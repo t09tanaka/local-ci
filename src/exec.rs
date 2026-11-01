@@ -1,0 +1,1637 @@
+//! Running the plan: setup once, then every unit on its own thread.
+
+use crate::expr::{self, Ctx, Status};
+use crate::matrix;
+use crate::plan::{self, Plan, Unit};
+use crate::workflow::{Job, Service, Step, Workflow};
+use crate::Repo;
+use anyhow::{anyhow, bail, Context, Result};
+use regex::Regex;
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+pub static CANCEL: AtomicBool = AtomicBool::new(false);
+static PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static CONTAINERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static COMPOSE_PROJECTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Stop everything that is running (Ctrl-C).
+pub fn kill_all() {
+    CANCEL.store(true, Ordering::SeqCst);
+    for &pg in PGIDS.lock().unwrap().iter() {
+        unsafe {
+            libc::killpg(pg, libc::SIGTERM);
+        }
+    }
+}
+
+pub fn remove_containers() {
+    let projects: Vec<String> = COMPOSE_PROJECTS.lock().unwrap().drain(..).collect();
+    compose_down(&projects);
+    let names: Vec<String> = CONTAINERS.lock().unwrap().drain(..).collect();
+    if !names.is_empty() {
+        let _ = Command::new("docker")
+            .arg("rm")
+            .arg("-f")
+            .args(&names)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "result", content = "reason", rename_all = "lowercase")]
+pub enum Outcome {
+    Pass,
+    Fail,
+    Skip(String),
+    /// Could not be checked here (tool missing, docker down, unsupported construct, timeout).
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepResult {
+    pub label: String,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    pub secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobResult {
+    pub workflow: String,
+    pub job: String,
+    pub display: String,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+    pub secs: f64,
+    pub steps: Vec<StepResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnitResult {
+    pub workflow: String,
+    pub jobs: Vec<JobResult>,
+    pub waited_secs: f64,
+}
+
+pub struct Opts {
+    pub parallel: usize,
+    pub canirun: Option<PathBuf>,
+    pub job_timeout_min: f64,
+}
+
+pub struct Runner<'a> {
+    pub repo: &'a Repo,
+    pub plan: &'a Plan,
+    pub wt: PathBuf,
+    pub run_dir: PathBuf,
+    pub tools: PathBuf,
+    pub lock_file: PathBuf,
+    pub slug: String,
+    pub opts: Opts,
+    pub base_path: String,
+    seq: AtomicUsize,
+}
+
+fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
+    cell.get_or_init(|| Regex::new(pat).unwrap())
+}
+
+fn global_install(run: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(&R, r"(?m)^\s*(sudo\s|brew (install|upgrade|tap)\b|apt(-get)?\s|yum\s|dnf\s|apk add\b|choco\s|snap install\b)").is_match(run)
+}
+
+fn slug_of(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').chars().take(40).collect()
+}
+
+pub fn strip_ansi(s: &str) -> String {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(&R, r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r")
+        .replace_all(s, "")
+        .into_owned()
+}
+
+/// The last `n` non-empty lines of a log, without colour codes.
+pub fn tail(path: &Path, n: usize) -> Vec<String> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(256 * 1024);
+    let _ = f.seek(SeekFrom::Start(start));
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    let text = strip_ansi(&String::from_utf8_lossy(&buf));
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("canirun: "))
+        .map(String::from)
+        .collect();
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+enum Exit {
+    Code(i32),
+    Timeout,
+    Cancelled,
+}
+
+struct Semaphore {
+    free: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn acquire(&self) {
+        let mut f = self.free.lock().unwrap();
+        while *f == 0 {
+            f = self.cv.wait(f).unwrap();
+        }
+        *f -= 1;
+    }
+    fn release(&self) {
+        *self.free.lock().unwrap() += 1;
+        self.cv.notify_one();
+    }
+}
+
+/// Compose projects a script brings up: `-p name` / `--project-name name` on a
+/// `docker compose` / `docker-compose` command line, or `COMPOSE_PROJECT_NAME=name`.
+pub fn compose_projects(script: &str) -> Vec<String> {
+    static FLAG: OnceLock<Regex> = OnceLock::new();
+    static ENV: OnceLock<Regex> = OnceLock::new();
+    let flag = re(
+        &FLAG,
+        r"(?:^|\s)(?:-p|--project-name)(?:\s+|=)[\x22']?([A-Za-z0-9][A-Za-z0-9_-]*)",
+    );
+    let env = re(
+        &ENV,
+        r"\bCOMPOSE_PROJECT_NAME=[\x22']?([A-Za-z0-9][A-Za-z0-9_-]*)",
+    );
+    let joined = script.replace("\\\n", " ");
+    let mut out = Vec::new();
+    for line in joined.lines() {
+        out.extend(env.captures_iter(line).map(|c| c[1].to_string()));
+        for marker in ["docker compose", "docker-compose"] {
+            if let Some(at) = line.find(marker) {
+                let rest = &line[at + marker.len()..];
+                // stop at the next command on the line
+                let rest = rest.split(['|', ';', '&']).next().unwrap_or(rest);
+                out.extend(flag.captures_iter(rest).map(|c| c[1].to_string()));
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// `docker compose -p <name> down` for each project that still has containers.
+fn compose_down(projects: &[String]) {
+    for p in projects {
+        let label = format!("label=com.docker.compose.project={p}");
+        let has = Command::new("docker")
+            .args(["ps", "-aq", "--filter", &label])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if has {
+            let _ = Command::new("docker")
+                .args(["compose", "-p", p, "down", "--remove-orphans"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// GitHub's file commands: `name=value` lines and `name<<DELIM` blocks.
+pub fn parse_file_command(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if let Some((k, delim)) = line.split_once("<<") {
+            if !k.contains('=') {
+                let mut val = Vec::new();
+                for l in lines.by_ref() {
+                    if l == delim {
+                        break;
+                    }
+                    val.push(l);
+                }
+                out.push((k.to_string(), val.join("\n")));
+                continue;
+            }
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if !k.is_empty() {
+                out.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    out
+}
+
+struct PortMap {
+    declared: Option<u16>,
+    container: u16,
+    actual: u16,
+}
+
+/// Point `localhost:<declared>` (and `*_PORT=<declared>`) at the port docker gave us.
+fn rewrite_ports(text: &str, maps: &[PortMap]) -> String {
+    let mut s = text.to_string();
+    for m in maps {
+        if let Some(d) = m.declared {
+            let r = Regex::new(&format!(r"\b(localhost|127\.0\.0\.1|0\.0\.0\.0):{d}\b")).unwrap();
+            s = r
+                .replace_all(&s, format!("${{1}}:{}", m.actual).as_str())
+                .into_owned();
+        }
+    }
+    s
+}
+
+fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
+    for m in maps {
+        if let Some(d) = m.declared {
+            if key.to_ascii_uppercase().contains("PORT") && val.trim() == d.to_string() {
+                return m.actual.to_string();
+            }
+        }
+    }
+    rewrite_ports(val, maps)
+}
+
+impl<'a> Runner<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repo: &'a Repo,
+        plan: &'a Plan,
+        wt: PathBuf,
+        run_dir: PathBuf,
+        tools: PathBuf,
+        lock_file: PathBuf,
+        slug: String,
+        opts: Opts,
+    ) -> Self {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        Runner {
+            repo,
+            plan,
+            wt,
+            run_dir,
+            tools,
+            lock_file,
+            slug,
+            opts,
+            base_path,
+            seq: AtomicUsize::new(0),
+        }
+    }
+
+    fn github_ctx(&self, w: &Workflow, event: &str, job: &str) -> Value {
+        let base = crate::git::branch_name(&self.repo.base);
+        let head = self.repo.head.clone().unwrap_or_default();
+        let pr = event == "pull_request";
+        json!({
+            "event_name": event,
+            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.repo.sha}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
+            "sha": self.repo.sha,
+            "ref": if pr { "refs/pull/0/merge".to_string() } else { format!("refs/heads/{head}") },
+            "ref_name": if pr { "0/merge".to_string() } else { head.clone() },
+            "head_ref": if pr { head.clone() } else { String::new() },
+            "base_ref": if pr { base } else { String::new() },
+            "repository": self.slug,
+            "repository_owner": self.slug.split('/').next().unwrap_or(""),
+            "workflow": w.name,
+            "job": job,
+            "run_id": "0",
+            "run_number": "0",
+            "run_attempt": "1",
+            "actor": "local-ci",
+            "server_url": "https://github.com",
+            "api_url": "https://api.github.com",
+            "workspace": self.wt.to_string_lossy(),
+        })
+    }
+
+    fn runner_ctx(&self) -> Value {
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            "Linux"
+        };
+        let arch = if cfg!(target_arch = "aarch64") {
+            "ARM64"
+        } else {
+            "X64"
+        };
+        json!({"os": os, "arch": arch, "temp": self.tools.join("tmp").to_string_lossy(), "tool_cache": self.tools.join("tool-cache").to_string_lossy(), "name": "local-ci"})
+    }
+
+    fn base_env(&self, gh: &Value, extra_path: &[String]) -> Vec<(String, String)> {
+        let s = |k: &str| gh.get(k).map(expr::to_string).unwrap_or_default();
+        let mut path: Vec<String> = extra_path.iter().rev().cloned().collect();
+        path.push(self.tools.join("venv/bin").to_string_lossy().into_owned());
+        path.push(
+            self.tools
+                .join("npm-global/bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        path.push(self.base_path.clone());
+        vec![
+            ("CI".into(), "true".into()),
+            ("GITHUB_ACTIONS".into(), "true".into()),
+            ("LOCAL_CI".into(), "1".into()),
+            (
+                "GITHUB_WORKSPACE".into(),
+                self.wt.to_string_lossy().into_owned(),
+            ),
+            ("GITHUB_SHA".into(), self.repo.sha.clone()),
+            ("GITHUB_REF".into(), s("ref")),
+            ("GITHUB_REF_NAME".into(), s("ref_name")),
+            ("GITHUB_HEAD_REF".into(), s("head_ref")),
+            ("GITHUB_BASE_REF".into(), s("base_ref")),
+            ("GITHUB_EVENT_NAME".into(), s("event_name")),
+            ("GITHUB_REPOSITORY".into(), self.slug.clone()),
+            ("GITHUB_WORKFLOW".into(), s("workflow")),
+            ("GITHUB_JOB".into(), s("job")),
+            ("GITHUB_RUN_ID".into(), "0".into()),
+            ("GITHUB_RUN_NUMBER".into(), "0".into()),
+            (
+                "RUNNER_OS".into(),
+                self.runner_ctx()["os"].as_str().unwrap_or("").into(),
+            ),
+            (
+                "RUNNER_TEMP".into(),
+                self.tools.join("tmp").to_string_lossy().into_owned(),
+            ),
+            (
+                "NPM_CONFIG_PREFIX".into(),
+                self.tools.join("npm-global").to_string_lossy().into_owned(),
+            ),
+            ("PIP_REQUIRE_VIRTUALENV".into(), "true".into()),
+            ("PATH".into(), path.join(":")),
+        ]
+    }
+
+    /// Run one shell step. Output goes to `log`; returns how it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn shell(
+        &self,
+        cwd: &Path,
+        script: &str,
+        shell: Option<&str>,
+        env: &[(String, String)],
+        timeout: Option<Duration>,
+        log: &Path,
+        key: Option<String>,
+    ) -> Result<Exit> {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        let file = self.tools.join(format!("scripts/step-{n}.sh"));
+        fs::write(&file, script)?;
+        let f = file.to_string_lossy().into_owned();
+        let mut argv: Vec<String> = match shell.map(str::trim) {
+            None | Some("bash") => vec![
+                "bash".into(),
+                "--noprofile".into(),
+                "--norc".into(),
+                "-eo".into(),
+                "pipefail".into(),
+                f,
+            ],
+            Some("sh") => vec!["sh".into(), "-e".into(), f],
+            Some("python") => vec!["python3".into(), f],
+            Some(custom) if custom.contains("{0}") => shlex::split(&custom.replace("{0}", &f))
+                .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
+            Some(other) => bail!("unsupported shell `{other}`"),
+        };
+        if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
+            let mut w = vec![
+                c.to_string_lossy().into_owned(),
+                "exec".into(),
+                "--key".into(),
+                k,
+                "--".into(),
+            ];
+            w.append(&mut argv);
+            argv = w;
+        }
+        if !cwd.is_dir() {
+            fs::write(
+                log,
+                format!(
+                    "local-ci: working-directory {} does not exist\n",
+                    cwd.display()
+                ),
+            )?;
+            return Ok(Exit::Code(1));
+        }
+        let out = OpenOptions::new().create(true).append(true).open(log)?;
+        let err = out.try_clone()?;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .process_group(0);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("cannot start {}", argv[0]))?;
+        let pid = child.id() as i32;
+        PGIDS.lock().unwrap().push(pid);
+        // With canirun the clock starts when the command gets its turn, not while it waits.
+        let mut started: Option<Instant> = if self.opts.canirun.is_some() {
+            None
+        } else {
+            Some(Instant::now())
+        };
+        let mut seen = 0u64;
+        let mut term_at: Option<Instant> = None;
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if started.is_none() {
+                if let Ok(mut lf) = File::open(log) {
+                    let len = lf.metadata().map(|m| m.len()).unwrap_or(0);
+                    if len > seen {
+                        let _ = lf.seek(SeekFrom::Start(seen));
+                        let mut b = Vec::new();
+                        let _ = lf.read_to_end(&mut b);
+                        seen = len;
+                        if String::from_utf8_lossy(&b)
+                            .lines()
+                            .any(|l| !l.starts_with("canirun: "))
+                        {
+                            started = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+            let over = matches!((timeout, started), (Some(t), Some(s)) if s.elapsed() > t);
+            if (over || CANCEL.load(Ordering::SeqCst)) && term_at.is_none() {
+                timed_out = over;
+                unsafe {
+                    libc::killpg(pid, libc::SIGTERM);
+                }
+                term_at = Some(Instant::now());
+            }
+            if term_at.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        PGIDS.lock().unwrap().retain(|&p| p != pid);
+        let _ = fs::remove_file(&file);
+        if timed_out {
+            return Ok(Exit::Timeout);
+        }
+        if CANCEL.load(Ordering::SeqCst) {
+            return Ok(Exit::Cancelled);
+        }
+        Ok(Exit::Code(status.code().unwrap_or(
+            128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0),
+        )))
+    }
+
+    fn log_path(&self, wf: &str, job: &str, n: usize, label: &str) -> PathBuf {
+        let dir = self.run_dir.join(format!(
+            "{}-{}",
+            slug_of(
+                wf.rsplit('/')
+                    .next()
+                    .unwrap_or(wf)
+                    .trim_end_matches(".yml")
+                    .trim_end_matches(".yaml")
+            ),
+            slug_of(job)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir.join(format!("{:02}-{}.log", n, slug_of(label)))
+    }
+
+    /// Create the Python venv that `pip install` steps install into, if any step needs one.
+    pub fn prepare_tools(&self) -> Result<()> {
+        for d in ["scripts", "tmp", "npm-global/bin", "files"] {
+            fs::create_dir_all(self.tools.join(d))?;
+        }
+        let wants_pip = self.plan.selected.iter().any(|s| {
+            s.wf.jobs.iter().any(|j| {
+                j.steps.iter().any(|st| {
+                    st.run
+                        .as_deref()
+                        .is_some_and(|r| r.contains("pip install") || r.contains("pip3 install"))
+                })
+            })
+        });
+        if wants_pip {
+            let ok = Command::new("python3")
+                .arg("-m")
+                .arg("venv")
+                .arg(self.tools.join("venv"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!(
+                    "local-ci: could not create a Python venv; `pip install` steps will be refused"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn run_setup(&self) -> Vec<StepResult> {
+        let mut out = Vec::new();
+        for (i, s) in self.plan.setup.iter().enumerate() {
+            if !s.execute {
+                continue;
+            }
+            let sel = &self.plan.selected[s.wf];
+            let job = self.plan.job(s.wf, &s.job);
+            let gh = self.github_ctx(&sel.wf, &sel.event, &job.id);
+            let mut env = self.base_env(&gh, &[]);
+            for (k, v) in sel
+                .wf
+                .env
+                .iter()
+                .chain(job.env.iter())
+                .chain(s.key.env.iter())
+            {
+                if !v.contains("${{") {
+                    env.push((k.clone(), v.clone()));
+                }
+            }
+            let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.key.wd, s.label));
+            let t0 = Instant::now();
+            let cwd = self.wt.join(&s.key.wd);
+            let res = self.shell(
+                &cwd,
+                &s.key.run,
+                s.shell.as_deref(),
+                &env,
+                Some(Duration::from_secs(1800)),
+                &log,
+                None,
+            );
+            let label = format!(
+                "{}$ {}",
+                if s.key.wd.is_empty() { "." } else { &s.key.wd },
+                s.label
+            );
+            let (outcome, exit) = match res {
+                Ok(Exit::Code(0)) => (Outcome::Pass, Some(0)),
+                Ok(Exit::Code(c)) => (Outcome::Fail, Some(c)),
+                Ok(Exit::Timeout) => (Outcome::Error("timed out".into()), None),
+                Ok(Exit::Cancelled) => (Outcome::Error("cancelled".into()), None),
+                Err(e) => (Outcome::Error(format!("{e:#}")), None),
+            };
+            let stop = outcome != Outcome::Pass;
+            out.push(StepResult {
+                label,
+                outcome,
+                exit,
+                secs: t0.elapsed().as_secs_f64(),
+                log: Some(log),
+                note: None,
+            });
+            if stop {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn run_units(&self) -> Vec<UnitResult> {
+        let sem = Semaphore {
+            free: Mutex::new(self.opts.parallel.max(1)),
+            cv: Condvar::new(),
+        };
+        let results: Mutex<Vec<(usize, UnitResult)>> = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for (i, u) in self.plan.units.iter().enumerate() {
+                let sem = &sem;
+                let results = &results;
+                scope.spawn(move || {
+                    let t0 = Instant::now();
+                    let lock = if u.exclusive { self.lock().ok() } else { None };
+                    sem.acquire();
+                    let waited = t0.elapsed().as_secs_f64();
+                    let r = self.run_unit(u, waited);
+                    sem.release();
+                    drop(lock);
+                    results.lock().unwrap().push((i, r));
+                });
+            }
+        });
+        let mut r = results.into_inner().unwrap();
+        r.sort_by_key(|(i, _)| *i);
+        r.into_iter().map(|(_, u)| u).collect()
+    }
+
+    fn lock(&self) -> Result<File> {
+        use fs2::FileExt;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock_file)?;
+        f.lock_exclusive()?;
+        Ok(f)
+    }
+
+    fn run_unit(&self, u: &Unit, waited: f64) -> UnitResult {
+        let sel = &self.plan.selected[u.wf];
+        let w = &sel.wf;
+        let mut needs_ctx = Map::new();
+        let mut jobs = Vec::new();
+        for id in &u.jobs {
+            let job = self.plan.job(u.wf, id);
+            let mut job_results = self.run_job(w, &sel.event, job, &needs_ctx);
+            let failed = job_results
+                .iter()
+                .any(|r| r.0.outcome == Outcome::Fail || matches!(r.0.outcome, Outcome::Error(_)));
+            let all_skipped = !job_results.is_empty()
+                && job_results
+                    .iter()
+                    .all(|r| matches!(r.0.outcome, Outcome::Skip(_)));
+            let result = if failed {
+                "failure"
+            } else if all_skipped {
+                "skipped"
+            } else {
+                "success"
+            };
+            let mut outputs = Map::new();
+            for (_, o) in &job_results {
+                for (k, v) in o {
+                    outputs.insert(k.clone(), v.clone());
+                }
+            }
+            needs_ctx.insert(id.clone(), json!({"result": result, "outputs": outputs}));
+            jobs.extend(job_results.drain(..).map(|r| r.0));
+        }
+        UnitResult {
+            workflow: w.file.clone(),
+            jobs,
+            waited_secs: waited,
+        }
+    }
+
+    /// One job, all its matrix combinations. Returns each combination's result and outputs.
+    fn run_job(
+        &self,
+        w: &Workflow,
+        event: &str,
+        job: &Job,
+        needs: &Map<String, Value>,
+    ) -> Vec<(JobResult, Map<String, Value>)> {
+        let gh = self.github_ctx(w, event, &job.id);
+        let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
+        let skip = |display: String, reason: String| {
+            (
+                JobResult {
+                    workflow: w.file.clone(),
+                    job: job.id.clone(),
+                    display,
+                    outcome: Outcome::Skip(reason),
+                    secs: 0.0,
+                    steps: vec![],
+                },
+                Map::new(),
+            )
+        };
+        let error = |display: String, reason: String| {
+            (
+                JobResult {
+                    workflow: w.file.clone(),
+                    job: job.id.clone(),
+                    display,
+                    outcome: Outcome::Error(reason),
+                    secs: 0.0,
+                    steps: vec![],
+                },
+                Map::new(),
+            )
+        };
+
+        let needs_of_job: Map<String, Value> = job
+            .needs
+            .iter()
+            .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
+            .collect();
+        let needs_status = if needs_of_job.values().any(|v| v["result"] != "success") {
+            Status::Failure
+        } else {
+            Status::Success
+        };
+        let mut ctx_map = Map::new();
+        ctx_map.insert("github".into(), gh.clone());
+        ctx_map.insert("needs".into(), Value::Object(needs_of_job.clone()));
+        ctx_map.insert("runner".into(), self.runner_ctx());
+        ctx_map.insert("inputs".into(), json!({}));
+        ctx_map.insert("vars".into(), json!({}));
+        ctx_map.insert("env".into(), json!({}));
+        ctx_map.insert("matrix".into(), json!({}));
+        ctx_map.insert("strategy".into(), json!({}));
+
+        // The matrix may be an expression over `needs`.
+        let combos = match &job.matrix {
+            None => vec![Map::new()],
+            Some(m) => {
+                let ctx = Ctx::new(&ctx_map, Status::Success);
+                let value = eval_strings(&matrix::yaml_to_json(m), &ctx);
+                match value.and_then(|v| matrix::expand(&v)) {
+                    Ok(c) => c,
+                    Err(e) => return vec![error(base_name, format!("matrix: {e:#}"))],
+                }
+            }
+        };
+        if job.container {
+            return vec![skip(base_name, "container: is not supported".into())];
+        }
+        if let Some(u) = &job.reusable {
+            return vec![skip(
+                base_name,
+                format!("reusable workflow {u} is not supported"),
+            )];
+        }
+
+        let mut out = Vec::new();
+        let mut combo_failed = false;
+        for combo in combos {
+            let mut cm = ctx_map.clone();
+            cm.insert("matrix".into(), Value::Object(combo.clone()));
+            let display = {
+                let ctx = Ctx::new(&cm, Status::Success);
+                match &job.name {
+                    Some(n) if n.contains("${{") => {
+                        expr::interpolate(n, &ctx).unwrap_or_else(|_| n.clone())
+                    }
+                    Some(n) if !combo.is_empty() => format!("{n} ({})", matrix::describe(&combo)),
+                    Some(n) => n.clone(),
+                    None if !combo.is_empty() => {
+                        format!("{} ({})", job.id, matrix::describe(&combo))
+                    }
+                    None => job.id.clone(),
+                }
+            };
+            if CANCEL.load(Ordering::SeqCst) {
+                out.push(skip(display, "cancelled".into()));
+                continue;
+            }
+            if combo_failed && job.fail_fast {
+                out.push(skip(display, "fail-fast".into()));
+                continue;
+            }
+            let run_it = {
+                let ctx = Ctx::new(&cm, needs_status);
+                expr::condition(job.cond.as_deref(), &ctx)
+            };
+            match run_it {
+                Ok(true) => {}
+                Ok(false) => {
+                    out.push(skip(
+                        display,
+                        if needs_status == Status::Failure {
+                            "needs failed".into()
+                        } else {
+                            "if: false".into()
+                        },
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    out.push(error(display, format!("if: {e:#}")));
+                    continue;
+                }
+            }
+            let r = self.run_combo(w, job, cm, display);
+            if r.0.outcome == Outcome::Fail {
+                combo_failed = true;
+            }
+            out.push(r);
+        }
+        out
+    }
+
+    fn eval_env(
+        pairs: &[(String, String)],
+        cm: &Map<String, Value>,
+        into: &mut Map<String, Value>,
+        maps: &[PortMap],
+    ) -> Result<bool> {
+        let mut secrets = false;
+        for (k, v) in pairs {
+            let mut ctx_map = cm.clone();
+            ctx_map.insert("env".into(), Value::Object(into.clone()));
+            let ctx = Ctx::new(&ctx_map, Status::Success);
+            let val = expr::interpolate(v, &ctx)?;
+            secrets |= ctx.used_secrets.get();
+            into.insert(k.clone(), Value::String(rewrite_env_value(k, &val, maps)));
+        }
+        Ok(secrets)
+    }
+
+    fn run_combo(
+        &self,
+        w: &Workflow,
+        job: &Job,
+        mut cm: Map<String, Value>,
+        display: String,
+    ) -> (JobResult, Map<String, Value>) {
+        let t0 = Instant::now();
+        let mut steps: Vec<StepResult> = Vec::new();
+        let mut names = Vec::new();
+        let finish = |outcome: Outcome, steps: Vec<StepResult>, t0: Instant| JobResult {
+            workflow: w.file.clone(),
+            job: job.id.clone(),
+            display: display.clone(),
+            outcome,
+            secs: t0.elapsed().as_secs_f64(),
+            steps,
+        };
+
+        // services
+        let mut maps = Vec::new();
+        let mut services_ctx = Map::new();
+        if !job.services.is_empty() {
+            match self.start_services(job, &cm, &mut names) {
+                Ok((m, sc)) => {
+                    maps = m;
+                    services_ctx = sc;
+                }
+                Err(e) => {
+                    self.stop_services(&names);
+                    return (
+                        finish(Outcome::Error(format!("services: {e:#}")), steps, t0),
+                        Map::new(),
+                    );
+                }
+            }
+        }
+        cm.insert(
+            "job".into(),
+            json!({"status": "success", "services": services_ctx}),
+        );
+
+        // workflow + job env
+        let mut env_ctx = Map::new();
+        if let Err(e) = Self::eval_env(&w.env, &cm, &mut env_ctx, &maps)
+            .and_then(|_| Self::eval_env(&job.env, &cm, &mut env_ctx, &maps))
+        {
+            self.stop_services(&names);
+            return (
+                finish(Outcome::Error(format!("env: {e:#}")), steps, t0),
+                Map::new(),
+            );
+        }
+        let job_timeout = Duration::from_secs_f64(
+            60.0 * job.timeout_minutes.unwrap_or(self.opts.job_timeout_min),
+        );
+        let mut steps_ctx = Map::new();
+        let mut extra_env: Vec<(String, String)> = Vec::new();
+        let mut extra_path: Vec<String> = Vec::new();
+        let mut failed = false;
+        // `docker compose` without `-p` would share the project of the main checkout's directory.
+        let compose_default = format!(
+            "local-ci-{}-{}",
+            std::process::id(),
+            self.seq.fetch_add(1, Ordering::SeqCst)
+        );
+        let mut projects = vec![compose_default.clone()];
+        COMPOSE_PROJECTS
+            .lock()
+            .unwrap()
+            .push(compose_default.clone());
+        let mut errored: Option<String> = None;
+
+        for (n, s) in job.steps.iter().enumerate() {
+            let raw_label = s.label();
+            let label = if raw_label.contains("${{") {
+                let mut lcm = cm.clone();
+                lcm.insert("steps".into(), Value::Object(steps_ctx.clone()));
+                lcm.insert("env".into(), Value::Object(env_ctx.clone()));
+                expr::interpolate(&raw_label, &Ctx::new(&lcm, Status::Success)).unwrap_or(raw_label)
+            } else {
+                raw_label
+            };
+            let st0 = Instant::now();
+            let push = |steps: &mut Vec<StepResult>,
+                        outcome: Outcome,
+                        exit: Option<i32>,
+                        log: Option<PathBuf>,
+                        note: Option<String>| {
+                steps.push(StepResult {
+                    label: label.clone(),
+                    outcome,
+                    exit,
+                    secs: st0.elapsed().as_secs_f64(),
+                    log,
+                    note,
+                });
+            };
+            let status = if CANCEL.load(Ordering::SeqCst) {
+                Status::Cancelled
+            } else if failed || errored.is_some() {
+                Status::Failure
+            } else {
+                Status::Success
+            };
+            let mut scm = cm.clone();
+            scm.insert("steps".into(), Value::Object(steps_ctx.clone()));
+            let mut step_env = env_ctx.clone();
+            for (k, v) in &extra_env {
+                step_env.insert(k.clone(), Value::String(v.clone()));
+            }
+            scm.insert("env".into(), Value::Object(step_env.clone()));
+            let go = expr::condition(s.cond.as_deref(), &Ctx::new(&scm, status));
+            match go {
+                Ok(true) => {}
+                Ok(false) => {
+                    push(
+                        &mut steps,
+                        Outcome::Skip(if status == Status::Success {
+                            "if: false".into()
+                        } else {
+                            "earlier step failed".into()
+                        }),
+                        None,
+                        None,
+                        None,
+                    );
+                    record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
+                    continue;
+                }
+                Err(e) => {
+                    push(
+                        &mut steps,
+                        Outcome::Error(format!("if: {e:#}")),
+                        None,
+                        None,
+                        None,
+                    );
+                    errored.get_or_insert(format!("{label}: if: {e:#}"));
+                    continue;
+                }
+            }
+
+            if let Some(uses) = &s.uses {
+                let (outcome, note) = self.check_action(uses, s, &scm);
+                if let Outcome::Error(e) = &outcome {
+                    errored.get_or_insert(format!("{label}: {e}"));
+                }
+                let o = if matches!(outcome, Outcome::Pass) {
+                    "success"
+                } else {
+                    "skipped"
+                };
+                push(&mut steps, outcome, None, None, note);
+                record(&mut steps_ctx, &s.id, o, o, Map::new());
+                continue;
+            }
+            let Some(run) = &s.run else {
+                push(
+                    &mut steps,
+                    Outcome::Skip("no run or uses".into()),
+                    None,
+                    None,
+                    None,
+                );
+                continue;
+            };
+            if let Some(k) = plan::step_key(w, job, s) {
+                if self.plan.is_setup(&k) {
+                    push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
+                    record(&mut steps_ctx, &s.id, "success", "success", Map::new());
+                    continue;
+                }
+            }
+            if global_install(run) {
+                push(
+                    &mut steps,
+                    Outcome::Skip("installs system packages".into()),
+                    None,
+                    None,
+                    None,
+                );
+                record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
+                continue;
+            }
+            // interpolate
+            let ctx = Ctx::new(&scm, status);
+            let script = expr::interpolate(run, &ctx);
+            let mut env_now = step_env.clone();
+            let env_res = Self::eval_env(&s.env, &scm, &mut env_now, &maps);
+            let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
+            let (script, env_now) = match (script, env_res) {
+                (Ok(sc), Ok(_)) => (rewrite_ports(&sc, &maps), env_now),
+                (Err(e), _) | (_, Err(e)) => {
+                    push(
+                        &mut steps,
+                        Outcome::Error(format!("{e:#}")),
+                        None,
+                        None,
+                        None,
+                    );
+                    errored.get_or_insert(format!("{label}: {e:#}"));
+                    continue;
+                }
+            };
+            if secrets {
+                push(
+                    &mut steps,
+                    Outcome::Skip("uses secrets".into()),
+                    None,
+                    None,
+                    None,
+                );
+                record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
+                continue;
+            }
+            let wd = plan::step_dir(w, job, s);
+            let files_dir = self
+                .tools
+                .join(format!("files/{}", self.seq.fetch_add(1, Ordering::SeqCst)));
+            let _ = fs::create_dir_all(&files_dir);
+            let fc = |name: &str| files_dir.join(name);
+            for f in ["output", "env", "path", "summary"] {
+                let _ = File::create(fc(f));
+            }
+            let gh = scm["github"].clone();
+            let mut env: Vec<(String, String)> = self.base_env(&gh, &extra_path);
+            env.push((
+                "GITHUB_OUTPUT".into(),
+                fc("output").to_string_lossy().into_owned(),
+            ));
+            env.push((
+                "GITHUB_ENV".into(),
+                fc("env").to_string_lossy().into_owned(),
+            ));
+            env.push((
+                "GITHUB_PATH".into(),
+                fc("path").to_string_lossy().into_owned(),
+            ));
+            env.push((
+                "GITHUB_STEP_SUMMARY".into(),
+                fc("summary").to_string_lossy().into_owned(),
+            ));
+            env.push(("COMPOSE_PROJECT_NAME".into(), compose_default.clone()));
+            for p in compose_projects(&script) {
+                if !projects.contains(&p) {
+                    COMPOSE_PROJECTS.lock().unwrap().push(p.clone());
+                    projects.push(p);
+                }
+            }
+            for (k, v) in &env_now {
+                env.push((k.clone(), expr::to_string(v)));
+            }
+            let log = self.log_path(&w.file, &display, n + 1, &label);
+            let remaining = job_timeout.saturating_sub(t0.elapsed());
+            let timeout = s
+                .timeout_minutes
+                .map(|m| Duration::from_secs_f64(m * 60.0))
+                .map(|t| t.min(remaining))
+                .unwrap_or(remaining);
+            let key = format!(
+                "local-ci {} {} {}",
+                w.file.rsplit('/').next().unwrap_or(""),
+                job.id,
+                label
+            );
+            let res = self.shell(
+                &self.wt.join(&wd),
+                &script,
+                s.shell
+                    .as_deref()
+                    .or(job.shell.as_deref())
+                    .or(w.shell.as_deref()),
+                &env,
+                Some(timeout),
+                &log,
+                Some(key),
+            );
+            let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
+            let mut outputs = Map::new();
+            for (k, v) in parse_file_command(&read("output")) {
+                outputs.insert(k, Value::String(v));
+            }
+            extra_env.extend(parse_file_command(&read("env")));
+            extra_path.extend(
+                read("path")
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(String::from),
+            );
+            let _ = fs::remove_dir_all(&files_dir);
+            match res {
+                Ok(Exit::Code(0)) => {
+                    push(&mut steps, Outcome::Pass, Some(0), Some(log), None);
+                    record(&mut steps_ctx, &s.id, "success", "success", outputs);
+                }
+                Ok(Exit::Code(c)) => {
+                    let ce = s.continue_on_error;
+                    push(
+                        &mut steps,
+                        Outcome::Fail,
+                        Some(c),
+                        Some(log),
+                        if ce {
+                            Some("continue-on-error".into())
+                        } else {
+                            None
+                        },
+                    );
+                    record(
+                        &mut steps_ctx,
+                        &s.id,
+                        "failure",
+                        if ce { "success" } else { "failure" },
+                        outputs,
+                    );
+                    if !ce {
+                        failed = true;
+                    }
+                }
+                Ok(Exit::Timeout) => {
+                    push(
+                        &mut steps,
+                        Outcome::Error(format!("timed out after {}s", timeout.as_secs())),
+                        None,
+                        Some(log),
+                        None,
+                    );
+                    record(&mut steps_ctx, &s.id, "failure", "failure", outputs);
+                    errored.get_or_insert(format!("{label}: timed out"));
+                }
+                Ok(Exit::Cancelled) => {
+                    push(
+                        &mut steps,
+                        Outcome::Error("cancelled".into()),
+                        None,
+                        Some(log),
+                        None,
+                    );
+                    errored.get_or_insert("cancelled".into());
+                }
+                Err(e) => {
+                    push(
+                        &mut steps,
+                        Outcome::Error(format!("{e:#}")),
+                        None,
+                        Some(log),
+                        None,
+                    );
+                    errored.get_or_insert(format!("{label}: {e:#}"));
+                }
+            }
+        }
+        self.stop_services(&names);
+        compose_down(&projects);
+        COMPOSE_PROJECTS
+            .lock()
+            .unwrap()
+            .retain(|p| !projects.contains(p));
+
+        // job outputs
+        let mut outputs = Map::new();
+        let mut ocm = cm.clone();
+        ocm.insert("steps".into(), Value::Object(steps_ctx));
+        let octx = Ctx::new(&ocm, Status::Success);
+        for (k, v) in &job.outputs {
+            if let Ok(val) = expr::interpolate(v, &octx) {
+                outputs.insert(k.clone(), Value::String(val));
+            }
+        }
+        let outcome = if failed {
+            Outcome::Fail
+        } else if let Some(e) = errored {
+            Outcome::Error(e)
+        } else {
+            Outcome::Pass
+        };
+        (finish(outcome, steps, t0), outputs)
+    }
+
+    /// `uses:` steps: version checks for setup actions, skips for the rest.
+    fn check_action(
+        &self,
+        uses: &str,
+        s: &Step,
+        cm: &Map<String, Value>,
+    ) -> (Outcome, Option<String>) {
+        let name = uses.split('@').next().unwrap_or(uses).to_ascii_lowercase();
+        let ctx = Ctx::new(cm, Status::Success);
+        let with = |k: &str| {
+            s.with
+                .iter()
+                .find(|(n, _)| n == k)
+                .and_then(|(_, v)| expr::interpolate(v, &ctx).ok())
+                .filter(|v| !v.is_empty())
+        };
+        let tool = |bin: &str, args: &[&str]| -> Option<String> {
+            let out = Command::new(bin).args(args).output().ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr);
+            out.status
+                .success()
+                .then(|| text.lines().next().unwrap_or("").trim().to_string())
+        };
+        let check = |bin: &str, args: &[&str], want: Option<String>| -> (Outcome, Option<String>) {
+            match tool(bin, args) {
+                None => (Outcome::Error(format!("`{bin}` not found")), None),
+                Some(have) => {
+                    let have_v = have.trim_start_matches(|c: char| !c.is_ascii_digit());
+                    let note = match want {
+                        Some(w)
+                            if !have_v
+                                .starts_with(w.trim_start_matches('v').trim_end_matches(".x")) =>
+                        {
+                            Some(format!("wants {w}, have {have}"))
+                        }
+                        _ => Some(have),
+                    };
+                    (Outcome::Pass, note)
+                }
+            }
+        };
+        let version_file = |key: &str| {
+            with(key)
+                .and_then(|f| fs::read_to_string(self.wt.join(f)).ok())
+                .map(|t| t.trim().to_string())
+        };
+        match name.as_str() {
+            "actions/checkout" => (Outcome::Skip("checkout".into()), None),
+            "actions/setup-node" => check(
+                "node",
+                &["--version"],
+                with("node-version").or_else(|| version_file("node-version-file")),
+            ),
+            "actions/setup-python" => check(
+                "python3",
+                &["--version"],
+                with("python-version").or_else(|| version_file("python-version-file")),
+            ),
+            "actions/setup-go" => check("go", &["version"], None),
+            "actions/setup-java" => check("java", &["-version"], None),
+            "ruby/setup-ruby" => check("ruby", &["--version"], with("ruby-version")),
+            "subosito/flutter-action" => check("flutter", &["--version"], with("flutter-version")),
+            "dart-lang/setup-dart" => check("dart", &["--version"], None),
+            n if n.starts_with("dtolnay/rust-toolchain") => check("cargo", &["--version"], None),
+            n if n.starts_with("actions/cache") || n.ends_with("/rust-cache") => {
+                (Outcome::Skip("cache".into()), None)
+            }
+            n if n.contains("upload-artifact") || n.contains("download-artifact") => {
+                (Outcome::Skip("artifact".into()), None)
+            }
+            _ => (Outcome::Skip(format!("action {uses}")), None),
+        }
+    }
+
+    fn docker_ok() -> Result<(), String> {
+        static OK: OnceLock<Result<(), String>> = OnceLock::new();
+        OK.get_or_init(|| {
+            match Command::new("docker")
+                .args(["info", "--format", "{{.ServerVersion}}"])
+                .output()
+            {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("docker info failed")
+                    .to_string()),
+                Err(e) => Err(format!("docker: {e}")),
+            }
+        })
+        .clone()
+    }
+
+    fn docker(args: &[&str], timeout: Duration) -> Result<String> {
+        let mut child = Command::new("docker")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let t0 = Instant::now();
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if t0.elapsed() > timeout || CANCEL.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                bail!(
+                    "docker {} did not finish in {}s",
+                    args.first().unwrap_or(&""),
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "docker {}: {}",
+                args.first().unwrap_or(&""),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn start_services(
+        &self,
+        job: &Job,
+        cm: &Map<String, Value>,
+        names: &mut Vec<String>,
+    ) -> Result<(Vec<PortMap>, Map<String, Value>)> {
+        Self::docker_ok().map_err(|e| anyhow!("docker is not available ({e})"))?;
+        let ctx = Ctx::new(cm, Status::Success);
+        let mut maps = Vec::new();
+        let mut sctx = Map::new();
+        for svc in &job.services {
+            let image = expr::interpolate(&svc.image, &ctx)?;
+            if Self::docker(&["image", "inspect", &image], Duration::from_secs(30)).is_err() {
+                Self::docker(&["pull", "--quiet", &image], Duration::from_secs(600))
+                    .with_context(|| format!("pull {image}"))?;
+            }
+            let name = format!(
+                "local-ci-{}-{}",
+                std::process::id(),
+                self.seq.fetch_add(1, Ordering::SeqCst)
+            );
+            let mut args: Vec<String> = vec![
+                "run".into(),
+                "-d".into(),
+                "--name".into(),
+                name.clone(),
+                "--label".into(),
+                "local-ci=1".into(),
+            ];
+            for (k, v) in &svc.env {
+                args.push("-e".into());
+                args.push(format!("{k}={}", expr::interpolate(v, &ctx)?));
+            }
+            for (_, c) in &svc.ports {
+                args.push("-p".into());
+                args.push(format!("127.0.0.1::{c}"));
+            }
+            let opts = expr::interpolate(&svc.options, &ctx)?;
+            args.extend(
+                shlex::split(&opts).ok_or_else(|| anyhow!("cannot parse options `{opts}`"))?,
+            );
+            args.push(image.clone());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            Self::docker(&refs, Duration::from_secs(120))?;
+            CONTAINERS.lock().unwrap().push(name.clone());
+            names.push(name.clone());
+            let mut ports = Map::new();
+            for (d, c) in &svc.ports {
+                let line = Self::docker(
+                    &["port", &name, &format!("{c}/tcp")],
+                    Duration::from_secs(30),
+                )?;
+                let actual: u16 = line
+                    .lines()
+                    .next()
+                    .and_then(|l| l.rsplit(':').next())
+                    .and_then(|p| p.trim().parse().ok())
+                    .ok_or_else(|| anyhow!("no host port for {c}"))?;
+                ports.insert(c.to_string(), Value::String(actual.to_string()));
+                maps.push(PortMap {
+                    declared: *d,
+                    container: *c,
+                    actual,
+                });
+            }
+            self.wait_healthy(&name, svc, &maps)?;
+            sctx.insert(
+                svc.id.clone(),
+                json!({"id": name, "ports": ports, "network": ""}),
+            );
+        }
+        Ok((maps, sctx))
+    }
+
+    fn wait_healthy(&self, name: &str, svc: &Service, maps: &[PortMap]) -> Result<()> {
+        let has_health = svc.options.contains("--health-cmd");
+        let t0 = Instant::now();
+        let limit = Duration::from_secs(180);
+        loop {
+            if CANCEL.load(Ordering::SeqCst) {
+                bail!("cancelled");
+            }
+            let state = Self::docker(&["inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], Duration::from_secs(30))?;
+            let mut parts = state.split_whitespace();
+            let (run, health) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            if run == "exited" || run == "dead" {
+                let logs = Command::new("docker")
+                    .args(["logs", "--tail", "15", name])
+                    .output()
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stderr).to_string()
+                            + &String::from_utf8_lossy(&o.stdout)
+                    })
+                    .unwrap_or_default();
+                bail!("service {} exited:\n{}", svc.id, logs.trim());
+            }
+            if has_health {
+                if health == "healthy" {
+                    return Ok(());
+                }
+                if health == "unhealthy" {
+                    bail!("service {} is unhealthy", svc.id);
+                }
+            } else {
+                let mine: Vec<&PortMap> = maps
+                    .iter()
+                    .filter(|m| svc.ports.iter().any(|(_, c)| *c == m.container))
+                    .collect();
+                if run == "running"
+                    && mine.iter().all(|m| {
+                        std::net::TcpStream::connect_timeout(
+                            &([127, 0, 0, 1], m.actual).into(),
+                            Duration::from_secs(1),
+                        )
+                        .is_ok()
+                    })
+                {
+                    return Ok(());
+                }
+            }
+            if t0.elapsed() > limit {
+                bail!("service {} not ready after {}s", svc.id, limit.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+    }
+
+    fn stop_services(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let _ = Command::new("docker")
+            .arg("rm")
+            .arg("-f")
+            .args(names)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let set: HashSet<&String> = names.iter().collect();
+        CONTAINERS.lock().unwrap().retain(|n| !set.contains(n));
+    }
+}
+
+/// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
+fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
+    Ok(match v {
+        Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|x| eval_strings(x, ctx))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| Ok((k.clone(), eval_strings(x, ctx)?)))
+                .collect::<Result<_>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
+fn record(
+    ctx: &mut Map<String, Value>,
+    id: &Option<String>,
+    outcome: &str,
+    conclusion: &str,
+    outputs: Map<String, Value>,
+) {
+    if let Some(id) = id {
+        ctx.insert(
+            id.clone(),
+            json!({"outcome": outcome, "conclusion": conclusion, "outputs": outputs}),
+        );
+    }
+}
+
+pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(serde_json::to_string_pretty(v)?.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_commands() {
+        let v = parse_file_command("a=1\nmatrix<<EOF\n{\"x\":\n[1]}\nEOF\nb=two=2\n");
+        assert_eq!(
+            v,
+            vec![
+                ("a".into(), "1".into()),
+                ("matrix".into(), "{\"x\":\n[1]}".into()),
+                ("b".into(), "two=2".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn port_rewrites() {
+        let maps = vec![PortMap {
+            declared: Some(5433),
+            container: 5432,
+            actual: 49152,
+        }];
+        assert_eq!(
+            rewrite_ports("postgresql://u:p@localhost:5433/db?x=1", &maps),
+            "postgresql://u:p@localhost:49152/db?x=1"
+        );
+        assert_eq!(rewrite_ports("127.0.0.1:54330", &maps), "127.0.0.1:54330");
+        assert_eq!(rewrite_env_value("DB_PORT", "5433", &maps), "49152");
+        assert_eq!(rewrite_env_value("COUNT", "5433", &maps), "5433");
+    }
+
+    #[test]
+    fn compose_project_names() {
+        assert_eq!(
+            compose_projects("TEST_DB_PORT=1 docker compose \\\n  -p app-int \\\n  -f a.yml up -d"),
+            vec!["app-int"]
+        );
+        assert_eq!(
+            compose_projects("docker compose --project-name=y up"),
+            vec!["y"]
+        );
+        assert!(compose_projects("npm run test -p foo").is_empty());
+        assert!(compose_projects("mkdir -p api && docker compose up -d").is_empty());
+        assert_eq!(
+            compose_projects("COMPOSE_PROJECT_NAME=z docker compose up"),
+            vec!["z"]
+        );
+    }
+
+    #[test]
+    fn system_installs() {
+        assert!(global_install("sudo apt-get install -y jq"));
+        assert!(global_install("echo hi\n  brew install x"));
+        assert!(!global_install("npm ci"));
+        assert!(!global_install("echo sudo"));
+    }
+
+    #[test]
+    fn ansi_and_slugs() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m\r"), "red");
+        assert_eq!(
+            slug_of("Run integration tests (1/2)"),
+            "run-integration-tests-1-2"
+        );
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "local-ci"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Run the GitHub Actions jobs a branch would trigger, locally, in an isolated worktree, and print a short report"
+license = "MIT"
+repository = "https://github.com/t09tanaka/local-ci"
+readme = "README.md"
+keywords = ["ci", "github-actions", "workflow", "local", "dev-tools"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+fs2 = "0.4"
+globset = "0.4"
+libc = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+shlex = "1"
+
+[dev-dependencies]
+tempfile = "3"

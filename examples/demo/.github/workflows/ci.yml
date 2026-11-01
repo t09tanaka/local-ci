@@ -1,0 +1,75 @@
+name: CI
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/ci.yml"
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./install.sh
+      - name: Lint
+        run: ./lint.sh
+
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./install.sh
+      - id: list
+        run: echo "shards=$(./list-shards.sh)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: [lint, discover]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.discover.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./install.sh
+      - name: Unit tests (shard ${{ matrix.shard }})
+        run: ./test.sh "${{ matrix.shard }}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.shard }}
+          path: app/report.txt
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      cache:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-retries 30
+    env:
+      CACHE_URL: redis://localhost:6390
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./install.sh
+      - name: Integration test
+        run: ./integration.sh
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.DEPLOY_TOKEN }}"

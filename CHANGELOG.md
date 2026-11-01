@@ -1,0 +1,17 @@
+# Changelog
+
+## 0.1.0
+
+First release.
+
+- `local-ci plan` / `local-ci run` / `local-ci status`.
+- Picks workflows the way GitHub does for a pull request (`types`, `branches`,
+  `paths`, `paths-ignore`, workflows disabled on GitHub), or all of them with
+  `--all`.
+- Runs in a throwaway worktree of the commit; install steps run once; units of
+  jobs run in parallel, exclusive ones under a per-repository lock.
+- Expressions, matrices (including ones computed from `needs`), file commands,
+  job outputs, `services:` on free host ports, `docker compose` projects
+  isolated and cleaned up.
+- Wraps steps in `canirun exec` when canirun is installed.
+- Short text report, JSON result, logs per step, `local-ci` commit status.
