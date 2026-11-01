@@ -8,6 +8,8 @@ pub struct Trigger {
     pub event: String,
     pub branches: Vec<String>,
     pub branches_ignore: Vec<String>,
+    pub tags: Vec<String>,
+    pub tags_ignore: Vec<String>,
     pub paths: Vec<String>,
     pub paths_ignore: Vec<String>,
     pub types: Vec<String>,
@@ -171,6 +173,8 @@ fn parse_triggers(on: Option<&Y>) -> Vec<Trigger> {
                 let mut t = ev(&scalar(k)?);
                 t.branches = list_of(v, "branches");
                 t.branches_ignore = list_of(v, "branches-ignore");
+                t.tags = list_of(v, "tags");
+                t.tags_ignore = list_of(v, "tags-ignore");
                 t.paths = list_of(v, "paths");
                 t.paths_ignore = list_of(v, "paths-ignore");
                 t.types = list_of(v, "types");

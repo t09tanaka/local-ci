@@ -129,9 +129,11 @@ Common options (`plan` and `run`):
   when its version differs. Other actions are skipped and listed under
   `not covered`.
 
-Not covered: steps that read `secrets.*`, steps that install system packages
-(`sudo`, `apt-get`, `brew install`, ...), `container:` jobs and reusable
-workflows. `pip install` goes into a virtualenv of the run and `npm install -g`
+Not covered: steps that read `secrets.*` or `github.token`, steps that push,
+publish or deploy (`git push`, `gh release`, `npm publish`, `aws`, `kubectl`,
+`terraform apply`, ...), steps that install system packages (`sudo`,
+`apt-get`, `brew install`, ...), `container:` jobs and reusable workflows. A
+`git push` from inside a script is pointed at a URL that does not exist. `pip install` goes into a virtualenv of the run and `npm install -g`
 into a prefix of the run, so neither changes your machine.
 
 ## Working with other tools

@@ -119,6 +119,16 @@ fn global_install(run: &str) -> bool {
     re(&R, r"(?m)^\s*(sudo\s|brew (install|upgrade|tap)\b|apt(-get)?\s|yum\s|dnf\s|apk add\b|choco\s|snap install\b)").is_match(run)
 }
 
+/// Steps that would change something outside this machine with your credentials.
+fn remote_effect(run: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(
+        &R,
+        r"(?m)(^|[;&|(]\s*|\s)(git\s+push|gh\s+(api|release|pr|issue|workflow|run|repo|secret|variable|label|gist)\b|npm\s+publish|cargo\s+publish|dart\s+pub\s+publish|docker\s+(push|login)|aws\s|gcloud\s|kubectl\s|helm\s+(install|upgrade)|terraform\s+(apply|destroy)|serverless\s+deploy|sls\s+deploy|firebase\s+deploy|vercel\b|netlify\s+deploy|wrangler\s+(deploy|publish))",
+    )
+    .is_match(run)
+}
+
 fn slug_of(s: &str) -> String {
     let mut out: String = s
         .chars()
@@ -447,6 +457,24 @@ impl<'a> Runner<'a> {
                 "LOCAL_CI_TOOLS".into(),
                 self.tools.to_string_lossy().into_owned(),
             ),
+            // a `git push` from inside a script goes nowhere
+            ("GIT_CONFIG_COUNT".into(), "3".into()),
+            (
+                "GIT_CONFIG_KEY_0".into(),
+                "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
+            ),
+            ("GIT_CONFIG_VALUE_0".into(), "https://".into()),
+            (
+                "GIT_CONFIG_KEY_1".into(),
+                "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
+            ),
+            ("GIT_CONFIG_VALUE_1".into(), "git@".into()),
+            (
+                "GIT_CONFIG_KEY_2".into(),
+                "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
+            ),
+            ("GIT_CONFIG_VALUE_2".into(), "ssh://".into()),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             ("PATH".into(), path.join(":")),
         ]
     }
@@ -1111,6 +1139,17 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             }
+            if remote_effect(run) {
+                push(
+                    &mut steps,
+                    Outcome::Skip("pushes, publishes or deploys".into()),
+                    None,
+                    None,
+                    None,
+                );
+                record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
+                continue;
+            }
             if global_install(run) {
                 push(
                     &mut steps,
@@ -1381,7 +1420,11 @@ impl<'a> Runner<'a> {
             "ruby/setup-ruby" => check("ruby", &["--version"], with("ruby-version")),
             "subosito/flutter-action" => check("flutter", &["--version"], with("flutter-version")),
             "dart-lang/setup-dart" => check("dart", &["--version"], None),
-            n if n.starts_with("dtolnay/rust-toolchain") => check("cargo", &["--version"], None),
+            n if n.starts_with("dtolnay/rust-toolchain") => check(
+                "cargo",
+                &["--version"],
+                with("toolchain").filter(|t| t.starts_with(|c: char| c.is_ascii_digit())),
+            ),
             n if n.starts_with("actions/cache") || n.ends_with("/rust-cache") => {
                 (Outcome::Skip("cache".into()), None)
             }
@@ -1717,6 +1760,19 @@ mod tests {
         npm(&["ci"]);
         let calls = fs::read_to_string(&log).unwrap();
         assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\n");
+    }
+
+    #[test]
+    fn remote_effects() {
+        assert!(remote_effect("git push origin HEAD"));
+        assert!(remote_effect(
+            "npm run build && npm publish --access public"
+        ));
+        assert!(remote_effect("gh release upload v1 a.tgz"));
+        assert!(remote_effect("aws s3 sync dist s3://bucket"));
+        assert!(!remote_effect("git diff --exit-code"));
+        assert!(!remote_effect("npm run lint"));
+        assert!(!remote_effect("echo pushing"));
     }
 
     #[test]

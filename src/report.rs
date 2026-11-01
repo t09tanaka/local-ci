@@ -109,6 +109,7 @@ pub fn not_covered(units: &[UnitResult]) -> Vec<String> {
                 if r == "uses secrets"
                     || r.starts_with("action ")
                     || r == "installs system packages"
+                    || r == "pushes, publishes or deploys"
                 {
                     out.push(format!(
                         "{} › {} › {}: {r}",

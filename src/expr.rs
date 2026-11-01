@@ -410,6 +410,12 @@ fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
         Ast::Prop(b, k) => {
             let base = eval(b, ctx)?;
             let key = eval(k, ctx)?;
+            // `github.token` is a credential, like `secrets.GITHUB_TOKEN`
+            if matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("github"))
+                && to_string(&key).eq_ignore_ascii_case("token")
+            {
+                ctx.used_secrets.set(true);
+            }
             get_prop(&base, &key)
         }
         Ast::Star(b) => match eval(b, ctx)? {
@@ -670,6 +676,12 @@ mod tests {
         let c = Ctx::new(&m, Status::Success);
         assert_eq!(interpolate("${{ secrets.TOKEN }}", &c).unwrap(), "");
         assert!(c.used_secrets.get());
+        let c = Ctx::new(&m, Status::Success);
+        interpolate("${{ github.token }}", &c).unwrap();
+        assert!(c.used_secrets.get());
+        let c = Ctx::new(&m, Status::Success);
+        interpolate("${{ github.sha }}", &c).unwrap();
+        assert!(!c.used_secrets.get());
     }
 
     #[test]

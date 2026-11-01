@@ -118,6 +118,15 @@ pub fn decide(w: &Workflow, ev: &Event) -> Decision {
             reasons.push(format!("{}: types {}", t.event, t.types.join(",")));
             continue;
         }
+        // `push: tags: [...]` without `branches` runs for tag pushes only
+        if !pr
+            && (!t.tags.is_empty() || !t.tags_ignore.is_empty())
+            && t.branches.is_empty()
+            && t.branches_ignore.is_empty()
+        {
+            reasons.push("push: tags only".into());
+            continue;
+        }
         let branch = if pr {
             Some(ev.base.as_str())
         } else {
@@ -273,6 +282,17 @@ mod tests {
             decide(&w, &ev(&["a"])),
             Decision::Run {
                 event: "push".into()
+            }
+        );
+        let w = parse(
+            "a.yml",
+            "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\njobs: {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            decide(&w, &ev(&["a"])),
+            Decision::Skip {
+                reason: "push: tags only".into()
             }
         );
     }
