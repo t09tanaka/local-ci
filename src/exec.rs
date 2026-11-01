@@ -238,6 +238,42 @@ fn compose_down(projects: &[String]) {
     }
 }
 
+/// Put in front of PATH for the run. Every job shares one checkout, and `npm ci`
+/// deletes `node_modules` before installing, so a job installing a directory
+/// (directly or from a script) would break another job running there. A
+/// directory is installed once per run and lockfile; later installs are no-ops.
+const NPM_SHIM: &str = r#"#!/bin/sh
+# Written by local-ci for one run.
+real="__REAL__"
+sub="$1"
+case "$sub" in
+  ci|install|i) ;;
+  *) exec "$real" "$@" ;;
+esac
+shift
+for a in "$@"; do
+  case "$a" in
+    -*) ;;
+    *) exec "$real" "$sub" "$@" ;;
+  esac
+done
+dir=$(pwd -P)
+sum=$(cksum package-lock.json 2>/dev/null | cut -d' ' -f1)
+key=$(printf '%s' "$dir" | cksum | cut -d' ' -f1)
+marks="$LOCAL_CI_TOOLS/installed"
+mkdir -p "$marks"
+until mkdir "$marks/$key.lock" 2>/dev/null; do sleep 1; done
+trap 'rmdir "$marks/$key.lock" 2>/dev/null' EXIT INT TERM
+if [ -f "$marks/$key-$sum" ] && [ -d node_modules ]; then
+  echo "local-ci: node_modules in $dir was installed earlier in this run; skipping npm $sub" >&2
+  exit 0
+fi
+"$real" "$sub" "$@"
+rc=$?
+if [ "$rc" -eq 0 ]; then : > "$marks/$key-$sum"; fi
+exit "$rc"
+"#;
+
 /// GitHub's file commands: `name=value` lines and `name<<DELIM` blocks.
 pub fn parse_file_command(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -365,7 +401,8 @@ impl<'a> Runner<'a> {
 
     fn base_env(&self, gh: &Value, extra_path: &[String]) -> Vec<(String, String)> {
         let s = |k: &str| gh.get(k).map(expr::to_string).unwrap_or_default();
-        let mut path: Vec<String> = extra_path.iter().rev().cloned().collect();
+        let mut path: Vec<String> = vec![self.tools.join("bin").to_string_lossy().into_owned()];
+        path.extend(extra_path.iter().rev().cloned());
         path.push(self.tools.join("venv/bin").to_string_lossy().into_owned());
         path.push(
             self.tools
@@ -406,6 +443,10 @@ impl<'a> Runner<'a> {
                 self.tools.join("npm-global").to_string_lossy().into_owned(),
             ),
             ("PIP_REQUIRE_VIRTUALENV".into(), "true".into()),
+            (
+                "LOCAL_CI_TOOLS".into(),
+                self.tools.to_string_lossy().into_owned(),
+            ),
             ("PATH".into(), path.join(":")),
         ]
     }
@@ -555,8 +596,26 @@ impl<'a> Runner<'a> {
 
     /// Create the Python venv that `pip install` steps install into, if any step needs one.
     pub fn prepare_tools(&self) -> Result<()> {
-        for d in ["scripts", "tmp", "npm-global/bin", "files"] {
+        for d in [
+            "scripts",
+            "tmp",
+            "npm-global/bin",
+            "files",
+            "bin",
+            "installed",
+        ] {
             fs::create_dir_all(self.tools.join(d))?;
+        }
+        if let Some(npm) = self
+            .base_path
+            .split(':')
+            .map(|d| Path::new(d).join("npm"))
+            .find(|p| p.is_file())
+        {
+            let shim = self.tools.join("bin/npm");
+            fs::write(&shim, NPM_SHIM.replace("__REAL__", &npm.to_string_lossy()))?;
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
         }
         let wants_pip = self.plan.selected.iter().any(|s| {
             s.wf.jobs.iter().any(|j| {
@@ -1616,6 +1675,48 @@ mod tests {
             compose_projects("COMPOSE_PROJECT_NAME=z docker compose up"),
             vec!["z"]
         );
+    }
+
+    #[test]
+    fn npm_installs_once_per_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls");
+        let fake = tmp.path().join("fake-npm");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nmkdir -p node_modules\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = tmp.path().join("npm");
+        fs::write(&shim, NPM_SHIM.replace("__REAL__", &fake.to_string_lossy())).unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("package-lock.json"), "{}").unwrap();
+        let npm = |args: &[&str]| {
+            let st = Command::new(&shim)
+                .args(args)
+                .current_dir(&proj)
+                .env("LOCAL_CI_TOOLS", tmp.path().join("tools"))
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        npm(&["ci", "--no-audit"]);
+        npm(&["ci"]);
+        npm(&["install"]);
+        npm(&["install", "left-pad"]);
+        npm(&["run", "test"]);
+        fs::write(proj.join("package-lock.json"), "{\"changed\":1}").unwrap();
+        npm(&["ci"]);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\n");
     }
 
     #[test]

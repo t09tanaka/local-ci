@@ -84,7 +84,10 @@ Common options (`plan` and `run`):
    installs, so parallel jobs would break each other. Install steps
    (`npm ci`, `pip install`, `flutter pub get`, `npx prisma generate`, ...)
    and steps that several jobs repeat word for word at their start are run
-   once, before any job, and skipped in the jobs.
+   once, before any job, and skipped in the jobs. Installs that happen later
+   anyway (a matrix job, a script that calls `npm ci`) go through an `npm`
+   wrapper on `PATH`: a directory is installed once per run and lockfile, and
+   later `npm ci` / `npm install` there are no-ops.
 3. **Units in parallel.** Jobs linked by `needs:` (or writing the same build
    output) form a unit and run in order. Units run in parallel. Units that
    start services or containers, or look like integration / e2e tests, are
