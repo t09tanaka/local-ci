@@ -231,12 +231,49 @@ pub fn compose_projects(script: &str) -> Vec<String> {
                 let rest = &line[at + marker.len()..];
                 // stop at the next command on the line
                 let rest = rest.split(['|', ';', '&']).next().unwrap_or(rest);
-                out.extend(flag.captures_iter(rest).map(|c| c[1].to_string()));
+                out.extend(
+                    flag.captures_iter(compose_globals(rest))
+                        .map(|c| c[1].to_string()),
+                );
             }
         }
     }
     out.dedup();
     out
+}
+
+/// The part of a `docker compose` command line before its subcommand (`up`,
+/// `exec`, ...). Only there is `-p` the project: `exec db mkdir -p tmp` is not.
+fn compose_globals(args: &str) -> &str {
+    // options of `docker compose` itself that take a value
+    const VALUED: [&str; 10] = [
+        "-f",
+        "--file",
+        "-p",
+        "--project-name",
+        "--env-file",
+        "--profile",
+        "--project-directory",
+        "--ansi",
+        "--parallel",
+        "--progress",
+    ];
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let mut value_next = false;
+    for m in re(&WORD, r"\S+").find_iter(args) {
+        let t = m.as_str();
+        if t == "\\" {
+            continue;
+        }
+        if value_next {
+            value_next = false;
+        } else if t.starts_with('-') {
+            value_next = VALUED.contains(&t);
+        } else {
+            return &args[..m.start()];
+        }
+    }
+    args
 }
 
 /// `docker compose -p <name> down` for each project that still has containers.
@@ -339,11 +376,14 @@ fn rewrite_ports(text: &str, maps: &[PortMap]) -> String {
             s = r
                 .replace_all(&s, format!("${{1}}:{}", m.actual).as_str())
                 .into_owned();
-            let a = Regex::new(&format!(r#"\b([A-Za-z_][A-Za-z0-9_]*=["']?){d}\b"#)).unwrap();
+            let a = Regex::new(&format!(
+                r#"(-e\s+|--env[=\s]\s*)?\b([A-Za-z_][A-Za-z0-9_]*=["']?){d}\b"#
+            ))
+            .unwrap();
             s = a
                 .replace_all(&s, |c: &regex::Captures| {
-                    if port_key(c[1].trim_end_matches(['=', '"', '\''])) {
-                        format!("{}{}", &c[1], m.actual)
+                    if c.get(1).is_none() && port_key(c[2].trim_end_matches(['=', '"', '\''])) {
+                        format!("{}{}", &c[2], m.actual)
                     } else {
                         c[0].to_string()
                     }
@@ -354,38 +394,51 @@ fn rewrite_ports(text: &str, maps: &[PortMap]) -> String {
     s
 }
 
-/// `PORT`, `DB_PORT`, `PORT_E2E`; not `EXPORT` or `REPORT`.
+/// `PORT`, `DB_PORT`, `PORT_E2E`, `PGPORT`; not `EXPORT` or `REPORT`.
 fn port_key(k: &str) -> bool {
     static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?i)^([a-z0-9_]*_)?port(_[a-z0-9_]*)?$").is_match(k)
+    re(&R, r"(?i)^(([a-z0-9_]*_)?|pg)port(_[a-z0-9_]*)?$").is_match(k)
 }
 
 fn port_literal(v: &str) -> Option<u16> {
     v.trim().parse::<u16>().ok().filter(|p| *p >= 1024)
 }
 
-/// Ports a script fixes for itself: `TEST_DB_PORT=33306 docker compose …`.
+/// Ports a script fixes for itself: `TEST_DB_PORT=15432 docker compose …`.
+/// `docker run -e X_PORT=…` is the container's own port and stays.
 fn assigned_ports(script: &str) -> Vec<u16> {
     static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r#"\b([A-Za-z_][A-Za-z0-9_]*)=["']?(\d{4,5})\b"#)
-        .captures_iter(script)
-        .filter(|c| port_key(&c[1]))
-        .filter_map(|c| port_literal(&c[2]))
-        .collect()
+    re(
+        &R,
+        r#"(-e\s+|--env[=\s]\s*)?\b([A-Za-z_][A-Za-z0-9_]*)=["']?(\d{4,5})\b"#,
+    )
+    .captures_iter(script)
+    .filter(|c| c.get(1).is_none() && port_key(&c[2]))
+    .filter_map(|c| port_literal(&c[3]))
+    .collect()
 }
 
 /// Give each fixed port a job sets itself a free one, the same in all its steps.
 /// Free ports come from the ephemeral range, which portool's blocks stay below.
 fn map_literals(ports: impl IntoIterator<Item = u16>, maps: &mut Vec<PortMap>) -> Result<()> {
+    // held until all are picked, so the OS hands out a different one each time
+    let mut held = Vec::new();
     for p in ports {
         if maps.iter().any(|m| m.declared == Some(p)) {
             continue;
         }
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).context("no free port")?;
+        let actual = loop {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).context("no free port")?;
+            let a = l.local_addr()?.port();
+            held.push(l);
+            if !maps.iter().any(|m| m.actual == a) {
+                break a;
+            }
+        };
         maps.push(PortMap {
             declared: Some(p),
             container: p,
-            actual: l.local_addr()?.port(),
+            actual,
         });
     }
     Ok(())
@@ -435,7 +488,9 @@ fn rename_compose_projects(script: &str, tag: &str) -> String {
                     || (b[i] == b'\n' && (i == 0 || b[i - 1] != b'\\'))
             })
             .unwrap_or(b.len());
-        out.push_str(&flag.replace_all(&seg[..end], rename));
+        let globals = compose_globals(&seg[..end]);
+        out.push_str(&flag.replace_all(globals, rename));
+        out.push_str(&seg[globals.len()..end]);
         rest = &seg[end..];
     }
     out
@@ -444,7 +499,7 @@ fn rename_compose_projects(script: &str, tag: &str) -> String {
 fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
     for m in maps {
         if let Some(d) = m.declared {
-            if key.to_ascii_uppercase().contains("PORT") && val.trim() == d.to_string() {
+            if port_key(key) && val.trim() == d.to_string() {
                 return m.actual.to_string();
             }
         }
@@ -1213,11 +1268,10 @@ impl<'a> Runner<'a> {
         let exclusive = plan::is_exclusive(job);
         let port_env = match &self.opts.portool {
             Some(bin) if exclusive && ws.join(".portool.toml").is_file() => {
+                // before the sync: it may take a block and still fail
+                self.synced.lock().unwrap().insert(ws.to_path_buf());
                 match crate::portool::sync(bin, ws) {
-                    Ok(v) => {
-                        self.synced.lock().unwrap().insert(ws.to_path_buf());
-                        v
-                    }
+                    Ok(v) => v,
                     Err(e) => {
                         self.stop_services(&names);
                         return (
@@ -1446,7 +1500,13 @@ impl<'a> Runner<'a> {
                 }
                 for (k, v) in env_now.iter_mut() {
                     let s = expr::to_string(v);
-                    let r = rewrite_env_value(k, &s, &maps);
+                    let mut r = rewrite_env_value(k, &s, &maps);
+                    if k == "COMPOSE_PROJECT_NAME"
+                        && !r.is_empty()
+                        && !r.ends_with(&format!("-{tag}"))
+                    {
+                        r = format!("{r}-{tag}");
+                    }
                     if r != s {
                         *v = Value::String(r);
                     }
@@ -1495,7 +1555,11 @@ impl<'a> Runner<'a> {
                 fc("summary").to_string_lossy().into_owned(),
             ));
             env.push(("COMPOSE_PROJECT_NAME".into(), compose_default.clone()));
-            for p in compose_projects(&script) {
+            let from_env = env_now
+                .get("COMPOSE_PROJECT_NAME")
+                .map(expr::to_string)
+                .filter(|p| !p.is_empty());
+            for p in compose_projects(&script).into_iter().chain(from_env) {
                 if !projects.contains(&p) {
                     COMPOSE_PROJECTS.lock().unwrap().push(p.clone());
                     projects.push(p);
@@ -1990,9 +2054,18 @@ mod tests {
             assigned_ports("TEST_DB_PORT=15432 docker compose up\nEXPORT=4000 PORT=80 X=5000"),
             vec![15432]
         );
+        assert!(
+            assigned_ports("docker run -e POSTGRES_PORT=15432 --env=X_PORT=15433 img").is_empty()
+        );
         let mut maps = vec![];
         map_literals([15432, 15432, 15433], &mut maps).unwrap();
         assert_eq!(maps.len(), 2);
+        assert_ne!(maps[0].actual, maps[1].actual);
+        assert_eq!(
+            rewrite_ports("docker run -e PGPORT=15432 img; PGPORT=15432", &maps[..1]),
+            format!("docker run -e PGPORT=15432 img; PGPORT={}", maps[0].actual)
+        );
+        assert_eq!(rewrite_env_value("REPORT", "15432", &maps), "15432");
         assert!(maps
             .iter()
             .all(|m| m.actual != 0 && m.declared != Some(m.actual)));
@@ -2025,6 +2098,18 @@ mod tests {
         assert_eq!(
             rename_compose_projects("docker compose -p a up\nnpm test -p b", "t"),
             "docker compose -p a-t up\nnpm test -p b"
+        );
+        // after the subcommand, `-p` belongs to it
+        assert_eq!(
+            rename_compose_projects(
+                "docker compose -f x.yml -p a exec db mkdir -p tmp; docker compose run -p 8080:80 web",
+                "t"
+            ),
+            "docker compose -f x.yml -p a-t exec db mkdir -p tmp; docker compose run -p 8080:80 web"
+        );
+        assert_eq!(
+            compose_projects("docker compose exec db psql -p 5432"),
+            Vec::<String>::new()
         );
     }
 
