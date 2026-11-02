@@ -66,6 +66,7 @@ Common options (`plan` and `run`):
 | `--base <ref>` | Compare against this ref. Default: origin's default branch. |
 | `--sha <rev>` | Test this commit. Default: `HEAD`. Uncommitted changes are never tested. |
 | `--all` | All checks: ignore `paths` / `paths-ignore`, and run workflows that are disabled on GitHub. `branches` and `types` still apply, so a workflow that only runs on pushes to `main` stays out. |
+| `--include-disabled` | Also run workflows that are disabled on GitHub, with `paths` / `paths-ignore` still applied. `--all` implies it. |
 | `-w, --workflow <file or name>` | Only these workflows. |
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
@@ -105,7 +106,7 @@ Common options (`plan` and `run`):
   `paths`, `paths-ignore`) and `push`. A run pretends to be a non-draft pull
   request into the base branch. `workflow_dispatch`, `schedule` and the rest
   are reported as not triggered, and so are workflows disabled on GitHub (read
-  with `gh` when it is available).
+  with `gh` when it is available) unless `--include-disabled` or `--all` is given.
 - `run:` steps with `bash` (GitHub's `bash --noprofile --norc -eo pipefail`),
   `sh`, `python` or a custom `shell: ... {0}`; `working-directory`, `env`,
   `if:`, `continue-on-error`, `timeout-minutes`.

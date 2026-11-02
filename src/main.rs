@@ -33,6 +33,9 @@ pub struct Target {
     /// (`branches` and `types` still apply). Default: only what these changes trigger
     #[arg(long)]
     all: bool,
+    /// Also run workflows that are disabled on GitHub (`paths` still apply; `--all` implies this)
+    #[arg(long)]
+    include_disabled: bool,
     /// Only these workflows (file name or `name:`), repeatable
     #[arg(long = "workflow", short = 'w')]
     workflows: Vec<String>,
@@ -133,7 +136,7 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
     };
     // GitHub does not run workflows that are disabled there; neither does the default mode.
     let mut disabled_skips = Vec::new();
-    if !t.all {
+    if !t.all && !t.include_disabled {
         let disabled = disabled_workflows(&root);
         wfs.retain(
             |w| match disabled.iter().find(|(path, _)| path == &w.file) {
