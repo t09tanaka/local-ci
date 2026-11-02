@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - `--include-disabled` runs workflows that are disabled on GitHub while keeping
   the `paths` / `paths-ignore` filter (`--all` already did both).
