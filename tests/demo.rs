@@ -218,3 +218,66 @@ fn services_get_their_own_port() {
     assert_eq!(o.status.code(), Some(0), "{out}");
     assert!(out.contains("PASS   ci.yml › integration"), "{out}");
 }
+
+/// `gh` that reports ci.yml as disabled on GitHub.
+fn fake_gh_disabled(d: &Demo) -> String {
+    let bin = d.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '.github/workflows/ci.yml\\tdisabled_manually\\n'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &d.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/demo/demo.git",
+        ],
+    );
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+fn local_ci_path(d: &Demo, path: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_local-ci"))
+        .args(args)
+        .current_dir(&d.repo)
+        .env("LOCAL_CI_HOME", &d.home)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn include_disabled_runs_disabled_workflows_with_paths() {
+    let d = demo("app/lib.sh");
+    let path = fake_gh_disabled(&d);
+    let base = ["plan", "--base", "main"];
+    let o = local_ci_path(&d, &path, &base);
+    let out = stdout(&o);
+    assert!(
+        out.contains("not triggered (disabled manually on GitHub: ci.yml)"),
+        "{out}"
+    );
+    assert!(!out.contains("unit 1"), "{out}");
+    let o = local_ci_path(&d, &path, &[&base[..], &["--include-disabled"]].concat());
+    let out = stdout(&o);
+    assert!(out.contains("triggered by the changes)"), "{out}");
+    assert!(out.contains("unit 1  ci.yml: lint"), "{out}");
+
+    // paths still apply
+    let d = demo("README.md");
+    let path = fake_gh_disabled(&d);
+    let o = local_ci_path(&d, &path, &[&base[..], &["--include-disabled"]].concat());
+    let out = stdout(&o);
+    assert!(
+        out.contains("not triggered (paths not matched: ci.yml)"),
+        "{out}"
+    );
+    assert!(!out.contains("unit 1"), "{out}");
+}
