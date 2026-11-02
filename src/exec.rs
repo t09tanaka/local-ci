@@ -224,24 +224,116 @@ pub fn compose_projects(script: &str) -> Vec<String> {
         &ENV,
         r"\bCOMPOSE_PROJECT_NAME=[\x22']?([A-Za-z0-9][A-Za-z0-9_-]*)",
     );
+    let mut out: Vec<String> = env
+        .captures_iter(&script.replace("\\\n", " "))
+        .map(|c| c[1].to_string())
+        .collect();
+    for cmd in compose_commands(script) {
+        out.extend(
+            flag.captures_iter(compose_globals(&cmd))
+                .map(|c| c[1].to_string()),
+        );
+    }
+    let mut seen = HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
+/// The log written since `from` holds only canirun's own lines, ending in its
+/// ledger lock timing out: the command itself never ran.
+fn ledger_timed_out(log: &Path, from: u64) -> bool {
+    let Ok(mut f) = File::open(log) else {
+        return false;
+    };
+    let mut b = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut b).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&b);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.iter().all(|l| l.starts_with("canirun: "))
+        && lines
+            .iter()
+            .any(|l| l.starts_with("canirun: ledger: timed out"))
+}
+
+/// Each `docker compose` command line of a script, cut at the next command.
+fn compose_commands(script: &str) -> Vec<String> {
     let joined = script.replace("\\\n", " ");
     let mut out = Vec::new();
     for line in joined.lines() {
-        out.extend(env.captures_iter(line).map(|c| c[1].to_string()));
         for marker in ["docker compose", "docker-compose"] {
-            if let Some(at) = line.find(marker) {
+            for (at, _) in line.match_indices(marker) {
                 let rest = &line[at + marker.len()..];
-                // stop at the next command on the line
-                let rest = rest.split(['|', ';', '&']).next().unwrap_or(rest);
-                out.extend(
-                    flag.captures_iter(compose_globals(rest))
-                        .map(|c| c[1].to_string()),
+                out.push(
+                    rest.split(['|', ';', '&'])
+                        .next()
+                        .unwrap_or(rest)
+                        .to_string(),
                 );
             }
         }
     }
-    out.dedup();
     out
+}
+
+/// The Compose files the script's `docker compose` commands read: their `-f`
+/// files, or the default names. None for a file named by a variable.
+fn compose_files(script: &str) -> Vec<Option<String>> {
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let mut out = Vec::new();
+    for cmd in compose_commands(script) {
+        let words: Vec<&str> = re(&WORD, r"\S+")
+            .find_iter(compose_globals(&cmd))
+            .map(|m| m.as_str())
+            .collect();
+        let mut named = false;
+        for (i, w) in words.iter().enumerate() {
+            let file = match *w {
+                "-f" | "--file" => words.get(i + 1).copied(),
+                w => w.strip_prefix("--file="),
+            };
+            if let Some(f) = file {
+                named = true;
+                let f = f.trim_matches(['"', '\'']);
+                out.push((!f.contains('$')).then(|| f.to_string()));
+            }
+        }
+        if !named {
+            for f in [
+                "compose.yaml",
+                "compose.yml",
+                "docker-compose.yaml",
+                "docker-compose.yml",
+            ] {
+                out.push(Some(f.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// A Compose file that pins a container name or a host port.
+fn compose_fixed(text: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(
+        &R,
+        r#"(?m)^\s*container_name\s*:|^\s*-\s*["']?(\d{1,3}(\.\d{1,3}){3}:)?\d{2,5}:\d|^\s*published\s*:\s*["']?\d"#,
+    )
+    .is_match(text)
+}
+
+/// `docker run` with a fixed name or host port.
+fn docker_run_fixed(script: &str) -> bool {
+    static RUN: OnceLock<Regex> = OnceLock::new();
+    static FIXED: OnceLock<Regex> = OnceLock::new();
+    let fixed = re(
+        &FIXED,
+        r#"\s--name[=\s]|\s(-p|--publish)[=\s]+["']?(\d{1,3}(\.\d{1,3}){3}:)?\d{2,5}:"#,
+    );
+    re(&RUN, r"docker\s+(container\s+)?run\b[^|;&\n]*")
+        .find_iter(&script.replace("\\\n", " "))
+        .any(|m| fixed.is_match(m.as_str()))
 }
 
 /// The part of a `docker compose` command line before its subcommand (`up`,
@@ -649,9 +741,39 @@ impl<'a> Runner<'a> {
         ]
     }
 
-    /// Run one shell step. Output goes to `log`; returns how it ended.
+    /// Run one shell step. Output goes to `log`; returns how it ended. When
+    /// canirun's ledger lock times out the command never started, so it is
+    /// tried again, a few times.
     #[allow(clippy::too_many_arguments)]
     fn shell(
+        &self,
+        cwd: &Path,
+        script: &str,
+        shell: Option<&str>,
+        env: &[(String, String)],
+        timeout: Option<Duration>,
+        log: &Path,
+        key: Option<String>,
+    ) -> Result<Exit> {
+        let mut attempt = 0;
+        loop {
+            let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
+            let r = self.shell_once(cwd, script, shell, env, timeout, log, key.clone())?;
+            let failed = matches!(r, Exit::Code(c) if c != 0);
+            if !(failed
+                && attempt < 3
+                && self.opts.canirun.is_some()
+                && ledger_timed_out(log, from))
+            {
+                return Ok(r);
+            }
+            attempt += 1;
+            std::thread::sleep(Duration::from_secs(attempt));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shell_once(
         &self,
         cwd: &Path,
         script: &str,
@@ -960,26 +1082,44 @@ impl<'a> Runner<'a> {
     /// One of the `--containers` slots, shared by every `local-ci` run on the
     /// machine: each exclusive job holds one while it runs, so databases started
     /// early do not pile up while their tests wait for CPU. None when cancelled.
-    fn container_slot(&self) -> Option<File> {
+    fn container_slot(&self) -> Result<Option<File>> {
         use fs2::FileExt;
-        let dir = self.lock_file.parent()?;
+        let dir = self.lock_file.parent().context("no lock directory")?;
+        fs::create_dir_all(dir)?;
         loop {
             for i in 0..self.opts.containers.max(1) {
                 let f = OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
-                    .open(dir.join(format!("containers-{i}.lock")))
-                    .ok()?;
+                    .open(dir.join(format!("containers-{i}.lock")))?;
                 if f.try_lock_exclusive().is_ok() {
-                    return Some(f);
+                    return Ok(Some(f));
                 }
             }
             if CANCEL.load(Ordering::SeqCst) {
-                return None;
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// Whether the job binds something fixed that rewriting does not reach: a
+    /// Compose file with `container_name:` or a literal host port, or
+    /// `docker run --name` / `-p <host port>:`. A Compose file named by a
+    /// variable cannot be read here and counts as fixed.
+    fn fixed_resources(&self, ws: &Path, w: &Workflow, job: &Job, cm: &Map<String, Value>) -> bool {
+        let ctx = Ctx::new(cm, Status::Success);
+        job.steps.iter().any(|s| {
+            let Some(run) = &s.run else { return false };
+            let script = expr::interpolate(run, &ctx).unwrap_or_else(|_| run.clone());
+            let dir = ws.join(plan::step_dir(w, job, s));
+            docker_run_fixed(&script)
+                || compose_files(&script).iter().any(|f| match f {
+                    Some(f) => fs::read_to_string(dir.join(f)).is_ok_and(|t| compose_fixed(&t)),
+                    None => true,
+                })
+        })
     }
 
     /// Where the npm shim records the installs done in the workspace `ws`.
@@ -1195,10 +1335,11 @@ impl<'a> Runner<'a> {
         // Combinations that pass `if:` run after this loop.
         let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
         let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for combo in combos {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
-            let display = {
+            let mut display = {
                 let ctx = Ctx::new(&cm, Status::Success);
                 match &job.name {
                     Some(n) if n.contains("${{") => {
@@ -1212,6 +1353,11 @@ impl<'a> Runner<'a> {
                     None => job.id.clone(),
                 }
             };
+            // a name over some of the matrix only: keep the entries (and their logs) apart
+            if !seen.insert(display.clone()) {
+                display = format!("{display} #{}", out.len() + 1);
+                seen.insert(display.clone());
+            }
             let run_it = {
                 let ctx = Ctx::new(&cm, needs_status);
                 expr::condition(job.cond.as_deref(), &ctx)
@@ -1235,11 +1381,21 @@ impl<'a> Runner<'a> {
 
         let exclusive = plan::is_exclusive(job);
         let failed = AtomicBool::new(false);
+        let stop = job.fail_fast.then_some(&failed);
         let one = |ws: &Path, cm: Map<String, Value>, display: String| {
+            // Something rewriting cannot reach (a `container_name:`) still needs
+            // the lock. Taken before the slot, in the order units take them.
+            let lock = if exclusive && self.isolated() && self.fixed_resources(ws, w, job, &cm) {
+                self.lock().ok()
+            } else {
+                None
+            };
             let slot = if exclusive {
                 match self.container_slot() {
-                    Some(s) => Some(s),
-                    None => return skip(display, "cancelled".into()),
+                    Ok(Some(s)) => Some(s),
+                    Ok(None) => return skip(display, "cancelled".into()),
+                    // no lock files: run without a slot rather than not at all
+                    Err(_) => None,
                 }
             } else {
                 None
@@ -1247,12 +1403,13 @@ impl<'a> Runner<'a> {
             if CANCEL.load(Ordering::SeqCst) {
                 return skip(display, "cancelled".into());
             }
-            if job.fail_fast && failed.load(Ordering::SeqCst) {
+            if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
             }
-            let r = self.run_combo(ws, w, job, cm, display);
+            let r = self.run_combo(ws, w, job, cm, display, stop);
             drop(slot);
-            if r.0.outcome == Outcome::Fail {
+            drop(lock);
+            if matches!(r.0.outcome, Outcome::Fail | Outcome::Error(_)) {
                 failed.store(true, Ordering::SeqCst);
             }
             r
@@ -1260,12 +1417,22 @@ impl<'a> Runner<'a> {
         // Each combination at once, in its own copy of the workspace, as each
         // gets its own runner on GitHub. Only with canirun, which keeps the CPU
         // in check, and for exclusive jobs only when they cannot collide.
-        if todo.len() > 1 && self.opts.canirun.is_some() && (!exclusive || self.isolated()) {
+        let at_once = job.max_parallel.unwrap_or(usize::MAX);
+        if todo.len() > 1
+            && at_once > 1
+            && self.opts.canirun.is_some()
+            && (!exclusive || self.isolated())
+        {
             let done = Mutex::new(Vec::new());
+            let sem = Semaphore {
+                free: Mutex::new(at_once),
+                cv: Condvar::new(),
+            };
             std::thread::scope(|scope| {
                 for (i, cm, display) in todo {
-                    let (one, done) = (&one, &done);
+                    let (one, done, sem) = (&one, &done, &sem);
                     scope.spawn(move || {
+                        sem.acquire();
                         // the pid stays last in the name: cleanup scripts read it from there
                         let copy = self.wt.with_file_name(format!(
                             "{}-c{}-{}",
@@ -1278,6 +1445,7 @@ impl<'a> Runner<'a> {
                             Err(e) => error(display, format!("cannot copy the worktree: {e:#}")),
                         };
                         self.remove_copy(&copy);
+                        sem.release();
                         done.lock().unwrap().push((i, r));
                     });
                 }
@@ -1318,8 +1486,11 @@ impl<'a> Runner<'a> {
         job: &Job,
         mut cm: Map<String, Value>,
         display: String,
+        // set when another entry of a fail-fast matrix failed
+        stop: Option<&AtomicBool>,
     ) -> (JobResult, Map<String, Value>) {
         let t0 = Instant::now();
+        let mut stopped = false;
         let mut steps: Vec<StepResult> = Vec::new();
         let mut names = Vec::new();
         let finish = |outcome: Outcome, steps: Vec<StepResult>, t0: Instant| JobResult {
@@ -1450,7 +1621,8 @@ impl<'a> Runner<'a> {
                     note,
                 });
             };
-            let status = if CANCEL.load(Ordering::SeqCst) {
+            stopped |= stop.is_some_and(|s| s.load(Ordering::SeqCst));
+            let status = if CANCEL.load(Ordering::SeqCst) || stopped {
                 Status::Cancelled
             } else if failed || errored.is_some() {
                 Status::Failure
@@ -1780,6 +1952,8 @@ impl<'a> Runner<'a> {
             Outcome::Fail
         } else if let Some(e) = errored {
             Outcome::Error(e)
+        } else if stopped {
+            Outcome::Skip("fail-fast: another entry failed".into())
         } else {
             Outcome::Pass
         };
@@ -2163,6 +2337,50 @@ mod tests {
     }
 
     #[test]
+    fn what_rewriting_cannot_reach() {
+        assert_eq!(
+            compose_files(
+                "docker compose -f a.yml --file=b.yml -p x up -d; docker compose -f \"$F\" up"
+            ),
+            vec![Some("a.yml".into()), Some("b.yml".into()), None]
+        );
+        assert_eq!(compose_files("docker compose up -f nope").len(), 4);
+        assert!(compose_fixed("services:\n  db:\n    container_name: db\n"));
+        assert!(compose_fixed("    ports:\n      - \"5432:5432\"\n"));
+        assert!(compose_fixed("    ports:\n      - 127.0.0.1:5432:5432\n"));
+        assert!(compose_fixed(
+            "      - target: 80\n        published: 8080\n"
+        ));
+        assert!(!compose_fixed(
+            "    ports:\n      - \"${DB_PORT:-5432}:5432\"\n      - \"5432\"\n"
+        ));
+        assert!(docker_run_fixed("docker run -d --name db postgres"));
+        assert!(docker_run_fixed("docker run \\\n  -p 5432:5432 postgres"));
+        assert!(!docker_run_fixed(
+            "docker run -p 127.0.0.1::5432 -e X=1 postgres; docker compose run --name x web"
+        ));
+    }
+
+    #[test]
+    fn canirun_ledger_timeouts_are_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        fs::write(&log, "earlier output\n").unwrap();
+        let from = fs::metadata(&log).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "canirun: waiting 0:00 (queue)").unwrap();
+        writeln!(
+            f,
+            "canirun: ledger: timed out after 10s waiting for /x/ledger.lock"
+        )
+        .unwrap();
+        assert!(ledger_timed_out(&log, from));
+        writeln!(f, "npm ERR! something").unwrap();
+        assert!(!ledger_timed_out(&log, from));
+        assert!(!ledger_timed_out(&log, 0));
+    }
+
+    #[test]
     fn compose_projects_get_a_tag() {
         assert_eq!(
             rename_compose_projects(
@@ -2206,6 +2424,12 @@ mod tests {
 
     #[test]
     fn compose_project_names() {
+        assert_eq!(
+            compose_projects(
+                "docker compose -p a up -d; docker compose -p b down; docker compose -p a ps"
+            ),
+            vec!["a", "b"]
+        );
         assert_eq!(
             compose_projects("TEST_DB_PORT=1 docker compose \\\n  -p app-int \\\n  -f a.yml up -d"),
             vec!["app-int"]

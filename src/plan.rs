@@ -156,7 +156,16 @@ pub fn is_exclusive(j: &Job) -> bool {
         || j.steps
             .iter()
             .filter_map(|s| s.run.as_deref())
-            .any(|r| docker_re().is_match(r))
+            .any(|r| docker_re().is_match(r) || server_re().is_match(r))
+}
+
+/// Scripts that start a browser test server or an e2e / integration suite,
+/// which bind ports even when the job's name does not say so.
+fn server_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)\b(playwright|cypress)\b|\btest:(e2e|int|integration)\b").unwrap()
+    })
 }
 
 pub fn is_installer(run: &str) -> bool {

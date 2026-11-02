@@ -96,13 +96,17 @@ Common options (`plan` and `run`):
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
    a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere), so
    `node_modules` and other setup output cost little to copy. With canirun,
-   the entries of a matrix run at once too, each in its own copy. Jobs that
-   start services or containers, or look like integration / e2e tests, are
+   the entries of a matrix run at once too (up to `strategy.max-parallel`),
+   each in its own copy. Jobs that start services or containers, run
+   Playwright or Cypress, or look like integration / e2e tests, are
    *exclusive*. Their fixed ports and Compose projects are rewritten (see
-   below), and with portool and a `.portool.toml` they overlap freely; without
-   portool the ports their scripts choose for themselves may still collide, so
-   their units hold a per-repository lock and never overlap, in this run or in
-   another `local-ci` run of the same repository. Either way, at most
+   below), and with portool and a `.portool.toml` they overlap freely, except a
+   job that pins something rewriting cannot reach (a Compose file with
+   `container_name:` or a literal host port, `docker run --name`): it takes a
+   per-repository lock. Without portool the ports their scripts choose for
+   themselves may still collide, so their units hold that lock and never
+   overlap, in this run or in another `local-ci` run of the same repository.
+   Either way, at most
    `--containers` exclusive jobs (default 2) run at once on the machine, across
    all `local-ci` runs, so databases do not pile up while their tests wait
    for CPU.

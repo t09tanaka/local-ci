@@ -41,6 +41,8 @@ pub struct Job {
     /// `strategy.matrix`, as YAML (a mapping, or an expression string).
     pub matrix: Option<Y>,
     pub fail_fast: bool,
+    /// `strategy.max-parallel` when it is a number.
+    pub max_parallel: Option<usize>,
     pub steps: Vec<Step>,
     pub timeout_minutes: Option<f64>,
     pub continue_on_error: bool,
@@ -254,6 +256,10 @@ fn parse_job(id: &str, j: &Y) -> Job {
             get(j, "strategy").and_then(|s| get(s, "fail-fast")),
             Some(Y::Bool(false))
         ),
+        max_parallel: get(j, "strategy")
+            .and_then(|s| get(s, "max-parallel"))
+            .and_then(Y::as_u64)
+            .map(|n| n as usize),
         steps: match get(j, "steps") {
             Some(Y::Sequence(s)) => s.iter().map(parse_step).collect(),
             _ => vec![],
