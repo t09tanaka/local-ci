@@ -37,8 +37,10 @@ pub struct Saved {
     pub description: String,
 }
 
+/// How a workflow is named in output: the file name for `.github/workflows/`,
+/// the path for one read with `--workflows-dir`, so equal file names stay apart.
 pub fn short(f: &str) -> &str {
-    f.rsplit('/').next().unwrap_or(f)
+    f.strip_prefix(".github/workflows/").unwrap_or(f)
 }
 
 pub fn tilde(p: &Path) -> String {

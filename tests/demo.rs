@@ -340,3 +340,59 @@ fn include_disabled_runs_disabled_workflows_with_paths() {
     );
     assert!(!out.contains("unit 1"), "{out}");
 }
+
+#[test]
+fn workflows_dir_adds_workflows_github_does_not_run() {
+    let d = demo("app/lib.sh");
+    // Same file name as .github/workflows/ci.yml: the output names it by path.
+    std::fs::create_dir_all(d.repo.join("ci/local")).unwrap();
+    std::fs::write(
+        d.repo.join("ci/local/ci.yml"),
+        r#"on: pull_request
+jobs:
+  extra:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo extra
+"#,
+    )
+    .unwrap();
+    git(&d.repo, &["add", "."]);
+    git(&d.repo, &["commit", "-qm", "local-only workflow"]);
+
+    let out = stdout(&local_ci(&d, &["plan"]));
+    assert!(!out.contains("ci/local"), "{out}");
+
+    let o = local_ci(&d, &["plan", "--workflows-dir", "./ci/local/"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("  ci.yml: lint"), "{out}");
+    assert!(out.contains("  ci/local/ci.yml: extra"), "{out}");
+
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-canirun",
+            "--workflows-dir",
+            "ci/local",
+            "-w",
+            "ci/local/ci.yml",
+        ],
+    );
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("PASS   ci/local/ci.yml › extra"), "{out}");
+}
+
+#[test]
+fn workflows_dir_must_be_committed() {
+    let d = demo("app/lib.sh");
+    std::fs::create_dir_all(d.repo.join("ci/local")).unwrap();
+    std::fs::write(d.repo.join("ci/local/ci.yml"), "on: pull_request\n").unwrap();
+    let o = local_ci(&d, &["plan", "--workflows-dir", "ci/local"]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("commit them first"), "{err}");
+}

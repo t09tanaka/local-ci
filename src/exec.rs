@@ -621,9 +621,7 @@ impl<'a> Runner<'a> {
         let dir = self.run_dir.join(format!(
             "{}-{}",
             slug_of(
-                wf.rsplit('/')
-                    .next()
-                    .unwrap_or(wf)
+                crate::report::short(wf)
                     .trim_end_matches(".yml")
                     .trim_end_matches(".yaml")
             ),
@@ -1325,7 +1323,7 @@ impl<'a> Runner<'a> {
                 .unwrap_or(remaining);
             let key = format!(
                 "local-ci {} {} {}",
-                w.file.rsplit('/').next().unwrap_or(""),
+                crate::report::short(&w.file),
                 job.id,
                 label
             );

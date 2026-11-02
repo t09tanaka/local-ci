@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `--workflows-dir <dir>` also reads the workflows in another directory of the
+  repository, for checks that should only run locally. They are named by their
+  path in the output, so a file name used in both places stays distinct.
 - Each unit runs in its own copy of the worktree, cloned after setup, instead
   of all units sharing one. A job that edits tracked files for a while (a
   negative control, a formatter, mutation testing) made the jobs running beside

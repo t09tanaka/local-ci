@@ -36,6 +36,10 @@ pub struct Target {
     /// Also run workflows that are disabled on GitHub (`paths` still apply; `--all` implies this)
     #[arg(long)]
     include_disabled: bool,
+    /// Also read workflows from this directory (relative to the repository root), repeatable.
+    /// GitHub does not run them; their triggers are applied as for `.github/workflows/`
+    #[arg(long = "workflows-dir", value_name = "DIR")]
+    workflows_dirs: Vec<String>,
     /// Only these workflows (file name or `name:`), repeatable
     #[arg(long = "workflow", short = 'w')]
     workflows: Vec<String>,
@@ -122,7 +126,7 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
         None
     };
     let mut wfs = Vec::new();
-    for (file, text) in git::workflows_at(&root, &sha)? {
+    for (file, text) in git::workflows_at(&root, &sha, &t.workflows_dirs)? {
         match workflow::parse(&file, &text) {
             Ok(w) => wfs.push(w),
             Err(e) => eprintln!("local-ci: skipping {file}: {e:#}"),
@@ -542,10 +546,6 @@ fn status(dir: Option<PathBuf>, sha: &str) -> Result<i32> {
     Ok(0)
 }
 
-fn short(f: &str) -> &str {
-    f.rsplit('/').next().unwrap_or(f)
-}
-
 fn job_note(j: &workflow::Job) -> String {
     let mut n = Vec::new();
     if j.container {
@@ -650,7 +650,7 @@ fn print_plan(r: &Repo, p: &plan::Plan) {
         println!(
             "unit {:<2} {}: {}{}",
             i + 1,
-            short(&w.file),
+            report::short(&w.file),
             jobs.join(" → "),
             if u.exclusive { "  [exclusive]" } else { "" }
         );
