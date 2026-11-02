@@ -1037,7 +1037,7 @@ impl<'a> Runner<'a> {
                 let results = &results;
                 scope.spawn(move || {
                     let t0 = Instant::now();
-                    let lock = if u.exclusive && !self.isolated() {
+                    let lock = if self.unit_locked(u) {
                         self.lock().ok()
                     } else {
                         None
@@ -1077,6 +1077,17 @@ impl<'a> Runner<'a> {
     /// the per-repository lock.
     fn isolated(&self) -> bool {
         self.opts.portool.is_some() && self.wt.join(".portool.toml").is_file()
+    }
+
+    /// Whether the unit holds the per-repository lock while it runs. Jobs with
+    /// `services:` always do: they get no portool ports (see `run_combo`), so a
+    /// port their code picks for itself, a test server's, is not their own.
+    fn unit_locked(&self, u: &Unit) -> bool {
+        u.exclusive
+            && (!self.isolated()
+                || u.jobs
+                    .iter()
+                    .any(|id| !self.plan.job(u.wf, id).services.is_empty()))
     }
 
     /// One of the `--containers` slots, shared by every `local-ci` run on the
@@ -1218,9 +1229,10 @@ impl<'a> Runner<'a> {
         let w = &sel.wf;
         let mut needs_ctx = Map::new();
         let mut jobs = Vec::new();
+        let locked = self.unit_locked(u);
         for id in &u.jobs {
             let job = self.plan.job(u.wf, id);
-            let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx);
+            let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked);
             let failed = job_results
                 .iter()
                 .any(|r| r.0.outcome == Outcome::Fail || matches!(r.0.outcome, Outcome::Error(_)));
@@ -1260,6 +1272,8 @@ impl<'a> Runner<'a> {
         event: &str,
         job: &Job,
         needs: &Map<String, Value>,
+        // the unit holds the per-repository lock
+        locked: bool,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
         let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
@@ -1385,7 +1399,7 @@ impl<'a> Runner<'a> {
         let one = |ws: &Path, cm: Map<String, Value>, display: String| {
             // Something rewriting cannot reach (a `container_name:`) still needs
             // the lock. Taken before the slot, in the order units take them.
-            let lock = if exclusive && self.isolated() && self.fixed_resources(ws, w, job, &cm) {
+            let lock = if exclusive && !locked && self.fixed_resources(ws, w, job, &cm) {
                 self.lock().ok()
             } else {
                 None
@@ -1418,11 +1432,7 @@ impl<'a> Runner<'a> {
         // gets its own runner on GitHub. Only with canirun, which keeps the CPU
         // in check, and for exclusive jobs only when they cannot collide.
         let at_once = job.max_parallel.unwrap_or(usize::MAX);
-        if todo.len() > 1
-            && at_once > 1
-            && self.opts.canirun.is_some()
-            && (!exclusive || self.isolated())
-        {
+        if todo.len() > 1 && at_once > 1 && self.opts.canirun.is_some() && (!exclusive || !locked) {
             let done = Mutex::new(Vec::new());
             let sem = Semaphore {
                 free: Mutex::new(at_once),
@@ -1529,7 +1539,11 @@ impl<'a> Runner<'a> {
         // another run, or a matrix entry beside it, binds.
         let exclusive = plan::is_exclusive(job);
         let port_env = match &self.opts.portool {
-            Some(bin) if exclusive && ws.join(".portool.toml").is_file() => {
+            // Not with `services:`: the job's database is the service, and a
+            // script that honours portool's ports would look for its own instead.
+            Some(bin)
+                if exclusive && job.services.is_empty() && ws.join(".portool.toml").is_file() =>
+            {
                 // before the sync: it may take a block and still fail
                 self.synced.lock().unwrap().insert(ws.to_path_buf());
                 match crate::portool::sync(bin, ws) {
