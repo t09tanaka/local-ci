@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - Worktree copies are registered one at a time per repository, across runs.
   When many units made their copies at the same moment, `git worktree add`
