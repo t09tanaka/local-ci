@@ -101,15 +101,35 @@ pub fn changed_files(dir: &Path, base: &str, sha: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Workflow files at `sha`, as (path, text).
-pub fn workflows_at(dir: &Path, sha: &str) -> Result<Vec<(String, String)>> {
-    let list = git(dir, &["ls-tree", "--name-only", sha, ".github/workflows/"]).unwrap_or_default();
+/// Workflow files at `sha`, as (path, text): `.github/workflows/` and then each
+/// of `extra` (directories relative to the repository root, which must hold some).
+pub fn workflows_at(dir: &Path, sha: &str, extra: &[String]) -> Result<Vec<(String, String)>> {
+    let mut dirs = vec![".github/workflows".to_string()];
+    for d in extra {
+        if Path::new(d).is_absolute() {
+            bail!("--workflows-dir {d}: give a path relative to the repository root");
+        }
+        let d = crate::plan::norm_dir(d);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
     let mut out = Vec::new();
-    for f in list
-        .lines()
-        .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
-    {
-        out.push((f.to_string(), git(dir, &["show", &format!("{sha}:{f}")])?));
+    for (i, d) in dirs.iter().enumerate() {
+        let list = git(dir, &["ls-tree", "--name-only", sha, &format!("{d}/")]).unwrap_or_default();
+        let files: Vec<&str> = list
+            .lines()
+            .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
+            .collect();
+        if i > 0 && files.is_empty() {
+            bail!(
+                "--workflows-dir {d}: no .yml / .yaml files there at {} (workflows are read from the commit; commit them first)",
+                &sha[..sha.len().min(7)]
+            );
+        }
+        for f in files {
+            out.push((f.to_string(), git(dir, &["show", &format!("{sha}:{f}")])?));
+        }
     }
     Ok(out)
 }

@@ -67,6 +67,7 @@ Common options (`plan` and `run`):
 | `--sha <rev>` | Test this commit. Default: `HEAD`. Uncommitted changes are never tested. |
 | `--all` | All checks: ignore `paths` / `paths-ignore`, and run workflows that are disabled on GitHub. `branches` and `types` still apply, so a workflow that only runs on pushes to `main` stays out. |
 | `--include-disabled` | Also run workflows that are disabled on GitHub, with `paths` / `paths-ignore` still applied. `--all` implies it. |
+| `--workflows-dir <dir>` | Also read the workflows in this directory (relative to the repository root, repeatable). GitHub never runs them, so this is the place for checks you only want before pushing. They are picked by the same triggers and `paths`, read from the commit like the rest, and named by their path in the output (`ci/local/mutation.yml › ...`). |
 | `-w, --workflow <file or name>` | Only these workflows. |
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
