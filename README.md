@@ -93,7 +93,7 @@ Common options (`plan` and `run`):
    own copy of the worktree as it is after setup, as each CI job has its own
    checkout: a job that edits files for a while (a negative control, a
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
-   a copy-on-write clone (`cp -c` on APFS, `cp --reflink=auto` elsewhere), so
+   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere), so
    `node_modules` and other setup output cost little to copy. Units that
    start services or containers, or look like integration / e2e tests, are
    *exclusive*: they hold a per-repository lock, so they never overlap, in this

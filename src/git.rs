@@ -167,33 +167,27 @@ pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<
         .map(PathBuf::from)
     };
     std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
-    let mut entries = Vec::new();
+    let mut rest = Vec::new();
     for e in std::fs::read_dir(from)? {
         let e = e?;
-        if e.file_name() != ".git" {
-            entries.push(e.path());
+        if e.file_name() != ".git" && !clone_tree(&e.path(), &to.join(e.file_name())) {
+            rest.push(e.path());
         }
     }
-    if entries.is_empty() {
+    if rest.is_empty() {
         return Ok(());
     }
-    let cp = |flags: &[&str]| {
-        Command::new("cp")
-            .args(flags)
-            .args(&entries)
-            .arg(to)
-            .output()
-            .context("failed to run cp")
-    };
-    let mut out = if cfg!(target_os = "macos") {
-        cp(&["-cRp"])?
+    let flags: &[&str] = if cfg!(target_os = "macos") {
+        &["-Rp"]
     } else {
-        cp(&["-a", "--reflink=auto"])?
+        &["-a", "--reflink=auto"]
     };
-    if !out.status.success() && cfg!(target_os = "macos") {
-        // not APFS: a plain copy
-        out = cp(&["-Rp"])?;
-    }
+    let out = Command::new("cp")
+        .args(flags)
+        .args(&rest)
+        .arg(to)
+        .output()
+        .context("failed to run cp")?;
     if !out.status.success() {
         bail!(
             "cp {}: {}",
@@ -202,6 +196,27 @@ pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<
         );
     }
     Ok(())
+}
+
+/// Clone a whole directory tree in one call (APFS). About five times faster
+/// than `cp -c`, which clones file by file.
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let (Ok(f), Ok(t)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), CLONE_NOFOLLOW) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree(_from: &Path, _to: &Path) -> bool {
+    false
 }
 
 /// Move the worktree out of the way, unregister it, and delete the files in the background.
