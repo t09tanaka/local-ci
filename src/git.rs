@@ -26,6 +26,28 @@ fn git_ok(dir: &Path, args: &[&str]) -> Option<String> {
     git(dir, args).ok().filter(|s| !s.is_empty())
 }
 
+/// `git worktree add` / `prune` / `remove`, one at a time per repository, in
+/// this process and across `local-ci` runs. Side by side, an add reads the
+/// `.git/worktrees/<name>/commondir` another add is still writing ("failed to
+/// read ... commondir"), and a prune can drop an entry that is half made.
+fn worktree_admin<T>(repo: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs2::FileExt;
+    static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _local = LOCAL.lock().unwrap_or_else(|e| e.into_inner());
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(Path::new(&common).join("local-ci-worktrees.lock"))
+        .context("cannot open the worktree lock")?;
+    lock.lock_exclusive()?;
+    f()
+}
+
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(
         git(dir, &["rev-parse", "--show-toplevel"]).context("not inside a git repository")?,
@@ -148,17 +170,19 @@ pub fn repo_slug(dir: &Path) -> Option<String> {
 }
 
 pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
-    git(
-        repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            "--quiet",
-            &path.to_string_lossy(),
-            sha,
-        ],
-    )
+    worktree_admin(repo, || {
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--quiet",
+                &path.to_string_lossy(),
+                sha,
+            ],
+        )
+    })
     .map(|_| ())
 }
 
@@ -167,18 +191,20 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
 /// copy-on-write where the filesystem allows it, so this is quick and a write
 /// in one copy is never seen in the other.
 pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
-    git(
-        repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            "--no-checkout",
-            "--quiet",
-            &to.to_string_lossy(),
-            sha,
-        ],
-    )?;
+    worktree_admin(repo, || {
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                "--quiet",
+                &to.to_string_lossy(),
+                sha,
+            ],
+        )
+    })?;
     let index = |d: &Path| {
         git(
             d,
@@ -244,7 +270,7 @@ pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
     let _ = std::fs::create_dir_all(trash);
     let target = trash.join(path.file_name().unwrap_or_default());
     if std::fs::rename(path, &target).is_ok() {
-        let _ = git(repo, &["worktree", "prune"]);
+        let _ = worktree_admin(repo, || git(repo, &["worktree", "prune"]));
         let _ = Command::new("rm")
             .arg("-rf")
             .arg(&target)
@@ -253,10 +279,12 @@ pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
             .stderr(std::process::Stdio::null())
             .spawn();
     } else {
-        let _ = git(
-            repo,
-            &["worktree", "remove", "--force", &path.to_string_lossy()],
-        );
+        let _ = worktree_admin(repo, || {
+            git(
+                repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+            )
+        });
     }
 }
 
@@ -269,5 +297,51 @@ mod tests {
         assert_eq!(branch_name("origin/main"), "main");
         assert_eq!(branch_name("refs/heads/dev"), "dev");
         assert_eq!(branch_name("develop"), "develop");
+    }
+
+    /// Many units make and drop their copies at the same moment.
+    #[test]
+    fn copies_made_and_removed_side_by_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-qm", "a"]);
+        let sha = rev(&repo, "HEAD").unwrap();
+        let trash = tmp.path().join("trash");
+        std::thread::scope(|s| {
+            for i in 0..24 {
+                let (repo, sha, trash) = (&repo, &sha, &trash);
+                let to = tmp.path().join(format!("c{i}"));
+                s.spawn(move || {
+                    clone_worktree(repo, repo, &to, sha).unwrap();
+                    assert!(to.join("a.txt").is_file());
+                    remove_worktree(repo, &to, trash);
+                });
+            }
+        });
+        assert_eq!(
+            git(&repo, &["worktree", "list"]).unwrap().lines().count(),
+            1
+        );
     }
 }
