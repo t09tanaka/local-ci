@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - `--workflows-dir <dir>` also reads the workflows in another directory of the
   repository, for checks that should only run locally. They are named by their
