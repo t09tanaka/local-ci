@@ -6,7 +6,6 @@
   no `*_PORT` value, no `${{ job.services... }}`) is bound as declared instead
   of moved to a free port. The code reaching the service by that port as its
   default could not find it before.
-
 - Exclusive jobs no longer bind the fixed ports a workflow writes down. A number
   in a `*_PORT` variable of the job's `env`, or `TEST_DB_PORT=15432` in a
   script, is given a free port and rewritten everywhere the job uses it.
