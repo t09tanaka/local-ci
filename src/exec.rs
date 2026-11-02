@@ -590,6 +590,32 @@ fn rename_compose_projects(script: &str, tag: &str) -> String {
     out
 }
 
+/// Whether the workflow reaches a service's host port `h` somewhere the
+/// rewriting changes: `localhost:<h>`, `KEY_PORT=<h>`, a `*_PORT` env value,
+/// or `${{ job.services... }}`. When it never names the port, the code uses it
+/// as its default, and the service has to be on it as on GitHub.
+fn rewritable_mention(w: &Workflow, job: &Job, h: u16) -> bool {
+    let hs = h.to_string();
+    let host = Regex::new(&format!(r"\b(localhost|127\.0\.0\.1|0\.0\.0\.0):{h}\b")).unwrap();
+    let assign = Regex::new(&format!(r#"\b([A-Za-z_][A-Za-z0-9_]*)=["']?{h}\b"#)).unwrap();
+    let in_text = |t: &str| {
+        t.contains("job.services.")
+            || host.is_match(t)
+            || assign.captures_iter(t).any(|c| port_key(&c[1]))
+    };
+    let in_env = |pairs: &[(String, String)]| {
+        pairs
+            .iter()
+            .any(|(k, v)| (port_key(k) && v.trim() == hs) || in_text(v))
+    };
+    in_env(&w.env)
+        || in_env(&job.env)
+        || job
+            .steps
+            .iter()
+            .any(|s| in_env(&s.env) || s.run.as_deref().is_some_and(in_text))
+}
+
 fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
     for m in maps {
         if let Some(d) = m.declared {
@@ -1516,7 +1542,7 @@ impl<'a> Runner<'a> {
         let mut maps = Vec::new();
         let mut services_ctx = Map::new();
         if !job.services.is_empty() {
-            match self.start_services(job, &cm, &mut names) {
+            match self.start_services(w, job, &cm, &mut names) {
                 Ok((m, sc)) => {
                     maps = m;
                     services_ctx = sc;
@@ -2107,6 +2133,7 @@ impl<'a> Runner<'a> {
 
     fn start_services(
         &self,
+        w: &Workflow,
         job: &Job,
         cm: &Map<String, Value>,
         names: &mut Vec<String>,
@@ -2138,9 +2165,13 @@ impl<'a> Runner<'a> {
                 args.push("-e".into());
                 args.push(format!("{k}={}", expr::interpolate(v, &ctx)?));
             }
-            for (_, c) in &svc.ports {
+            for (d, c) in &svc.ports {
                 args.push("-p".into());
-                args.push(format!("127.0.0.1::{c}"));
+                args.push(match d {
+                    // nothing to rewrite: the code finds the service by this port
+                    Some(h) if !rewritable_mention(w, job, *h) => format!("127.0.0.1:{h}:{c}"),
+                    _ => format!("127.0.0.1::{c}"),
+                });
             }
             let opts = expr::interpolate(&svc.options, &ctx)?;
             args.extend(
@@ -2323,6 +2354,31 @@ mod tests {
             "TEST_DB_PORT=49152 docker compose up; N=5433"
         );
         assert_eq!(rewrite_ports("PORT='5433' x", &maps), "PORT='49152' x");
+    }
+
+    #[test]
+    fn service_ports_the_workflow_never_names() {
+        let wf = |env: &str, run: &str| {
+            crate::workflow::parse(
+                "ci.yml",
+                &format!(
+                    "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    env: {{{env}}}\n    services:\n      db:\n        image: mysql\n        ports: ['15306:3306']\n    steps:\n      - run: {run}\n"
+                ),
+            )
+            .unwrap()
+        };
+        let named = |w: &Workflow| rewritable_mention(w, &w.jobs[0], 15306);
+        assert!(!named(&wf("", "npm test")));
+        assert!(!named(&wf("COUNT: '15306'", "mysql -P 15306")));
+        assert!(named(&wf("DB_PORT: '15306'", "npm test")));
+        assert!(named(&wf(
+            "",
+            "DATABASE_URL=mysql://localhost:15306/x npm test"
+        )));
+        assert!(named(&wf(
+            "",
+            "PORT=${{ job.services.db.ports[3306] }} npm test"
+        )));
     }
 
     #[test]

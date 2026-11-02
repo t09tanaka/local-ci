@@ -139,8 +139,9 @@ Common options (`plan` and `run`):
 - `services:` with Docker. Each container gets a free host port, and
   `localhost:<port>` / `127.0.0.1:<port>` in the job's `env` and `run:`
   scripts (and `*PORT*` variables holding the port) are rewritten to it, so a
-  database you already run on 5432 is not in the way. `--health-cmd` is waited
-  for.
+  database you already run on 5432 is not in the way. A host port the workflow
+  never names that way is left as declared, since then the code itself
+  defaults to it. `--health-cmd` is waited for.
 - Fixed ports and Compose projects in exclusive jobs (below). A port the job
   sets itself — a number in a `*_PORT` variable of its `env`, or
   `TEST_DB_PORT=15432 docker compose ...` in a script — is given a free port,
