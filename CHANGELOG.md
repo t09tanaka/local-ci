@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Worktree copies are registered one at a time per repository, across runs.
+  When many units made their copies at the same moment, `git worktree add`
+  read another copy's half-written entry and the unit ended in `error`
+  ("failed to read .git/worktrees/.../commondir").
+
 ## 0.4.0
 
 - A `services:` host port that the workflow never names (no `localhost:<port>`,
