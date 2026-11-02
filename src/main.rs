@@ -4,6 +4,7 @@ mod filter;
 mod git;
 mod matrix;
 mod plan;
+mod portool;
 mod report;
 mod workflow;
 
@@ -61,6 +62,9 @@ struct RunArgs {
     /// Do not wrap steps in `canirun exec`
     #[arg(long)]
     no_canirun: bool,
+    /// Do not give jobs that start containers or test servers a port block from portool
+    #[arg(long)]
+    no_portool: bool,
     /// Do not record the result as the `local-ci` commit status
     #[arg(long)]
     no_status: bool,
@@ -423,6 +427,11 @@ fn run(a: RunArgs) -> Result<i32> {
         let opts = exec::Opts {
             parallel,
             canirun,
+            portool: if a.no_portool {
+                None
+            } else {
+                find_tool("portool")
+            },
             job_timeout_min: a.job_timeout,
             keep: a.keep,
             trash: cache.join("trash"),
@@ -456,6 +465,7 @@ fn run(a: RunArgs) -> Result<i32> {
                 eprintln!("local-ci: and each unit's copy of it beside it (`-u<n>-`)");
             }
         } else {
+            runner.release_ports(&wt);
             git::remove_worktree(&repo.root, &wt, &cache.join("trash"));
             let _ = std::fs::remove_dir_all(&tools);
         }
