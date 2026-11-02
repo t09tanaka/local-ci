@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - A `services:` host port that the workflow never names (no `localhost:<port>`,
   no `*_PORT` value, no `${{ job.services... }}`) is bound as declared instead
