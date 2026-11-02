@@ -99,6 +99,8 @@ pub struct Opts {
     pub canirun: Option<PathBuf>,
     /// Gives jobs that bind fixed ports a block of their own (`--no-portool` turns it off).
     pub portool: Option<PathBuf>,
+    /// Exclusive jobs that may run at once, across all runs on the machine.
+    pub containers: usize,
     pub job_timeout_min: f64,
     /// Leave the worktrees in place after the run (`--keep`).
     pub keep: bool,
@@ -858,7 +860,11 @@ impl<'a> Runner<'a> {
                 let results = &results;
                 scope.spawn(move || {
                     let t0 = Instant::now();
-                    let lock = if u.exclusive { self.lock().ok() } else { None };
+                    let lock = if u.exclusive && !self.isolated() {
+                        self.lock().ok()
+                    } else {
+                        None
+                    };
                     sem.acquire();
                     let waited = t0.elapsed().as_secs_f64();
                     let r = if isolate && !CANCEL.load(Ordering::SeqCst) {
@@ -888,11 +894,68 @@ impl<'a> Runner<'a> {
         Ok(f)
     }
 
+    /// Exclusive jobs can overlap: their fixed ports and Compose projects are
+    /// rewritten (see `run_combo`), and portool gives the ports their scripts
+    /// pick themselves. Without portool those may still collide, so they keep
+    /// the per-repository lock.
+    fn isolated(&self) -> bool {
+        self.opts.portool.is_some() && self.wt.join(".portool.toml").is_file()
+    }
+
+    /// One of the `--containers` slots, shared by every `local-ci` run on the
+    /// machine: each exclusive job holds one while it runs, so databases started
+    /// early do not pile up while their tests wait for CPU. None when cancelled.
+    fn container_slot(&self) -> Option<File> {
+        use fs2::FileExt;
+        let dir = self.lock_file.parent()?;
+        loop {
+            for i in 0..self.opts.containers.max(1) {
+                let f = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(dir.join(format!("containers-{i}.lock")))
+                    .ok()?;
+                if f.try_lock_exclusive().is_ok() {
+                    return Some(f);
+                }
+            }
+            if CANCEL.load(Ordering::SeqCst) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Where the npm shim records the installs done in the workspace `ws`.
     fn marks(&self, ws: &Path) -> PathBuf {
         self.tools
             .join("installed")
             .join(ws.file_name().unwrap_or_default())
+    }
+
+    /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
+    fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
+        crate::git::clone_worktree(&self.repo.root, from, to, &self.repo.sha)?;
+        let marks = self.marks(to);
+        fs::create_dir_all(&marks)?;
+        for e in fs::read_dir(self.marks(from))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if e.file_type().is_ok_and(|t| t.is_file()) {
+                fs::copy(e.path(), marks.join(e.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_copy(&self, ws: &Path) {
+        if !self.opts.keep {
+            self.release_ports(ws);
+            crate::git::remove_worktree(&self.repo.root, ws, &self.opts.trash);
+        }
     }
 
     /// Run the unit in its own copy of the worktree, as each GitHub job gets its
@@ -906,20 +969,8 @@ impl<'a> Runner<'a> {
             std::process::id()
         ));
         let t0 = Instant::now();
-        let copied = crate::git::clone_worktree(&self.repo.root, &self.wt, &ws, &self.repo.sha)
-            .and_then(|_| {
-                // installs done in setup are in the copy too
-                let to = self.marks(&ws);
-                fs::create_dir_all(&to)?;
-                let from = fs::read_dir(self.marks(&self.wt));
-                for e in from.into_iter().flatten().flatten() {
-                    if e.file_type().is_ok_and(|t| t.is_file()) {
-                        fs::copy(e.path(), to.join(e.file_name()))?;
-                    }
-                }
-                Ok(())
-            });
-        let r = match copied {
+        // installs done in setup are in the copy too
+        let r = match self.copy_of(&self.wt, &ws) {
             Ok(()) => {
                 let copy_secs = t0.elapsed().as_secs_f64();
                 UnitResult {
@@ -950,10 +1001,7 @@ impl<'a> Runner<'a> {
                 }
             }
         };
-        if !self.opts.keep {
-            self.release_ports(&ws);
-            crate::git::remove_worktree(&self.repo.root, &ws, &self.opts.trash);
-        }
+        self.remove_copy(&ws);
         r
     }
 
@@ -1089,8 +1137,9 @@ impl<'a> Runner<'a> {
             )];
         }
 
-        let mut out = Vec::new();
-        let mut combo_failed = false;
+        // Combinations that pass `if:` run after this loop.
+        let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
+        let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
         for combo in combos {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
@@ -1108,43 +1157,85 @@ impl<'a> Runner<'a> {
                     None => job.id.clone(),
                 }
             };
-            if CANCEL.load(Ordering::SeqCst) {
-                out.push(skip(display, "cancelled".into()));
-                continue;
-            }
-            if combo_failed && job.fail_fast {
-                out.push(skip(display, "fail-fast".into()));
-                continue;
-            }
             let run_it = {
                 let ctx = Ctx::new(&cm, needs_status);
                 expr::condition(job.cond.as_deref(), &ctx)
             };
             match run_it {
-                Ok(true) => {}
-                Ok(false) => {
-                    out.push(skip(
-                        display,
-                        if needs_status == Status::Failure {
-                            "needs failed".into()
-                        } else {
-                            "if: false".into()
-                        },
-                    ));
-                    continue;
+                Ok(true) => {
+                    todo.push((out.len(), cm, display));
+                    out.push(None);
                 }
-                Err(e) => {
-                    out.push(error(display, format!("if: {e:#}")));
-                    continue;
+                Ok(false) => out.push(Some(skip(
+                    display,
+                    if needs_status == Status::Failure {
+                        "needs failed".into()
+                    } else {
+                        "if: false".into()
+                    },
+                ))),
+                Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
+            }
+        }
+
+        let exclusive = plan::is_exclusive(job);
+        let failed = AtomicBool::new(false);
+        let one = |ws: &Path, cm: Map<String, Value>, display: String| {
+            let slot = if exclusive {
+                match self.container_slot() {
+                    Some(s) => Some(s),
+                    None => return skip(display, "cancelled".into()),
                 }
+            } else {
+                None
+            };
+            if CANCEL.load(Ordering::SeqCst) {
+                return skip(display, "cancelled".into());
+            }
+            if job.fail_fast && failed.load(Ordering::SeqCst) {
+                return skip(display, "fail-fast".into());
             }
             let r = self.run_combo(ws, w, job, cm, display);
+            drop(slot);
             if r.0.outcome == Outcome::Fail {
-                combo_failed = true;
+                failed.store(true, Ordering::SeqCst);
             }
-            out.push(r);
+            r
+        };
+        // Each combination at once, in its own copy of the workspace, as each
+        // gets its own runner on GitHub. Only with canirun, which keeps the CPU
+        // in check, and for exclusive jobs only when they cannot collide.
+        if todo.len() > 1 && self.opts.canirun.is_some() && (!exclusive || self.isolated()) {
+            let done = Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for (i, cm, display) in todo {
+                    let (one, done) = (&one, &done);
+                    scope.spawn(move || {
+                        // the pid stays last in the name: cleanup scripts read it from there
+                        let copy = self.wt.with_file_name(format!(
+                            "{}-c{}-{}",
+                            &self.repo.sha[..7],
+                            self.seq.fetch_add(1, Ordering::SeqCst),
+                            std::process::id()
+                        ));
+                        let r = match self.copy_of(ws, &copy) {
+                            Ok(()) => one(&copy, cm, display),
+                            Err(e) => error(display, format!("cannot copy the worktree: {e:#}")),
+                        };
+                        self.remove_copy(&copy);
+                        done.lock().unwrap().push((i, r));
+                    });
+                }
+            });
+            for (i, r) in done.into_inner().unwrap() {
+                out[i] = Some(r);
+            }
+        } else {
+            for (i, cm, display) in todo {
+                out[i] = Some(one(ws, cm, display));
+            }
         }
-        out
+        out.into_iter().flatten().collect()
     }
 
     fn eval_env(

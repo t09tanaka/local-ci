@@ -13,6 +13,15 @@
   own copy (`.env.portool` in their environment) and give it back afterwards;
   the block portool's hook takes for the run's worktree is given back too.
   `--no-portool` turns it off.
+- With canirun, the entries of a matrix run at once, each in its own copy of
+  the workspace, instead of one after another. `fail-fast` skips the entries
+  that have not started yet; running ones finish.
+- With portool and a `.portool.toml`, exclusive units no longer take the
+  per-repository lock, so integration and e2e jobs run beside each other and
+  beside another run of the same repository.
+- `--containers <n>` (default 2): exclusive jobs that may run at once on the
+  machine, across all runs, so their databases do not pile up while the tests
+  wait for CPU.
 
 ## 0.3.0
 

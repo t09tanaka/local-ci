@@ -72,7 +72,7 @@ Common options (`plan` and `run`):
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
 
-`run` also takes `--parallel <n>`, `--no-canirun`, `--no-portool`, `--no-status`, `--keep`
+`run` also takes `--parallel <n>`, `--containers <n>`, `--no-canirun`, `--no-portool`, `--no-status`, `--keep`
 (keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
 
 ## How a run works
@@ -95,10 +95,17 @@ Common options (`plan` and `run`):
    checkout: a job that edits files for a while (a negative control, a
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
    a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere), so
-   `node_modules` and other setup output cost little to copy. Units that
+   `node_modules` and other setup output cost little to copy. With canirun,
+   the entries of a matrix run at once too, each in its own copy. Jobs that
    start services or containers, or look like integration / e2e tests, are
-   *exclusive*: they hold a per-repository lock, so they never overlap, in this
-   run or in another `local-ci` run of the same repository.
+   *exclusive*. Their fixed ports and Compose projects are rewritten (see
+   below), and with portool and a `.portool.toml` they overlap freely; without
+   portool the ports their scripts choose for themselves may still collide, so
+   their units hold a per-repository lock and never overlap, in this run or in
+   another `local-ci` run of the same repository. Either way, at most
+   `--containers` exclusive jobs (default 2) run at once on the machine, across
+   all `local-ci` runs, so databases do not pile up while their tests wait
+   for CPU.
 4. **Report.** One line per job, the tail of each failing step, where the logs
    are, and the overall state: `success`, `failure` or `error`.
 5. **Commit status.** The state is posted as the `local-ci` commit status with
@@ -165,7 +172,7 @@ into a prefix of the run, so neither changes your machine.
 The cache directory is `~/Library/Caches/local-ci` on macOS and
 `$XDG_CACHE_HOME/local-ci` (or `~/.cache/local-ci`) elsewhere; set
 `LOCAL_CI_HOME` to move it. It holds the worktrees while they run
-(`wt/<sha>-<pid>` and one `wt/<sha>-u<n>-<pid>` per unit), the last 20
+(`wt/<sha>-<pid>`, one `wt/<sha>-u<n>-<pid>` per unit and one `wt/<sha>-c<n>-<pid>` per matrix entry run at once), the last 20
 runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
 `result.json`), and the locks.
 
