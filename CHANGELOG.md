@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Exclusive jobs no longer bind the fixed ports a workflow writes down. A number
+  in a `*_PORT` variable of the job's `env`, or `TEST_DB_PORT=15432` in a
+  script, is given a free port and rewritten everywhere the job uses it.
+  `KEY_PORT=<port>` in a script is now rewritten for `services:` ports too.
+- `docker compose -p <name>` and `COMPOSE_PROJECT_NAME=<name>` in exclusive
+  jobs get a suffix of the run, so the clean-up no longer stops a project of
+  the same name that you started yourself.
+- With portool and a `.portool.toml`, exclusive jobs get a port block of their
+  own copy (`.env.portool` in their environment) and give it back afterwards;
+  the block portool's hook takes for the run's worktree is given back too.
+  `--no-portool` turns it off.
+
 ## 0.3.0
 
 - `--workflows-dir <dir>` also reads the workflows in another directory of the

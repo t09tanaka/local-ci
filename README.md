@@ -72,7 +72,7 @@ Common options (`plan` and `run`):
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
 
-`run` also takes `--parallel <n>`, `--no-canirun`, `--no-status`, `--keep`
+`run` also takes `--parallel <n>`, `--no-canirun`, `--no-portool`, `--no-status`, `--keep`
 (keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
 
 ## How a run works
@@ -129,6 +129,12 @@ Common options (`plan` and `run`):
   scripts (and `*PORT*` variables holding the port) are rewritten to it, so a
   database you already run on 5432 is not in the way. `--health-cmd` is waited
   for.
+- Fixed ports and Compose projects in exclusive jobs (below). A port the job
+  sets itself — a number in a `*_PORT` variable of its `env`, or
+  `TEST_DB_PORT=15432 docker compose ...` in a script — is given a free port,
+  and every place the job uses it is rewritten the same way. `docker compose -p
+  <name>` and `COMPOSE_PROJECT_NAME=<name>` get a suffix of the run, so two runs
+  never share a project and the clean-up never stops one you started yourself.
 - `uses:` — `actions/checkout`, caches and artifacts are skipped; `setup-node`,
   `setup-python`, `setup-go`, `setup-java`, `setup-ruby`, `flutter-action`,
   `setup-dart` and `rust-toolchain` check that the tool is installed and warn
@@ -147,8 +153,12 @@ into a prefix of the run, so neither changes your machine.
 - **[canirun](https://github.com/t09tanaka/canirun)**: when it is installed,
   every `run:` step outside setup is wrapped in `canirun exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
-- Ports used by a workflow's own `docker compose` steps are not rewritten;
-  exclusive units take the per-repository lock instead.
+- **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
+  `.portool.toml`, each exclusive job asks portool for a port block of its own
+  worktree copy and gets `.env.portool` (`TEST_PORT=...`) in its environment, so
+  a script that falls back to a fixed port (`TEST_PORT ?? 4000`) uses one no
+  other worktree has. The workflow's own `env` still wins. The block is given
+  back when the copy is removed. `--no-portool` turns this off.
 
 ## Files
 

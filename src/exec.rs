@@ -97,6 +97,8 @@ pub struct UnitResult {
 pub struct Opts {
     pub parallel: usize,
     pub canirun: Option<PathBuf>,
+    /// Gives jobs that bind fixed ports a block of their own (`--no-portool` turns it off).
+    pub portool: Option<PathBuf>,
     pub job_timeout_min: f64,
     /// Leave the worktrees in place after the run (`--keep`).
     pub keep: bool,
@@ -115,6 +117,8 @@ pub struct Runner<'a> {
     pub opts: Opts,
     pub base_path: String,
     seq: AtomicUsize,
+    /// Copies that took a port block of their own.
+    synced: Mutex<HashSet<PathBuf>>,
 }
 
 fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
@@ -227,12 +231,49 @@ pub fn compose_projects(script: &str) -> Vec<String> {
                 let rest = &line[at + marker.len()..];
                 // stop at the next command on the line
                 let rest = rest.split(['|', ';', '&']).next().unwrap_or(rest);
-                out.extend(flag.captures_iter(rest).map(|c| c[1].to_string()));
+                out.extend(
+                    flag.captures_iter(compose_globals(rest))
+                        .map(|c| c[1].to_string()),
+                );
             }
         }
     }
     out.dedup();
     out
+}
+
+/// The part of a `docker compose` command line before its subcommand (`up`,
+/// `exec`, ...). Only there is `-p` the project: `exec db mkdir -p tmp` is not.
+fn compose_globals(args: &str) -> &str {
+    // options of `docker compose` itself that take a value
+    const VALUED: [&str; 10] = [
+        "-f",
+        "--file",
+        "-p",
+        "--project-name",
+        "--env-file",
+        "--profile",
+        "--project-directory",
+        "--ansi",
+        "--parallel",
+        "--progress",
+    ];
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let mut value_next = false;
+    for m in re(&WORD, r"\S+").find_iter(args) {
+        let t = m.as_str();
+        if t == "\\" {
+            continue;
+        }
+        if value_next {
+            value_next = false;
+        } else if t.starts_with('-') {
+            value_next = VALUED.contains(&t);
+        } else {
+            return &args[..m.start()];
+        }
+    }
+    args
 }
 
 /// `docker compose -p <name> down` for each project that still has containers.
@@ -335,15 +376,130 @@ fn rewrite_ports(text: &str, maps: &[PortMap]) -> String {
             s = r
                 .replace_all(&s, format!("${{1}}:{}", m.actual).as_str())
                 .into_owned();
+            let a = Regex::new(&format!(
+                r#"(-e\s+|--env[=\s]\s*)?\b([A-Za-z_][A-Za-z0-9_]*=["']?){d}\b"#
+            ))
+            .unwrap();
+            s = a
+                .replace_all(&s, |c: &regex::Captures| {
+                    if c.get(1).is_none() && port_key(c[2].trim_end_matches(['=', '"', '\''])) {
+                        format!("{}{}", &c[2], m.actual)
+                    } else {
+                        c[0].to_string()
+                    }
+                })
+                .into_owned();
         }
     }
     s
 }
 
+/// `PORT`, `DB_PORT`, `PORT_E2E`, `PGPORT`; not `EXPORT` or `REPORT`.
+fn port_key(k: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(&R, r"(?i)^(([a-z0-9_]*_)?|pg)port(_[a-z0-9_]*)?$").is_match(k)
+}
+
+fn port_literal(v: &str) -> Option<u16> {
+    v.trim().parse::<u16>().ok().filter(|p| *p >= 1024)
+}
+
+/// Ports a script fixes for itself: `TEST_DB_PORT=15432 docker compose …`.
+/// `docker run -e X_PORT=…` is the container's own port and stays.
+fn assigned_ports(script: &str) -> Vec<u16> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(
+        &R,
+        r#"(-e\s+|--env[=\s]\s*)?\b([A-Za-z_][A-Za-z0-9_]*)=["']?(\d{4,5})\b"#,
+    )
+    .captures_iter(script)
+    .filter(|c| c.get(1).is_none() && port_key(&c[2]))
+    .filter_map(|c| port_literal(&c[3]))
+    .collect()
+}
+
+/// Give each fixed port a job sets itself a free one, the same in all its steps.
+/// Free ports come from the ephemeral range, which portool's blocks stay below.
+fn map_literals(ports: impl IntoIterator<Item = u16>, maps: &mut Vec<PortMap>) -> Result<()> {
+    // held until all are picked, so the OS hands out a different one each time
+    let mut held = Vec::new();
+    for p in ports {
+        if maps.iter().any(|m| m.declared == Some(p)) {
+            continue;
+        }
+        let actual = loop {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).context("no free port")?;
+            let a = l.local_addr()?.port();
+            held.push(l);
+            if !maps.iter().any(|m| m.actual == a) {
+                break a;
+            }
+        };
+        maps.push(PortMap {
+            declared: Some(p),
+            container: p,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// `-p name` / `COMPOSE_PROJECT_NAME=name` with `-<tag>` appended, so two runs
+/// never share a project and our `down` never stops one started by hand.
+fn rename_compose_projects(script: &str, tag: &str) -> String {
+    static FLAG: OnceLock<Regex> = OnceLock::new();
+    static ENV: OnceLock<Regex> = OnceLock::new();
+    let suffix = format!("-{tag}");
+    let rename = |c: &regex::Captures| {
+        if c[2].ends_with(&suffix) {
+            c[0].to_string()
+        } else {
+            format!("{}{}{suffix}", &c[1], &c[2])
+        }
+    };
+    let s = re(
+        &ENV,
+        r#"(\bCOMPOSE_PROJECT_NAME=["']?)([A-Za-z0-9][A-Za-z0-9_-]*)"#,
+    )
+    .replace_all(script, rename)
+    .into_owned();
+    let flag = re(
+        &FLAG,
+        r#"((?:^|\s)(?:-p|--project-name)(?:\s+|=)["']?)([A-Za-z0-9][A-Za-z0-9_-]*)"#,
+    );
+    let mut out = String::new();
+    let mut rest = s.as_str();
+    loop {
+        let at = ["docker compose", "docker-compose"]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|i| i + m.len()))
+            .min();
+        let Some(at) = at else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        let seg = &rest[at..];
+        // the command ends at the next `|`, `;`, `&` or unescaped newline
+        let b = seg.as_bytes();
+        let end = (0..b.len())
+            .find(|&i| {
+                matches!(b[i], b'|' | b';' | b'&')
+                    || (b[i] == b'\n' && (i == 0 || b[i - 1] != b'\\'))
+            })
+            .unwrap_or(b.len());
+        let globals = compose_globals(&seg[..end]);
+        out.push_str(&flag.replace_all(globals, rename));
+        out.push_str(&seg[globals.len()..end]);
+        rest = &seg[end..];
+    }
+    out
+}
+
 fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
     for m in maps {
         if let Some(d) = m.declared {
-            if key.to_ascii_uppercase().contains("PORT") && val.trim() == d.to_string() {
+            if port_key(key) && val.trim() == d.to_string() {
                 return m.actual.to_string();
             }
         }
@@ -375,6 +531,7 @@ impl<'a> Runner<'a> {
             opts,
             base_path,
             seq: AtomicUsize::new(0),
+            synced: Mutex::new(HashSet::new()),
         }
     }
 
@@ -849,9 +1006,23 @@ impl<'a> Runner<'a> {
             }
         };
         if !self.opts.keep {
+            self.release_ports(&ws);
             crate::git::remove_worktree(&self.repo.root, &ws, &self.opts.trash);
         }
         r
+    }
+
+    /// Give back the port block of `ws`. The worktree of the run itself may hold
+    /// one even when no job asked: portool's post-checkout hook takes it.
+    pub fn release_ports(&self, ws: &Path) {
+        let Some(bin) = &self.opts.portool else {
+            return;
+        };
+        if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
+            && ws.join(".portool.toml").is_file()
+        {
+            crate::portool::release(bin, ws);
+        }
     }
 
     fn run_unit(&self, u: &Unit, waited: f64, ws: &Path) -> UnitResult {
@@ -1092,10 +1263,49 @@ impl<'a> Runner<'a> {
             json!({"status": "success", "services": services_ctx}),
         );
 
+        // A job that starts containers or test servers must not bind what
+        // another run, or a matrix entry beside it, binds.
+        let exclusive = plan::is_exclusive(job);
+        let port_env = match &self.opts.portool {
+            Some(bin) if exclusive && ws.join(".portool.toml").is_file() => {
+                // before the sync: it may take a block and still fail
+                self.synced.lock().unwrap().insert(ws.to_path_buf());
+                match crate::portool::sync(bin, ws) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.stop_services(&names);
+                        return (
+                            finish(Outcome::Error(format!("{e:#}")), steps, t0),
+                            Map::new(),
+                        );
+                    }
+                }
+            }
+            _ => vec![],
+        };
+
         // workflow + job env
         let mut env_ctx = Map::new();
         if let Err(e) = Self::eval_env(&w.env, &cm, &mut env_ctx, &maps)
             .and_then(|_| Self::eval_env(&job.env, &cm, &mut env_ctx, &maps))
+            .and_then(|_| {
+                if exclusive {
+                    let fixed: Vec<u16> = env_ctx
+                        .iter()
+                        .filter(|(k, _)| port_key(k))
+                        .filter_map(|(_, v)| port_literal(&expr::to_string(v)))
+                        .collect();
+                    map_literals(fixed, &mut maps)?;
+                    for (k, v) in env_ctx.iter_mut() {
+                        let s = expr::to_string(v);
+                        let r = rewrite_env_value(k, &s, &maps);
+                        if r != s {
+                            *v = Value::String(r);
+                        }
+                    }
+                }
+                Ok(())
+            })
         {
             self.stop_services(&names);
             return (
@@ -1116,6 +1326,7 @@ impl<'a> Runner<'a> {
             std::process::id(),
             self.seq.fetch_add(1, Ordering::SeqCst)
         );
+        let tag = format!("lc{}", &compose_default["local-ci-".len()..]);
         let mut projects = vec![compose_default.clone()];
         COMPOSE_PROJECTS
             .lock()
@@ -1252,8 +1463,8 @@ impl<'a> Runner<'a> {
             let mut env_now = step_env.clone();
             let env_res = Self::eval_env(&s.env, &scm, &mut env_now, &maps);
             let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
-            let (script, env_now) = match (script, env_res) {
-                (Ok(sc), Ok(_)) => (rewrite_ports(&sc, &maps), env_now),
+            let (script, mut env_now) = match (script, env_res) {
+                (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
                     push(
                         &mut steps,
@@ -1265,6 +1476,44 @@ impl<'a> Runner<'a> {
                     errored.get_or_insert(format!("{label}: {e:#}"));
                     continue;
                 }
+            };
+            let script = if exclusive {
+                let fixed: Vec<u16> = assigned_ports(&script)
+                    .into_iter()
+                    .chain(
+                        env_now
+                            .iter()
+                            .filter(|(k, _)| port_key(k))
+                            .filter_map(|(_, v)| port_literal(&expr::to_string(v))),
+                    )
+                    .collect();
+                if let Err(e) = map_literals(fixed, &mut maps) {
+                    push(
+                        &mut steps,
+                        Outcome::Error(format!("{e:#}")),
+                        None,
+                        None,
+                        None,
+                    );
+                    errored.get_or_insert(format!("{label}: {e:#}"));
+                    continue;
+                }
+                for (k, v) in env_now.iter_mut() {
+                    let s = expr::to_string(v);
+                    let mut r = rewrite_env_value(k, &s, &maps);
+                    if k == "COMPOSE_PROJECT_NAME"
+                        && !r.is_empty()
+                        && !r.ends_with(&format!("-{tag}"))
+                    {
+                        r = format!("{r}-{tag}");
+                    }
+                    if r != s {
+                        *v = Value::String(r);
+                    }
+                }
+                rename_compose_projects(&rewrite_ports(&script, &maps), &tag)
+            } else {
+                rewrite_ports(&script, &maps)
             };
             if secrets {
                 push(
@@ -1288,6 +1537,7 @@ impl<'a> Runner<'a> {
             }
             let gh = scm["github"].clone();
             let mut env: Vec<(String, String)> = self.base_env(&gh, &extra_path);
+            env.extend(port_env.iter().cloned());
             env.push((
                 "GITHUB_OUTPUT".into(),
                 fc("output").to_string_lossy().into_owned(),
@@ -1305,7 +1555,11 @@ impl<'a> Runner<'a> {
                 fc("summary").to_string_lossy().into_owned(),
             ));
             env.push(("COMPOSE_PROJECT_NAME".into(), compose_default.clone()));
-            for p in compose_projects(&script) {
+            let from_env = env_now
+                .get("COMPOSE_PROJECT_NAME")
+                .map(expr::to_string)
+                .filter(|p| !p.is_empty());
+            for p in compose_projects(&script).into_iter().chain(from_env) {
                 if !projects.contains(&p) {
                     COMPOSE_PROJECTS.lock().unwrap().push(p.clone());
                     projects.push(p);
@@ -1785,6 +2039,78 @@ mod tests {
         assert_eq!(rewrite_ports("127.0.0.1:54330", &maps), "127.0.0.1:54330");
         assert_eq!(rewrite_env_value("DB_PORT", "5433", &maps), "49152");
         assert_eq!(rewrite_env_value("COUNT", "5433", &maps), "5433");
+        assert_eq!(
+            rewrite_ports("TEST_DB_PORT=5433 docker compose up; N=5433", &maps),
+            "TEST_DB_PORT=49152 docker compose up; N=5433"
+        );
+        assert_eq!(rewrite_ports("PORT='5433' x", &maps), "PORT='49152' x");
+    }
+
+    #[test]
+    fn fixed_ports_a_job_sets() {
+        assert!(port_key("PORT") && port_key("TEST_DB_PORT") && port_key("port_e2e"));
+        assert!(!port_key("EXPORT") && !port_key("REPORT") && !port_key("PORTS"));
+        assert_eq!(
+            assigned_ports("TEST_DB_PORT=15432 docker compose up\nEXPORT=4000 PORT=80 X=5000"),
+            vec![15432]
+        );
+        assert!(
+            assigned_ports("docker run -e POSTGRES_PORT=15432 --env=X_PORT=15433 img").is_empty()
+        );
+        let mut maps = vec![];
+        map_literals([15432, 15432, 15433], &mut maps).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_ne!(maps[0].actual, maps[1].actual);
+        assert_eq!(
+            rewrite_ports("docker run -e PGPORT=15432 img; PGPORT=15432", &maps[..1]),
+            format!("docker run -e PGPORT=15432 img; PGPORT={}", maps[0].actual)
+        );
+        assert_eq!(rewrite_env_value("REPORT", "15432", &maps), "15432");
+        assert!(maps
+            .iter()
+            .all(|m| m.actual != 0 && m.declared != Some(m.actual)));
+    }
+
+    #[test]
+    fn compose_projects_get_a_tag() {
+        assert_eq!(
+            rename_compose_projects(
+                "TEST_DB_PORT=1 docker compose \\\n  -p app-int \\\n  -f a.yml up -d",
+                "lc1-2"
+            ),
+            "TEST_DB_PORT=1 docker compose \\\n  -p app-int-lc1-2 \\\n  -f a.yml up -d"
+        );
+        assert_eq!(
+            rename_compose_projects(
+                "mkdir -p app && docker compose --project-name=app down",
+                "t"
+            ),
+            "mkdir -p app && docker compose --project-name=app-t down"
+        );
+        assert_eq!(
+            rename_compose_projects("COMPOSE_PROJECT_NAME=\"z\" docker compose up", "t"),
+            "COMPOSE_PROJECT_NAME=\"z-t\" docker compose up"
+        );
+        assert_eq!(
+            rename_compose_projects("docker compose -p a-t up", "t"),
+            "docker compose -p a-t up"
+        );
+        assert_eq!(
+            rename_compose_projects("docker compose -p a up\nnpm test -p b", "t"),
+            "docker compose -p a-t up\nnpm test -p b"
+        );
+        // after the subcommand, `-p` belongs to it
+        assert_eq!(
+            rename_compose_projects(
+                "docker compose -f x.yml -p a exec db mkdir -p tmp; docker compose run -p 8080:80 web",
+                "t"
+            ),
+            "docker compose -f x.yml -p a-t exec db mkdir -p tmp; docker compose run -p 8080:80 web"
+        );
+        assert_eq!(
+            compose_projects("docker compose exec db psql -p 5432"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
