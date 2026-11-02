@@ -72,7 +72,7 @@ Common options (`plan` and `run`):
 | `-C <dir>` | Repository directory. |
 
 `run` also takes `--parallel <n>`, `--no-canirun`, `--no-status`, `--keep`
-(keep the worktree), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
+(keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
 
 ## How a run works
 
@@ -80,9 +80,8 @@ Common options (`plan` and `run`):
    under the cache directory. Your working tree is never touched, so steps such
    as `git add -A`, `cp .env.example .env` or generators that rewrite tracked
    files are harmless. The worktree is removed afterwards.
-2. **Setup, once.** In CI every job runs `npm ci` on a fresh VM. Locally all
-   jobs share one checkout, and `npm ci` deletes `node_modules` before it
-   installs, so parallel jobs would break each other. Install steps
+2. **Setup, once.** In CI every job runs `npm ci` on a fresh VM. Locally that
+   would install the same dependencies once per job. Install steps
    (`npm ci`, `pip install`, `flutter pub get`, `npx prisma generate`, ...)
    and steps that several jobs repeat word for word at their start are run
    once, before any job, and skipped in the jobs. Installs that happen later
@@ -90,7 +89,12 @@ Common options (`plan` and `run`):
    wrapper on `PATH`: a directory is installed once per run and lockfile, and
    later `npm ci` / `npm install` there are no-ops.
 3. **Units in parallel.** Jobs linked by `needs:` (or writing the same build
-   output) form a unit and run in order. Units run in parallel. Units that
+   output) form a unit and run in order. Units run in parallel, each in its
+   own copy of the worktree as it is after setup, as each CI job has its own
+   checkout: a job that edits files for a while (a negative control, a
+   formatter, mutation testing) is not seen by the jobs beside it. The copy is
+   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere), so
+   `node_modules` and other setup output cost little to copy. Units that
    start services or containers, or look like integration / e2e tests, are
    *exclusive*: they hold a per-repository lock, so they never overlap, in this
    run or in another `local-ci` run of the same repository.
@@ -149,7 +153,8 @@ into a prefix of the run, so neither changes your machine.
 
 The cache directory is `~/Library/Caches/local-ci` on macOS and
 `$XDG_CACHE_HOME/local-ci` (or `~/.cache/local-ci`) elsewhere; set
-`LOCAL_CI_HOME` to move it. It holds the worktrees while they run, the last 20
+`LOCAL_CI_HOME` to move it. It holds the worktrees while they run
+(`wt/<sha>-<pid>` and one `wt/<sha>-u<n>-<pid>` per unit), the last 20
 runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
 `result.json`), and the locks.
 

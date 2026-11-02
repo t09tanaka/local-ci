@@ -142,6 +142,83 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Another worktree of `sha` at `to`, holding a copy of everything in `from`
+/// (setup output such as `node_modules` included). Files are cloned
+/// copy-on-write where the filesystem allows it, so this is quick and a write
+/// in one copy is never seen in the other.
+pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "--quiet",
+            &to.to_string_lossy(),
+            sha,
+        ],
+    )?;
+    let index = |d: &Path| {
+        git(
+            d,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .map(PathBuf::from)
+    };
+    std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
+    let mut rest = Vec::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        if e.file_name() != ".git" && !clone_tree(&e.path(), &to.join(e.file_name())) {
+            rest.push(e.path());
+        }
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let flags: &[&str] = if cfg!(target_os = "macos") {
+        &["-Rp"]
+    } else {
+        &["-a", "--reflink=auto"]
+    };
+    let out = Command::new("cp")
+        .args(flags)
+        .args(&rest)
+        .arg(to)
+        .output()
+        .context("failed to run cp")?;
+    if !out.status.success() {
+        bail!(
+            "cp {}: {}",
+            from.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Clone a whole directory tree in one call (APFS). About five times faster
+/// than `cp -c`, which clones file by file.
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let (Ok(f), Ok(t)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), CLONE_NOFOLLOW) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree(_from: &Path, _to: &Path) -> bool {
+    false
+}
+
 /// Move the worktree out of the way, unregister it, and delete the files in the background.
 pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
     let _ = std::fs::create_dir_all(trash);

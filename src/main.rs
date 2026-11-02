@@ -60,7 +60,7 @@ struct RunArgs {
     /// Do not record the result as the `local-ci` commit status
     #[arg(long)]
     no_status: bool,
-    /// Keep the worktree afterwards (its path is printed)
+    /// Keep the worktrees afterwards (their paths are printed)
     #[arg(long)]
     keep: bool,
     /// Lines of a failing step's log to print
@@ -420,6 +420,8 @@ fn run(a: RunArgs) -> Result<i32> {
             parallel,
             canirun,
             job_timeout_min: a.job_timeout,
+            keep: a.keep,
+            trash: cache.join("trash"),
         };
         let slug = git::repo_slug(&repo.root).unwrap_or_default();
         let runner = exec::Runner::new(
@@ -446,6 +448,9 @@ fn run(a: RunArgs) -> Result<i32> {
         exec::remove_containers();
         if a.keep {
             eprintln!("local-ci: kept worktree {}", report::tilde(&wt));
+            if p.units.len() > 1 {
+                eprintln!("local-ci: and each unit's copy of it beside it (`-u<n>-`)");
+            }
         } else {
             git::remove_worktree(&repo.root, &wt, &cache.join("trash"));
             let _ = std::fs::remove_dir_all(&tools);
