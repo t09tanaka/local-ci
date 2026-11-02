@@ -65,6 +65,9 @@ struct RunArgs {
     /// Do not give jobs that start containers or test servers a port block from portool
     #[arg(long)]
     no_portool: bool,
+    /// Jobs with containers or test servers that may run at once, across all local-ci runs
+    #[arg(long, default_value_t = 2)]
+    containers: usize,
     /// Do not record the result as the `local-ci` commit status
     #[arg(long)]
     no_status: bool,
@@ -432,6 +435,7 @@ fn run(a: RunArgs) -> Result<i32> {
             } else {
                 find_tool("portool")
             },
+            containers: a.containers,
             job_timeout_min: a.job_timeout,
             keep: a.keep,
             trash: cache.join("trash"),
@@ -462,7 +466,7 @@ fn run(a: RunArgs) -> Result<i32> {
         if a.keep {
             eprintln!("local-ci: kept worktree {}", report::tilde(&wt));
             if p.units.len() > 1 {
-                eprintln!("local-ci: and each unit's copy of it beside it (`-u<n>-`)");
+                eprintln!("local-ci: and the copies of units and matrix entries beside it (`-u<n>-`, `-c<n>-`)");
             }
         } else {
             runner.release_ports(&wt);

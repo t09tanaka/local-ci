@@ -11,13 +11,37 @@
   in a `*_PORT` variable of the job's `env`, or `TEST_DB_PORT=15432` in a
   script, is given a free port and rewritten everywhere the job uses it.
   `KEY_PORT=<port>` in a script is now rewritten for `services:` ports too.
-- `docker compose -p <name>` and `COMPOSE_PROJECT_NAME=<name>` in exclusive
-  jobs get a suffix of the run, so the clean-up no longer stops a project of
-  the same name that you started yourself.
-- With portool and a `.portool.toml`, exclusive jobs get a port block of their
-  own copy (`.env.portool` in their environment) and give it back afterwards;
-  the block portool's hook takes for the run's worktree is given back too.
+- `docker compose -p <name>` and `COMPOSE_PROJECT_NAME=<name>` (in a script or
+  in `env:`) in exclusive jobs get a suffix of the run, so the clean-up no
+  longer stops a project of the same name that you started yourself. Only a
+  `-p` before the subcommand counts, so `docker compose exec db mkdir -p tmp`
+  is left alone, and every `docker compose` command of a line is seen, not just
+  the first.
+- With portool and a `.portool.toml`, exclusive jobs without `services:` get a
+  port block of their own copy (`.env.portool` in their environment) and give
+  it back afterwards; the block portool's hook takes for the run's worktree is
+  given back too. Jobs with `services:` get none: their database is the
+  service, and a script that honours portool's ports would look for its own.
   `--no-portool` turns it off.
+- With canirun, the entries of a matrix run at once, each in its own copy of
+  the workspace, instead of one after another, up to `strategy.max-parallel`.
+  With `fail-fast`, once an entry fails or errors the others skip their
+  remaining steps (`if: always()` steps still run) and are reported as skipped.
+  Entries whose names come out the same get ` #<n>`, so their logs stay apart.
+- With portool and a `.portool.toml`, exclusive jobs without `services:` no
+  longer take the per-repository lock, so integration and e2e jobs that start
+  their own containers run beside each other and beside another run of the
+  same repository. Units with a `services:` job keep the lock. A job that still pins something
+  rewriting cannot reach takes the lock: a Compose file with `container_name:`
+  or a literal host port, a Compose file named by a variable, or
+  `docker run --name` / `-p <host port>:`.
+- `--containers <n>` (default 2): exclusive jobs that may run at once on the
+  machine, across all runs, so their databases do not pile up while the tests
+  wait for CPU.
+- Jobs whose scripts run Playwright, Cypress or `test:e2e` / `test:int` are
+  exclusive even when their name does not say so.
+- A step whose `canirun` call failed on its ledger lock timeout, before the
+  command started, is tried again (up to three times).
 
 ## 0.3.0
 
