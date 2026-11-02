@@ -190,6 +190,65 @@ fn reports_the_failing_step_with_its_log() {
 }
 
 #[test]
+fn parallel_units_do_not_see_each_others_writes() {
+    let d = demo("app/lib.sh");
+    // `tamper` edits a tracked file for a while and puts it back; `observe`
+    // reads that file meanwhile. On GitHub each job has its own checkout.
+    std::fs::write(
+        d.repo.join(".github/workflows/isolation.yml"),
+        r#"name: Isolation
+on: pull_request
+jobs:
+  tamper:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'echo tampered' >> app/lib.sh
+          sleep 4
+          git checkout -- app/lib.sh
+  observe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sleep 2
+          git diff --exit-code -- app/lib.sh
+          ! grep -q tampered app/lib.sh
+"#,
+    )
+    .unwrap();
+    git(&d.repo, &["add", "."]);
+    git(&d.repo, &["commit", "-qm", "isolation"]);
+    let o = local_ci(&d, &["plan", "-j", "tamper", "-j", "observe"]);
+    let out = stdout(&o);
+    assert!(out.contains("unit 1  isolation.yml: tamper"), "{out}");
+    assert!(out.contains("unit 2  isolation.yml: observe"), "{out}");
+
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-canirun",
+            "--parallel",
+            "2",
+            "-j",
+            "tamper",
+            "-j",
+            "observe",
+        ],
+    );
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("PASS   isolation.yml › observe"), "{out}");
+    let wt = Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&d.repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&wt.stdout).lines().count(), 1);
+}
+
+#[test]
 fn json_result_is_saved() {
     let d = demo("app/lib.sh");
     let o = local_ci(

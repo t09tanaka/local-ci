@@ -334,6 +334,7 @@ mod tests {
                 workflow: "ci.yml".into(),
                 jobs: o.into_iter().map(job).collect(),
                 waited_secs: 0.0,
+                copy_secs: None,
             }]
         };
         assert_eq!(

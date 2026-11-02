@@ -8,10 +8,9 @@
 //! another local-ci run of the same repository.
 //!
 //! Every job of a workflow starts with the same install steps (`npm ci` ...),
-//! because each CI job gets a fresh VM. Here all units share one checkout, and
-//! `npm ci` deletes `node_modules` before installing, so parallel jobs would
-//! break each other. Those steps are hoisted into a setup list that runs once,
-//! before any unit; the jobs skip them.
+//! because each CI job gets a fresh VM. Here they are hoisted into a setup list
+//! that runs once, before any unit; the jobs skip them, and each unit starts
+//! from a copy of the worktree as setup left it.
 
 use crate::filter::{decide, Decision, Event};
 use crate::workflow::{Job, Step, Workflow};

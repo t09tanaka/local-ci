@@ -89,12 +89,19 @@ pub struct UnitResult {
     pub workflow: String,
     pub jobs: Vec<JobResult>,
     pub waited_secs: f64,
+    /// Time spent copying the worktree for this unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_secs: Option<f64>,
 }
 
 pub struct Opts {
     pub parallel: usize,
     pub canirun: Option<PathBuf>,
     pub job_timeout_min: f64,
+    /// Leave the worktrees in place after the run (`--keep`).
+    pub keep: bool,
+    /// Where removed worktrees go before they are deleted in the background.
+    pub trash: PathBuf,
 }
 
 pub struct Runner<'a> {
@@ -268,9 +275,11 @@ for a in "$@"; do
   esac
 done
 dir=$(pwd -P)
+ws=$(cd "${GITHUB_WORKSPACE:-/}" 2>/dev/null && pwd -P)
 sum=$(cksum package-lock.json 2>/dev/null | cut -d' ' -f1)
-key=$(printf '%s' "$dir" | cksum | cut -d' ' -f1)
-marks="$LOCAL_CI_TOOLS/installed"
+# relative to the workspace, so a unit's copy of the worktree keeps setup's marks
+key=$(printf '%s' "${dir#"$ws"}" | cksum | cut -d' ' -f1)
+marks="$LOCAL_CI_MARKS"
 mkdir -p "$marks"
 until mkdir "$marks/$key.lock" 2>/dev/null; do sleep 1; done
 trap 'rmdir "$marks/$key.lock" 2>/dev/null' EXIT INT TERM
@@ -369,7 +378,7 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn github_ctx(&self, w: &Workflow, event: &str, job: &str) -> Value {
+    fn github_ctx(&self, ws: &Path, w: &Workflow, event: &str, job: &str) -> Value {
         let base = crate::git::branch_name(&self.repo.base);
         let head = self.repo.head.clone().unwrap_or_default();
         let pr = event == "pull_request";
@@ -391,7 +400,7 @@ impl<'a> Runner<'a> {
             "actor": "local-ci",
             "server_url": "https://github.com",
             "api_url": "https://api.github.com",
-            "workspace": self.wt.to_string_lossy(),
+            "workspace": ws.to_string_lossy(),
         })
     }
 
@@ -421,14 +430,16 @@ impl<'a> Runner<'a> {
                 .into_owned(),
         );
         path.push(self.base_path.clone());
+        let ws = s("workspace");
         vec![
             ("CI".into(), "true".into()),
             ("GITHUB_ACTIONS".into(), "true".into()),
             ("LOCAL_CI".into(), "1".into()),
             (
-                "GITHUB_WORKSPACE".into(),
-                self.wt.to_string_lossy().into_owned(),
+                "LOCAL_CI_MARKS".into(),
+                self.marks(Path::new(&ws)).to_string_lossy().into_owned(),
             ),
+            ("GITHUB_WORKSPACE".into(), ws),
             ("GITHUB_SHA".into(), self.repo.sha.clone()),
             ("GITHUB_REF".into(), s("ref")),
             ("GITHUB_REF_NAME".into(), s("ref_name")),
@@ -681,7 +692,7 @@ impl<'a> Runner<'a> {
             }
             let sel = &self.plan.selected[s.wf];
             let job = self.plan.job(s.wf, &s.job);
-            let gh = self.github_ctx(&sel.wf, &sel.event, &job.id);
+            let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &job.id);
             let mut env = self.base_env(&gh, &[]);
             for (k, v) in sel
                 .wf
@@ -740,6 +751,7 @@ impl<'a> Runner<'a> {
             cv: Condvar::new(),
         };
         let results: Mutex<Vec<(usize, UnitResult)>> = Mutex::new(Vec::new());
+        let isolate = self.plan.units.len() > 1;
         std::thread::scope(|scope| {
             for (i, u) in self.plan.units.iter().enumerate() {
                 let sem = &sem;
@@ -749,7 +761,11 @@ impl<'a> Runner<'a> {
                     let lock = if u.exclusive { self.lock().ok() } else { None };
                     sem.acquire();
                     let waited = t0.elapsed().as_secs_f64();
-                    let r = self.run_unit(u, waited);
+                    let r = if isolate && !CANCEL.load(Ordering::SeqCst) {
+                        self.run_unit_in_copy(i + 1, u, waited)
+                    } else {
+                        self.run_unit(u, waited, &self.wt)
+                    };
                     sem.release();
                     drop(lock);
                     results.lock().unwrap().push((i, r));
@@ -772,14 +788,82 @@ impl<'a> Runner<'a> {
         Ok(f)
     }
 
-    fn run_unit(&self, u: &Unit, waited: f64) -> UnitResult {
+    /// Where the npm shim records the installs done in the workspace `ws`.
+    fn marks(&self, ws: &Path) -> PathBuf {
+        self.tools
+            .join("installed")
+            .join(ws.file_name().unwrap_or_default())
+    }
+
+    /// Run the unit in its own copy of the worktree, as each GitHub job gets its
+    /// own checkout: a unit that edits tracked files for a while (a negative
+    /// control, a formatter) must not change what the units beside it read.
+    fn run_unit_in_copy(&self, n: usize, u: &Unit, waited: f64) -> UnitResult {
+        // the pid stays last in the name: cleanup scripts read it from there
+        let ws = self.wt.with_file_name(format!(
+            "{}-u{n}-{}",
+            &self.repo.sha[..7],
+            std::process::id()
+        ));
+        let t0 = Instant::now();
+        let copied = crate::git::clone_worktree(&self.repo.root, &self.wt, &ws, &self.repo.sha)
+            .and_then(|_| {
+                // installs done in setup are in the copy too
+                let to = self.marks(&ws);
+                fs::create_dir_all(&to)?;
+                let from = fs::read_dir(self.marks(&self.wt));
+                for e in from.into_iter().flatten().flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_file()) {
+                        fs::copy(e.path(), to.join(e.file_name()))?;
+                    }
+                }
+                Ok(())
+            });
+        let r = match copied {
+            Ok(()) => {
+                let copy_secs = t0.elapsed().as_secs_f64();
+                UnitResult {
+                    copy_secs: Some(copy_secs),
+                    ..self.run_unit(u, waited, &ws)
+                }
+            }
+            Err(e) => {
+                let w = &self.plan.selected[u.wf].wf;
+                let reason = format!("cannot copy the worktree: {e:#}");
+                let jobs = u
+                    .jobs
+                    .iter()
+                    .map(|id| JobResult {
+                        workflow: w.file.clone(),
+                        job: id.clone(),
+                        display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
+                        outcome: Outcome::Error(reason.clone()),
+                        secs: 0.0,
+                        steps: vec![],
+                    })
+                    .collect();
+                UnitResult {
+                    workflow: w.file.clone(),
+                    jobs,
+                    waited_secs: waited,
+                    copy_secs: None,
+                }
+            }
+        };
+        if !self.opts.keep {
+            crate::git::remove_worktree(&self.repo.root, &ws, &self.opts.trash);
+        }
+        r
+    }
+
+    fn run_unit(&self, u: &Unit, waited: f64, ws: &Path) -> UnitResult {
         let sel = &self.plan.selected[u.wf];
         let w = &sel.wf;
         let mut needs_ctx = Map::new();
         let mut jobs = Vec::new();
         for id in &u.jobs {
             let job = self.plan.job(u.wf, id);
-            let mut job_results = self.run_job(w, &sel.event, job, &needs_ctx);
+            let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx);
             let failed = job_results
                 .iter()
                 .any(|r| r.0.outcome == Outcome::Fail || matches!(r.0.outcome, Outcome::Error(_)));
@@ -807,18 +891,20 @@ impl<'a> Runner<'a> {
             workflow: w.file.clone(),
             jobs,
             waited_secs: waited,
+            copy_secs: None,
         }
     }
 
     /// One job, all its matrix combinations. Returns each combination's result and outputs.
     fn run_job(
         &self,
+        ws: &Path,
         w: &Workflow,
         event: &str,
         job: &Job,
         needs: &Map<String, Value>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
-        let gh = self.github_ctx(w, event, &job.id);
+        let gh = self.github_ctx(ws, w, event, &job.id);
         let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
         let skip = |display: String, reason: String| {
             (
@@ -938,7 +1024,7 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             }
-            let r = self.run_combo(w, job, cm, display);
+            let r = self.run_combo(ws, w, job, cm, display);
             if r.0.outcome == Outcome::Fail {
                 combo_failed = true;
             }
@@ -967,6 +1053,7 @@ impl<'a> Runner<'a> {
 
     fn run_combo(
         &self,
+        ws: &Path,
         w: &Workflow,
         job: &Job,
         mut cm: Map<String, Value>,
@@ -1243,7 +1330,7 @@ impl<'a> Runner<'a> {
                 label
             );
             let res = self.shell(
-                &self.wt.join(&wd),
+                &ws.join(&wd),
                 &script,
                 s.shell
                     .as_deref()
@@ -1738,19 +1825,22 @@ mod tests {
         let shim = tmp.path().join("npm");
         fs::write(&shim, NPM_SHIM.replace("__REAL__", &fake.to_string_lossy())).unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-        let proj = tmp.path().join("proj");
+        let ws = tmp.path().join("ws");
+        let proj = ws.join("proj");
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("package-lock.json"), "{}").unwrap();
-        let npm = |args: &[&str]| {
+        let npm_in = |ws: &Path, marks: &str, args: &[&str]| {
             let st = Command::new(&shim)
                 .args(args)
-                .current_dir(&proj)
-                .env("LOCAL_CI_TOOLS", tmp.path().join("tools"))
+                .current_dir(ws.join("proj"))
+                .env("GITHUB_WORKSPACE", ws)
+                .env("LOCAL_CI_MARKS", tmp.path().join(marks))
                 .stderr(Stdio::null())
                 .status()
                 .unwrap();
             assert!(st.success());
         };
+        let npm = |args: &[&str]| npm_in(&ws, "marks", args);
         npm(&["ci", "--no-audit"]);
         npm(&["ci"]);
         npm(&["install"]);
@@ -1760,6 +1850,30 @@ mod tests {
         npm(&["ci"]);
         let calls = fs::read_to_string(&log).unwrap();
         assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\n");
+
+        // A unit's copy of the workspace, with the marks copied, skips too;
+        // a copy without them does not.
+        let copy = tmp.path().join("copy");
+        fs::create_dir_all(copy.join("proj/node_modules")).unwrap();
+        fs::copy(
+            proj.join("package-lock.json"),
+            copy.join("proj/package-lock.json"),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("copied-marks")).unwrap();
+        for e in fs::read_dir(tmp.path().join("marks")).unwrap().flatten() {
+            if e.file_type().unwrap().is_file() {
+                fs::copy(
+                    e.path(),
+                    tmp.path().join("copied-marks").join(e.file_name()),
+                )
+                .unwrap();
+            }
+        }
+        npm_in(&copy, "copied-marks", &["ci"]);
+        npm_in(&copy, "other-marks", &["ci"]);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\nci\n");
     }
 
     #[test]

@@ -142,6 +142,68 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Another worktree of `sha` at `to`, holding a copy of everything in `from`
+/// (setup output such as `node_modules` included). Files are cloned
+/// copy-on-write where the filesystem allows it, so this is quick and a write
+/// in one copy is never seen in the other.
+pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "--quiet",
+            &to.to_string_lossy(),
+            sha,
+        ],
+    )?;
+    let index = |d: &Path| {
+        git(
+            d,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .map(PathBuf::from)
+    };
+    std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
+    let mut entries = Vec::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        if e.file_name() != ".git" {
+            entries.push(e.path());
+        }
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let cp = |flags: &[&str]| {
+        Command::new("cp")
+            .args(flags)
+            .args(&entries)
+            .arg(to)
+            .output()
+            .context("failed to run cp")
+    };
+    let mut out = if cfg!(target_os = "macos") {
+        cp(&["-cRp"])?
+    } else {
+        cp(&["-a", "--reflink=auto"])?
+    };
+    if !out.status.success() && cfg!(target_os = "macos") {
+        // not APFS: a plain copy
+        out = cp(&["-Rp"])?;
+    }
+    if !out.status.success() {
+        bail!(
+            "cp {}: {}",
+            from.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Move the worktree out of the way, unregister it, and delete the files in the background.
 pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
     let _ = std::fs::create_dir_all(trash);
