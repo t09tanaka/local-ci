@@ -154,7 +154,10 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    most of the files. A
    step that may write into `node_modules` (an install, `npm rebuild`,
    `prisma generate`, `yarn`, `pnpm`, `patch-package`, or an npm command from
-   inside a script) first gets a copy of its own. With canirun,
+   inside a script) first gets a copy of its own. A project whose
+   `tsconfig` emits declarations (`declaration` or `composite`) keeps a copy
+   too: TypeScript follows a link to setup's tree and then cannot name the
+   type (TS2742). With canirun,
    the entries of a matrix run at once too (up to `strategy.max-parallel`),
    each in its own copy. Jobs that start services or containers, run
    Playwright or Cypress, or look like integration / e2e tests, are

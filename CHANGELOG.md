@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1
+
+- A project whose `tsconfig*.json` (or one it extends by a relative path)
+  sets `declaration` or `composite` gets a copy of its `node_modules` again
+  instead of links. TypeScript follows a link to where the package really
+  is, outside the unit's copy, and a declaration that would have to name
+  that path failed with TS2742 ("cannot be named without a reference to
+  ...") even under `tsc --noEmit`.
+
 ## 0.6.0
 
 - A unit whose jobs passed in the last 24 hours is not run again when
