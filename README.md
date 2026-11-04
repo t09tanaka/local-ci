@@ -128,8 +128,12 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    own copy of the worktree as it is after setup, as each CI job has its own
    checkout: a job that edits files for a while (a negative control, a
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
-   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere), so
-   `node_modules` and other setup output cost little to copy. With canirun,
+   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere),
+   except that each `node_modules` is a link to setup's: even a clone makes and
+   later deletes one file per file, and dependencies are most of the files. A
+   step that may write into `node_modules` (an install, `npm rebuild`,
+   `prisma generate`, `yarn`, `pnpm`, `patch-package`, or an npm command from
+   inside a script) first gets a copy of its own. With canirun,
    the entries of a matrix run at once too (up to `strategy.max-parallel`),
    each in its own copy. Jobs that start services or containers, run
    Playwright or Cypress, or look like integration / e2e tests, are
