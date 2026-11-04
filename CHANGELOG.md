@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2
+
+- Units' copies clone `node_modules` again, as up to 0.5.1. Linking to
+  setup's packages (0.6.0) is now opt-in with `link-node-modules = true` in
+  `.local-ci.toml`. Tools that follow a link to where the package really is
+  and then refuse a path outside the project broke with it: after
+  TypeScript emitting declarations (0.6.1), a Next.js build with Turbopack
+  did not find `next` outside its workspace root.
+
 ## 0.6.1
 
 - A project whose `tsconfig*.json` (or one it extends by a relative path)

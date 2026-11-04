@@ -92,6 +92,23 @@ no-cache = ["e2e.yml", "api-ci.yml:contract"]
 |---|---|
 | `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
 | `no-cache` | Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never reused (see *Reused results*). |
+| `link-node-modules` | `true` to give units' copies links to setup's packages instead of a clone of each `node_modules`. Off by default. |
+
+**`link-node-modules`.** Even a copy-on-write clone makes, and later deletes,
+one file per file, and dependencies are most of the files: in a monorepo of
+twenty units that is millions of files per run, each deletion also checked by
+fseventsd. With the key on, a copy's `node_modules` is a directory of links
+to the packages setup installed. A step that may write into one (an install,
+`npm rebuild`, `prisma generate`, `yarn`, `pnpm`, `patch-package`, or an npm
+command from inside a script) first gets a copy of its own; so does a project
+whose `node_modules` links out of itself (workspaces, `file:` dependencies)
+or whose `tsconfig` emits declarations. It is off by default because a tool
+that follows a link to where the package really is, outside the unit's copy,
+may refuse it: TypeScript emitting declarations fails with TS2742 (handled
+as said), and a Next.js build with Turbopack does not find `next` outside
+its workspace root (not handled: do not turn the key on for a repository
+that builds with Turbopack). Run everything once with `--no-cache` after
+turning it on.
 
 Without the file, local-ci reads `.github/workflows` as before. An absolute
 path, a path outside the repository (`..`), an empty list and an unknown key
@@ -148,16 +165,9 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    own copy of the worktree as it is after setup, as each CI job has its own
    checkout: a job that edits files for a while (a negative control, a
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
-   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere),
-   except that each `node_modules` holds links to the packages in setup's: even
-   a clone makes and later deletes one file per file, and dependencies are
-   most of the files. A
-   step that may write into `node_modules` (an install, `npm rebuild`,
-   `prisma generate`, `yarn`, `pnpm`, `patch-package`, or an npm command from
-   inside a script) first gets a copy of its own. A project whose
-   `tsconfig` emits declarations (`declaration` or `composite`) keeps a copy
-   too: TypeScript follows a link to setup's tree and then cannot name the
-   type (TS2742). With canirun,
+   a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere).
+   With `link-node-modules = true` in `.local-ci.toml`, each `node_modules`
+   holds links to the packages in setup's instead (see below). With canirun,
    the entries of a matrix run at once too (up to `strategy.max-parallel`),
    each in its own copy. Jobs that start services or containers, run
    Playwright or Cypress, or look like integration / e2e tests, are

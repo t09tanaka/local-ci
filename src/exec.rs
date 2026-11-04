@@ -1239,7 +1239,13 @@ impl<'a> Runner<'a> {
 
     /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
     fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
-        crate::git::clone_worktree(&self.repo.root, from, to, &self.repo.sha)?;
+        crate::git::clone_worktree(
+            &self.repo.root,
+            from,
+            to,
+            &self.repo.sha,
+            self.repo.link_node_modules,
+        )?;
         let marks = self.marks(to);
         fs::create_dir_all(&marks)?;
         for e in fs::read_dir(self.marks(from))
