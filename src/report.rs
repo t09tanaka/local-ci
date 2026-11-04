@@ -37,10 +37,29 @@ pub struct Saved {
     pub description: String,
 }
 
-/// How a workflow is named in output: the file name for `.github/workflows/`,
-/// the path for one read with `--workflows-dir`, so equal file names stay apart.
+static DEFAULT_WORKFLOWS_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The directory `short` leaves off: the first `workflows-dirs` entry of
+/// `.local-ci.toml`. Set once, before anything is printed.
+pub fn set_default_workflows_dir(d: &str) {
+    let _ = DEFAULT_WORKFLOWS_DIR.set(d.to_string());
+}
+
+/// How a workflow is named in output: the file name for the default directory
+/// (`.github/workflows/`, or the first one `.local-ci.toml` names), the path
+/// for any other, so equal file names stay apart.
 pub fn short(f: &str) -> &str {
-    f.strip_prefix(".github/workflows/").unwrap_or(f)
+    let dir = DEFAULT_WORKFLOWS_DIR
+        .get()
+        .map(String::as_str)
+        .unwrap_or(crate::config::DEFAULT_WORKFLOWS_DIR);
+    short_in(dir, f)
+}
+
+fn short_in<'a>(dir: &str, f: &'a str) -> &'a str {
+    f.strip_prefix(dir)
+        .and_then(|r| r.strip_prefix('/'))
+        .unwrap_or(f)
 }
 
 pub fn tilde(p: &Path) -> String {
@@ -372,5 +391,27 @@ mod tests {
     fn durations() {
         assert_eq!(dur(5.2), "5s");
         assert_eq!(dur(125.0), "2m05s");
+    }
+
+    #[test]
+    fn workflow_names_leave_off_the_default_dir() {
+        assert_eq!(
+            short_in(".github/workflows", ".github/workflows/ci.yml"),
+            "ci.yml"
+        );
+        assert_eq!(short_in(".ci/workflows", ".ci/workflows/ci.yml"), "ci.yml");
+        assert_eq!(
+            short_in(".ci/workflows", ".github/workflows/ci.yml"),
+            ".github/workflows/ci.yml"
+        );
+        assert_eq!(
+            short_in(".ci/workflows", "ci/local/m.yml"),
+            "ci/local/m.yml"
+        );
+        // a sibling that only shares the prefix keeps its path
+        assert_eq!(
+            short_in(".ci/workflows", ".ci/workflows-old/ci.yml"),
+            ".ci/workflows-old/ci.yml"
+        );
     }
 }

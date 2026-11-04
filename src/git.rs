@@ -123,29 +123,56 @@ pub fn changed_files(dir: &Path, base: &str, sha: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Workflow files at `sha`, as (path, text): `.github/workflows/` and then each
-/// of `extra` (directories relative to the repository root, which must hold some).
-pub fn workflows_at(dir: &Path, sha: &str, extra: &[String]) -> Result<Vec<(String, String)>> {
-    let mut dirs = vec![".github/workflows".to_string()];
+/// Where a workflow directory was named, for the error when it holds none.
+#[derive(Clone, Copy, PartialEq)]
+enum Named {
+    /// `.github/workflows` with no `.local-ci.toml` to replace it: may be empty.
+    Default,
+    Config,
+    Flag,
+}
+
+/// Workflow files at `sha`, as (path, text): each of `configured` (the
+/// `workflows-dirs` of `.local-ci.toml`; `.github/workflows` when `None`) and
+/// then each of `extra` (`--workflows-dir`). All are relative to the
+/// repository root, and every one but the unconfigured `.github/workflows`
+/// must hold some.
+pub fn workflows_at(
+    dir: &Path,
+    sha: &str,
+    configured: Option<&[String]>,
+    extra: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut dirs: Vec<(String, Named)> = match configured {
+        Some(c) => c.iter().map(|d| (d.clone(), Named::Config)).collect(),
+        None => vec![(
+            crate::config::DEFAULT_WORKFLOWS_DIR.to_string(),
+            Named::Default,
+        )],
+    };
     for d in extra {
         if Path::new(d).is_absolute() {
             bail!("--workflows-dir {d}: give a path relative to the repository root");
         }
         let d = crate::plan::norm_dir(d);
-        if !dirs.contains(&d) {
-            dirs.push(d);
+        if !dirs.iter().any(|(x, _)| x == &d) {
+            dirs.push((d, Named::Flag));
         }
     }
     let mut out = Vec::new();
-    for (i, d) in dirs.iter().enumerate() {
+    for (d, named) in &dirs {
         let list = git(dir, &["ls-tree", "--name-only", sha, &format!("{d}/")]).unwrap_or_default();
         let files: Vec<&str> = list
             .lines()
             .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
             .collect();
-        if i > 0 && files.is_empty() {
+        if files.is_empty() && *named != Named::Default {
+            let source = match named {
+                Named::Config => format!("{}: workflows-dirs", crate::config::FILE),
+                _ => "--workflows-dir".to_string(),
+            };
             bail!(
-                "--workflows-dir {d}: no .yml / .yaml files there at {} (workflows are read from the commit; commit them first)",
+                "{source} {d}: no .yml / .yaml files there at {} (workflows are read from the commit; commit them first)",
                 &sha[..sha.len().min(7)]
             );
         }

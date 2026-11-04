@@ -8,7 +8,8 @@ local-ci run          # what a pull request of these changes would trigger
 local-ci run --all    # every check a pull request can trigger
 ```
 
-`local-ci` reads `.github/workflows/`, works out which workflows a pull request
+`local-ci` reads `.github/workflows/` (or the directories
+[`.local-ci.toml`](#local-citoml) names), works out which workflows a pull request
 from this branch would start (triggers, `branches`, `paths` / `paths-ignore`),
 and runs their jobs in a throwaway `git worktree` of the commit. It prints one
 line per job and, for a failure, the end of the failing step's log. Full logs
@@ -67,13 +68,45 @@ Common options (`plan` and `run`):
 | `--sha <rev>` | Test this commit. Default: `HEAD`. Uncommitted changes are never tested. |
 | `--all` | All checks: ignore `paths` / `paths-ignore`, and run workflows that are disabled on GitHub. `branches` and `types` still apply, so a workflow that only runs on pushes to `main` stays out. |
 | `--include-disabled` | Also run workflows that are disabled on GitHub, with `paths` / `paths-ignore` still applied. `--all` implies it. |
-| `--workflows-dir <dir>` | Also read the workflows in this directory (relative to the repository root, repeatable). GitHub never runs them, so this is the place for checks you only want before pushing. They are picked by the same triggers and `paths`, read from the commit like the rest, and named by their path in the output (`ci/local/mutation.yml › ...`). |
+| `--workflows-dir <dir>` | Also read the workflows in this directory (relative to the repository root, repeatable), besides `.github/workflows` or the directories `.local-ci.toml` names. GitHub never runs them, so this is the place for checks you only want before pushing. They are picked by the same triggers and `paths`, read from the commit like the rest, and named by their path in the output (`ci/local/mutation.yml › ...`). |
 | `-w, --workflow <file or name>` | Only these workflows. |
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
 
 `run` also takes `--parallel <n>`, `--containers <n>`, `--no-canirun`, `--no-portool`, `--no-status`, `--keep`
 (keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
+
+## `.local-ci.toml`
+
+An optional file at the repository root. Like the workflows, it is read from
+the commit under test, so commit it before it takes effect.
+
+```toml
+# Read workflows from here instead of .github/workflows
+workflows-dirs = [".ci/workflows"]
+```
+
+| Key | |
+|---|---|
+| `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
+
+Without the file, local-ci reads `.github/workflows` as before. An absolute
+path, an empty list and an unknown key are errors.
+
+**CI with local-ci only.** To keep GitHub Actions from running your checks and
+run them with local-ci alone, move the workflows out of `.github/workflows`
+(the only place GitHub looks) and point local-ci at their new place:
+
+```
+mkdir -p .ci && git mv .github/workflows .ci/workflows
+printf 'workflows-dirs = [".ci/workflows"]\n' > .local-ci.toml
+git add .local-ci.toml && git commit -m "Run CI with local-ci"
+local-ci run
+```
+
+The triggers, `branches` and `paths` of the moved files apply as before, and
+`local-ci status` still records the result as the `local-ci` commit status.
+Workflows outside `.github/workflows` are never seen as disabled on GitHub.
 
 ## How a run works
 

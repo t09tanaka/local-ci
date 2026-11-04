@@ -1,3 +1,4 @@
+mod config;
 mod exec;
 mod expr;
 mod filter;
@@ -37,8 +38,9 @@ pub struct Target {
     /// Also run workflows that are disabled on GitHub (`paths` still apply; `--all` implies this)
     #[arg(long)]
     include_disabled: bool,
-    /// Also read workflows from this directory (relative to the repository root), repeatable.
-    /// GitHub does not run them; their triggers are applied as for `.github/workflows/`
+    /// Also read workflows from this directory (relative to the repository root), repeatable,
+    /// besides `.github/workflows` (or the `workflows-dirs` of `.local-ci.toml`).
+    /// Their triggers are applied as for the others
     #[arg(long = "workflows-dir", value_name = "DIR")]
     workflows_dirs: Vec<String>,
     /// Only these workflows (file name or `name:`), repeatable
@@ -132,8 +134,15 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
     } else {
         None
     };
+    let config = config::at(&root, &sha)?;
+    report::set_default_workflows_dir(config.default_workflows_dir());
     let mut wfs = Vec::new();
-    for (file, text) in git::workflows_at(&root, &sha, &t.workflows_dirs)? {
+    for (file, text) in git::workflows_at(
+        &root,
+        &sha,
+        config.workflows_dirs.as_deref(),
+        &t.workflows_dirs,
+    )? {
         match workflow::parse(&file, &text) {
             Ok(w) => wfs.push(w),
             Err(e) => eprintln!("local-ci: skipping {file}: {e:#}"),
