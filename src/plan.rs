@@ -354,9 +354,16 @@ pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
         }
     }
 
-    // Setup: steps from the common head of the jobs that are installs, or that
-    // several jobs repeat word for word, as long as everything before them in
-    // each of those jobs is also hoisted.
+    fill_setup(&mut plan);
+    plan
+}
+
+/// Setup: steps from the common head of the jobs that are installs, or that
+/// several jobs repeat word for word, as long as everything before them in
+/// each of those jobs is also hoisted. Worked out again when units are taken
+/// out of the plan (their results are reused).
+pub fn fill_setup(plan: &mut Plan) {
+    plan.setup.clear();
     let mut prefixes: Vec<JobPrefix> = Vec::new();
     for u in &plan.units {
         let w = &plan.selected[u.wf].wf;
@@ -418,7 +425,6 @@ pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
             }
         }
     }
-    plan
 }
 
 #[cfg(test)]

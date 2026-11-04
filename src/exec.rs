@@ -92,6 +92,9 @@ pub struct UnitResult {
     /// Time spent copying the worktree for this unit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_secs: Option<f64>,
+    /// Where the reused result comes from (`abc1234, 2h ago`), when the unit did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<String>,
 }
 
 pub struct Opts {
@@ -1261,6 +1264,7 @@ impl<'a> Runner<'a> {
                     jobs,
                     waited_secs: waited,
                     copy_secs: None,
+                    cached: None,
                 }
             }
         };
@@ -1318,6 +1322,7 @@ impl<'a> Runner<'a> {
             jobs,
             waited_secs: waited,
             copy_secs: None,
+            cached: None,
         }
     }
 

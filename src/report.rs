@@ -109,6 +109,15 @@ pub fn counts(units: &[UnitResult]) -> Counts {
     c
 }
 
+/// Jobs whose result was reused instead of run.
+pub fn cached_jobs(units: &[UnitResult]) -> usize {
+    units
+        .iter()
+        .filter(|u| u.cached.is_some())
+        .map(|u| u.jobs.len())
+        .sum()
+}
+
 /// success / failure / error, the same table the commit status uses.
 pub fn state(setup: &[StepResult], units: &[UnitResult]) -> &'static str {
     let c = counts(units);
@@ -186,6 +195,10 @@ pub fn description(
     if not_covered > 0 {
         d.push_str(&format!(", {not_covered} not covered"));
     }
+    let cached = cached_jobs(units);
+    if cached > 0 {
+        d.push_str(&format!(", {cached} cached"));
+    }
     let list = wfs.join(",");
     if d.len() + list.len() + 3 <= 140 {
         d = format!("{list}: {d}");
@@ -254,10 +267,17 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         }
     }
     let mut skipped_jobs = Vec::new();
-    for j in r.units.iter().flat_map(|u| &u.jobs) {
+    for (u, j) in r
+        .units
+        .iter()
+        .flat_map(|u| u.jobs.iter().map(move |j| (u, j)))
+    {
         let name = format!("{} › {}", short(&j.workflow), j.display);
         match &j.outcome {
-            Outcome::Pass => println!("PASS   {name}  {}", dur(j.secs)),
+            Outcome::Pass => match &u.cached {
+                Some(from) => println!("PASS   {name}  cached ({from})"),
+                None => println!("PASS   {name}  {}", dur(j.secs)),
+            },
             Outcome::Fail => {
                 let s = failed_step(j);
                 let what = s
@@ -319,13 +339,19 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         }
     }
     let c = counts(&r.units);
+    let cached = cached_jobs(&r.units);
     println!(
-        "\nresult: {} · pass {} / fail {} / error {} / skip {} · {}",
+        "\nresult: {} · pass {} / fail {} / error {} / skip {}{} · {}",
         r.state,
         c.pass,
         c.fail,
         c.error,
         c.skip,
+        if cached > 0 {
+            format!(" ({cached} cached)")
+        } else {
+            String::new()
+        },
         dur(r.secs)
     );
 }
@@ -361,6 +387,7 @@ mod tests {
                 jobs: o.into_iter().map(job).collect(),
                 waited_secs: 0.0,
                 copy_secs: None,
+                cached: None,
             }]
         };
         assert_eq!(

@@ -84,11 +84,14 @@ the commit under test, so commit it before it takes effect.
 ```toml
 # Read workflows from here instead of .github/workflows
 workflows-dirs = [".ci/workflows"]
+# Always run these, even when a recent result covers them
+no-cache = ["e2e.yml", "api-ci.yml:contract"]
 ```
 
 | Key | |
 |---|---|
 | `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
+| `no-cache` | Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never reused (see *Reused results*). |
 
 Without the file, local-ci reads `.github/workflows` as before. An absolute
 path, a path outside the repository (`..`), an empty list and an unknown key
@@ -111,6 +114,20 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
 
 ## How a run works
 
+0. **Reused results.** A unit whose jobs all passed (or were skipped) in the
+   last 24 hours is not run again when nothing it depends on has changed: the
+   files its workflow's `paths` cover (all files but its `paths-ignore`, or
+   every file when it has neither), everything under `.github/` and the
+   workflow directories, `.local-ci.toml`, the Node version, and local-ci's
+   own version; plus the merge base when a step looks at the base
+   (`--affected`, `git diff`, `base_ref`, ...). `paths` is what GitHub decides
+   by whether the workflow runs at all, so a reused result stands on the same
+   ground as GitHub not running it. The report shows such jobs as
+   `PASS … cached (abc1234, 2h ago)`, and when every unit is reused nothing
+   is checked out or installed. Units running `npm audit` or other advisory
+   checks are always run, since their result changes without the code; so
+   are those listed in `no-cache`. `--no-cache` runs everything (and keeps
+   the new results).
 1. **Worktree.** The commit is checked out with `git worktree add --detach`
    under the cache directory. Your working tree is never touched, so steps such
    as `git add -A`, `cp .env.example .env` or generators that rewrite tracked
@@ -219,7 +236,8 @@ The cache directory is `~/Library/Caches/local-ci` on macOS and
 `LOCAL_CI_HOME` to move it. It holds the worktrees while they run
 (`wt/<sha>-<pid>`, one `wt/<sha>-u<n>-<pid>` per unit and one `wt/<sha>-c<n>-<pid>` per matrix entry run at once), the last 20
 runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
-`result.json`), and the locks.
+`result.json`), the results that may be reused (`results/<repo>/`, a day at
+most), and the locks.
 
 ## License
 

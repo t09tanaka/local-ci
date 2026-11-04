@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A unit whose jobs passed in the last 24 hours is not run again when
+  nothing it depends on has changed: the files its workflow's `paths` (or all
+  but its `paths-ignore`) cover, the workflows and local actions,
+  `.local-ci.toml`, the Node version and local-ci's own, and the merge base
+  when a step compares with the base. The report marks such jobs
+  `cached (abc1234, 2h ago)`; when every unit is reused, nothing is checked
+  out or installed. Units running `npm audit` or other advisory checks always
+  run, as do workflows and jobs listed in the new `no-cache` key of
+  `.local-ci.toml`. `--no-cache` runs everything.
 - A unit's copy of the worktree links each `node_modules` to setup's instead
   of cloning it. A clone is still one new file per file, so a run of twenty
   units made and then deleted twenty copies of every project's dependencies
