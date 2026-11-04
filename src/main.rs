@@ -286,22 +286,9 @@ fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
         u.jobs.retain(|j| keep.contains(j));
     }
     p.units.retain(|u| !u.jobs.is_empty());
-    let live: Vec<(usize, String)> = p
-        .units
-        .iter()
-        .flat_map(|u| u.jobs.iter().map(move |j| (u.wf, j.clone())))
-        .collect();
-    p.setup.retain(|s| {
-        live.contains(&(s.wf, s.job.clone()))
-            || live.iter().any(|(wf, j)| {
-                let w = &p.selected[*wf].wf;
-                w.jobs.iter().find(|x| &x.id == j).is_some_and(|job| {
-                    job.steps
-                        .iter()
-                        .any(|st| plan::step_key(w, job, st).as_ref() == Some(&s.key))
-                })
-            })
-    });
+    // worked out again rather than filtered: an install kept from a job left
+    // out may be the one that runs, its twin in a kept job marked not to
+    plan::fill_setup(p);
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -426,6 +413,7 @@ fn run(a: RunArgs) -> Result<i32> {
             &repo.root,
             &repo.sha,
             &repo.base,
+            repo.head.as_deref(),
             &repo.workflow_dirs,
             &repo.no_cache,
         ) {
@@ -490,6 +478,7 @@ fn run(a: RunArgs) -> Result<i32> {
         std::fs::create_dir_all(cache.join("wt"))?;
         git::add_worktree(&repo.root, &wt, &repo.sha)?;
         ctrlc::set_handler(exec::kill_all).ok();
+        exec::remove_orphan_containers();
         let canirun = if a.no_canirun {
             None
         } else {
@@ -549,9 +538,12 @@ fn run(a: RunArgs) -> Result<i32> {
         result?
     };
     if !exec::CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
         for (u, fp) in units.iter().zip(&run_fps) {
             if let Some(fp) = fp {
-                store.put(fp, &repo.sha, u, stamp);
+                store.put(fp, &repo.sha, u, now);
             }
         }
     }

@@ -1,25 +1,43 @@
 //! Reuse the result of a unit that passed when nothing it depends on has
 //! changed since: the files its workflow's `paths` (or all but its
-//! `paths-ignore`) cover, the workflows and local actions themselves,
-//! `.local-ci.toml`, the base when a step looks at it, and the versions of
-//! Node and local-ci. `paths` is what GitHub goes by to decide whether the
-//! workflow runs at all, so a reused result stands on the same ground as
-//! GitHub not running it. Results are kept for a day: tests that depend on
+//! `paths-ignore`) cover, every file at the root of the repository (lockfiles
+//! and shared configuration), the workflows and local actions themselves,
+//! the merge base and branch, the versions of the tools its steps use, and
+//! local-ci itself. This trusts `paths` to name what the workflow depends on,
+//! as GitHub does when a pull request changes nothing it covers; a change
+//! outside it, say in a shared directory the workflow does not list, does
+//! not run the unit again. Results are kept for a day: tests that depend on
 //! the date, and checks against advisory databases, change without the code.
 
-use crate::exec::{JobResult, Outcome, UnitResult};
+use crate::exec::{JobResult, Outcome, StepResult, UnitResult};
 use crate::filter::last_match;
 use crate::plan::Unit;
-use crate::workflow::{Job, Workflow};
+use crate::workflow::Workflow;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub const TTL_SECS: u64 = 24 * 3600;
+
+/// Tools whose version goes into the fingerprint of a unit that names them:
+/// the word to look for and the command that prints the version.
+const TOOLS: &[(&str, &[&str])] = &[
+    ("npm", &["npm", "--version"]),
+    ("npx", &["npm", "--version"]),
+    ("yarn", &["yarn", "--version"]),
+    ("pnpm", &["pnpm", "--version"]),
+    ("dart", &["dart", "--version"]),
+    ("flutter", &["flutter", "--version"]),
+    ("cargo", &["rustc", "--version"]),
+    ("python3", &["python3", "--version"]),
+    ("pip", &["python3", "--version"]),
+    ("go", &["go", "version"]),
+];
 
 /// What the fingerprints of one run share.
 pub struct Inputs {
@@ -29,8 +47,12 @@ pub struct Inputs {
     /// Directories whose files always count: workflows and local actions.
     always: Vec<String>,
     merge_base: Option<String>,
-    node: String,
+    branch: Option<String>,
+    /// local-ci's version and, for builds between releases, its binary.
+    binary: String,
     no_cache: Vec<String>,
+    /// Output of version commands and contents of blobs, read once.
+    seen: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl Inputs {
@@ -38,6 +60,7 @@ impl Inputs {
         root: &Path,
         sha: &str,
         base: &str,
+        branch: Option<&str>,
         workflow_dirs: &[String],
         no_cache: &[String],
     ) -> Result<Inputs> {
@@ -56,41 +79,52 @@ impl Inputs {
             always.push(format!("{}/", d.trim_end_matches('/')));
         }
         let merge_base = crate::git::git(root, &["merge-base", base, sha]).ok();
-        let node = Command::new("node")
-            .arg("--version")
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        let exe = std::env::current_exe()
+            .and_then(|p| p.metadata())
+            .map(|m| {
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("{} {t}", m.len())
+            })
             .unwrap_or_default();
         Ok(Inputs {
             root: root.to_path_buf(),
             files,
             always,
             merge_base,
-            node,
+            branch: branch.map(String::from),
+            binary: format!("{} {exe}", env!("CARGO_PKG_VERSION")),
             no_cache: no_cache.to_vec(),
+            seen: Mutex::new(HashMap::new()),
         })
     }
 
     /// The fingerprint of `u` (in workflow `w`, run as `event`), or `None`
     /// when its result is never reused.
     pub fn fingerprint(&self, w: &Workflow, event: &str, u: &Unit) -> Option<String> {
-        let jobs: Vec<&Job> = u
-            .jobs
-            .iter()
-            .filter_map(|id| w.jobs.iter().find(|j| &j.id == id))
-            .collect();
         if self.excluded(w, &u.jobs) {
             return None;
         }
-        let scripts: Vec<&str> = jobs
-            .iter()
-            .flat_map(|j| j.steps.iter())
-            .filter_map(|s| s.run.as_deref())
-            .collect();
-        if scripts.iter().any(|s| volatile(s)) {
+        // what the steps run, with the package.json scripts they start
+        let mut texts = Vec::new();
+        for id in &u.jobs {
+            let j = w.jobs.iter().find(|j| &j.id == id)?;
+            for s in &j.steps {
+                let Some(run) = &s.run else { continue };
+                let dir = crate::plan::step_dir(w, j, s);
+                let pkg = if dir.is_empty() {
+                    "package.json".to_string()
+                } else {
+                    format!("{dir}/package.json")
+                };
+                texts.push(crate::plan::with_scripts(run, self.blob(&pkg).as_deref()));
+            }
+        }
+        if texts.iter().any(|t| volatile(t)) {
             return None;
         }
         let trigger = w.triggers.iter().find(|t| {
@@ -108,20 +142,21 @@ impl Inputs {
             _ => true,
         };
         let mut m = format!(
-            "local-ci {}\nnode {}\nevent {event}\nworkflow {}\njobs {}\n",
-            env!("CARGO_PKG_VERSION"),
-            self.node,
+            "local-ci {}\nnode {}\nevent {event}\nworkflow {}\njobs {}\nbranch {}\nbase {}\n",
+            self.binary,
+            self.version(&["node", "--version"]),
             w.file,
-            u.jobs.join(",")
+            u.jobs.join(","),
+            self.branch.as_deref().unwrap_or(""),
+            self.merge_base.as_deref().unwrap_or("none"),
         );
-        if scripts.iter().any(|s| looks_at_base(s)) {
-            m.push_str(&format!(
-                "base {}\n",
-                self.merge_base.as_deref().unwrap_or("none")
-            ));
+        for (word, cmd) in TOOLS {
+            if texts.iter().any(|t| names(t, word)) {
+                m.push_str(&format!("{word} {}\n", self.version(cmd)));
+            }
         }
         for (path, object) in &self.files {
-            if path == crate::config::FILE
+            if !path.contains('/')
                 || self.always.iter().any(|d| path.starts_with(d.as_str()))
                 || covered(path)
             {
@@ -138,23 +173,53 @@ impl Inputs {
             None => is_wf(e),
         })
     }
+
+    fn version(&self, cmd: &[&str]) -> String {
+        let key = cmd.join(" ");
+        self.remember(key, || {
+            let o = Command::new(cmd[0])
+                .args(&cmd[1..])
+                .stdin(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            // `java -version`-style tools print to stderr
+            let text = [o.stdout, o.stderr].concat();
+            Some(String::from_utf8_lossy(&text).trim().to_string())
+        })
+        .unwrap_or_default()
+    }
+
+    /// The file at `path` in the commit.
+    fn blob(&self, path: &str) -> Option<String> {
+        let object = self.files.iter().find(|(p, _)| p == path)?.1.clone();
+        let root = self.root.clone();
+        self.remember(format!("blob {object}"), move || {
+            crate::git::git(&root, &["cat-file", "-p", &object]).ok()
+        })
+    }
+
+    fn remember(&self, key: String, f: impl FnOnce() -> Option<String>) -> Option<String> {
+        if let Some(v) = self.seen.lock().unwrap().get(&key) {
+            return v.clone();
+        }
+        let v = f();
+        self.seen.lock().unwrap().insert(key, v.clone());
+        v
+    }
 }
 
 /// Checks whose result changes without the code: advisory databases.
-fn volatile(script: &str) -> bool {
+fn volatile(text: &str) -> bool {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)\baudit\b|advisor|osv-scanner").unwrap())
-        .is_match(script)
+        .is_match(&text.replace("--no-audit", ""))
 }
 
-/// A step whose result depends on the base it is compared with.
-fn looks_at_base(script: &str) -> bool {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r"base_ref|BASE_REF|merge-base|--affected|git (diff|log)|origin/|github\.event\.pull_request")
-            .unwrap()
-    })
-    .is_match(script)
+/// Whether `text` runs the command `word`.
+fn names(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .any(|w| w == word)
 }
 
 fn hash(root: &Path, text: &str) -> Option<String> {
@@ -187,6 +252,17 @@ struct SavedJob {
     display: String,
     /// Why the job was skipped, when it was.
     skip: Option<String>,
+    /// Steps that were skipped or noted, which the report lists as not
+    /// covered or as warnings.
+    #[serde(default)]
+    steps: Vec<SavedStep>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedStep {
+    label: String,
+    skip: Option<String>,
+    note: Option<String>,
 }
 
 /// The results kept for one repository.
@@ -218,7 +294,21 @@ impl Store {
                     None => Outcome::Pass,
                 },
                 secs: 0.0,
-                steps: vec![],
+                steps: j
+                    .steps
+                    .into_iter()
+                    .map(|s| StepResult {
+                        label: s.label,
+                        outcome: match s.skip {
+                            Some(r) => Outcome::Skip(r),
+                            None => Outcome::Pass,
+                        },
+                        exit: None,
+                        secs: 0.0,
+                        log: None,
+                        note: s.note,
+                    })
+                    .collect(),
             })
             .collect();
         Some(UnitResult {
@@ -243,6 +333,10 @@ impl Store {
         {
             return;
         }
+        let skip = |o: &Outcome| match o {
+            Outcome::Skip(r) => Some(r.clone()),
+            _ => None,
+        };
         let saved = Saved {
             at: now,
             sha: sha.to_string(),
@@ -252,10 +346,17 @@ impl Store {
                 .map(|j| SavedJob {
                     job: j.job.clone(),
                     display: j.display.clone(),
-                    skip: match &j.outcome {
-                        Outcome::Skip(r) => Some(r.clone()),
-                        _ => None,
-                    },
+                    skip: skip(&j.outcome),
+                    steps: j
+                        .steps
+                        .iter()
+                        .filter(|s| matches!(s.outcome, Outcome::Skip(_)) || s.note.is_some())
+                        .map(|s| SavedStep {
+                            label: s.label.clone(),
+                            skip: skip(&s.outcome),
+                            note: s.note.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -301,7 +402,7 @@ mod tests {
     use crate::workflow::parse;
 
     fn inputs(files: &[(&str, &str)]) -> Inputs {
-        Inputs {
+        let i = Inputs {
             root: std::env::temp_dir(),
             files: files
                 .iter()
@@ -309,9 +410,16 @@ mod tests {
                 .collect(),
             always: vec![".github/".into()],
             merge_base: Some("b".repeat(40)),
-            node: "v22".into(),
+            branch: Some("feature".into()),
+            binary: "0.0.0".into(),
             no_cache: vec!["ci.yml:audit".into()],
+            seen: Mutex::new(HashMap::new()),
+        };
+        // no commands or git objects behind these tests
+        for cmd in ["node --version", "npm --version"] {
+            i.seen.lock().unwrap().insert(cmd.into(), Some("v".into()));
         }
+        i
     }
 
     const WF: &str = r#"
@@ -321,7 +429,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
     steps:
+      - run: npm ci --no-audit
       - run: npm test
   audit:
     runs-on: ubuntu-latest
@@ -338,41 +450,69 @@ jobs:
     }
 
     #[test]
-    fn only_what_the_paths_cover_counts() {
+    fn what_the_fingerprint_covers() {
         let w = parse(".github/workflows/ci.yml", WF).unwrap();
         let base = [
             (".github/workflows/ci.yml", "w1"),
+            ("package-lock.json", "l1"),
             ("api/src/a.ts", "a1"),
             ("api/docs/x.md", "d1"),
             ("web/b.ts", "b1"),
         ];
-        let fp =
-            |files: &[(&str, &str)]| inputs(files).fingerprint(&w, "pull_request", &unit("test"));
-        let a = fp(&base).unwrap();
+        let fp = |files: &[(&str, &str)]| {
+            inputs(files)
+                .fingerprint(&w, "pull_request", &unit("test"))
+                .unwrap()
+        };
+        let a = fp(&base);
         // outside `paths`, or excluded by `!`: the same fingerprint
         let mut other = base;
-        other[2].1 = "d2";
-        other[3].1 = "b2";
-        assert_eq!(fp(&other).unwrap(), a);
-        // a covered file or the workflow itself: a different one
-        let mut changed = base;
-        changed[1].1 = "a2";
-        assert_ne!(fp(&changed).unwrap(), a);
-        let mut wf = base;
-        wf[0].1 = "w2";
-        assert_ne!(fp(&wf).unwrap(), a);
+        other[3].1 = "d2";
+        other[4].1 = "b2";
+        assert_eq!(fp(&other), a);
+        // a covered file, a file at the root or the workflow: a different one
+        for i in [0, 1, 2] {
+            let mut changed = base;
+            changed[i].1 = "x";
+            assert_ne!(fp(&changed), a, "{}", base[i].0);
+        }
+        // so do the base and the branch
+        let mut moved = inputs(&base);
+        moved.merge_base = Some("c".repeat(40));
+        assert_ne!(
+            moved
+                .fingerprint(&w, "pull_request", &unit("test"))
+                .unwrap(),
+            a
+        );
+        let mut other_branch = inputs(&base);
+        other_branch.branch = Some("other".into());
+        assert_ne!(
+            other_branch
+                .fingerprint(&w, "pull_request", &unit("test"))
+                .unwrap(),
+            a
+        );
     }
 
     #[test]
     fn some_results_are_never_reused() {
         let w = parse(".github/workflows/ci.yml", WF).unwrap();
-        let i = inputs(&[("api/a.ts", "a")]);
+        let i = inputs(&[("api/a.ts", "a"), ("api/package.json", "p")]);
+        // listed in no-cache
         assert!(i.fingerprint(&w, "pull_request", &unit("audit")).is_none());
-        assert!(volatile("npm audit --omit=dev"));
+        // `npm ci --no-audit` alone is not an audit...
+        assert!(i.fingerprint(&w, "pull_request", &unit("test")).is_some());
+        // ...but a script `npm test` starts that runs one is
+        let i = inputs(&[("api/a.ts", "a"), ("api/package.json", "p")]);
+        i.seen.lock().unwrap().insert(
+            "blob p".into(),
+            Some(r#"{"scripts":{"test":"npm run check","check":"npm audit"}}"#.into()),
+        );
+        assert!(i.fingerprint(&w, "pull_request", &unit("test")).is_none());
         assert!(volatile("node scripts/audit-dependencies.mjs"));
-        assert!(!volatile("npm test"));
-        assert!(looks_at_base("npx test-gates --affected"));
-        assert!(!looks_at_base("npm test"));
+        assert!(!volatile("npm ci --no-audit"));
+        assert!(names("cd api && npm test", "npm") && !names("pnpm i", "npm"));
     }
 
     #[test]
@@ -385,7 +525,24 @@ jobs:
             display: "test".into(),
             outcome: o,
             secs: 3.0,
-            steps: vec![],
+            steps: vec![
+                StepResult {
+                    label: "deploy".into(),
+                    outcome: Outcome::Skip("uses secrets".into()),
+                    exit: None,
+                    secs: 0.0,
+                    log: None,
+                    note: None,
+                },
+                StepResult {
+                    label: "test".into(),
+                    outcome: Outcome::Pass,
+                    exit: Some(0),
+                    secs: 3.0,
+                    log: None,
+                    note: None,
+                },
+            ],
         };
         let u = |o: Outcome| UnitResult {
             workflow: "ci.yml".into(),
@@ -401,6 +558,11 @@ jobs:
         let hit = store.get("f2", "ci.yml", 100 + 7200).unwrap();
         assert_eq!(hit.jobs[0].outcome, Outcome::Pass);
         assert_eq!(hit.cached.as_deref(), Some("aaaaaaa, 2h ago"));
+        // what was not covered is still reported
+        assert_eq!(
+            crate::report::not_covered(&[hit]),
+            vec!["ci.yml › test › deploy: uses secrets"]
+        );
         assert!(store.get("f2", "ci.yml", 100 + TTL_SECS + 1).is_none());
     }
 }
