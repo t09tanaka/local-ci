@@ -117,15 +117,18 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
 0. **Reused results.** A unit whose jobs all passed (or were skipped) in the
    last 24 hours is not run again when nothing it depends on has changed: the
    files its workflow's `paths` cover (all files but its `paths-ignore`, or
-   every file when it has neither), everything under `.github/` and the
-   workflow directories, `.local-ci.toml`, the Node version, and local-ci's
-   own version; plus the merge base when a step looks at the base
-   (`--affected`, `git diff`, `base_ref`, ...). `paths` is what GitHub decides
-   by whether the workflow runs at all, so a reused result stands on the same
-   ground as GitHub not running it. The report shows such jobs as
-   `PASS … cached (abc1234, 2h ago)`, and when every unit is reused nothing
-   is checked out or installed. Units running `npm audit` or other advisory
-   checks are always run, since their result changes without the code; so
+   every file when it has neither), every file at the repository root
+   (lockfiles, shared configuration), everything under `.github/` and the
+   workflow directories, the merge base and the branch, the versions of Node
+   and of the tools its steps name (npm, yarn, pnpm, dart, flutter, rustc,
+   python3, go), and local-ci itself. This trusts `paths` to name what the
+   workflow depends on, as GitHub does when a pull request changes nothing it
+   covers: a change in a shared directory the workflow does not list does
+   not run it again. The report shows such jobs as
+   `PASS … cached (abc1234, 2h ago)`, still lists what they did not cover,
+   and when every unit is reused nothing is checked out or installed. Units
+   running `npm audit` or other advisory checks (also from a `package.json`
+   script) are always run, since their result changes without the code; so
    are those listed in `no-cache`. `--no-cache` runs everything (and keeps
    the new results).
 1. **Worktree.** The commit is checked out with `git worktree add --detach`
