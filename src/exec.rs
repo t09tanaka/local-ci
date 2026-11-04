@@ -1909,9 +1909,13 @@ impl<'a> Runner<'a> {
                 job.id,
                 label
             );
-            if writes_node_modules(&script) {
-                if let Err(e) = crate::git::own_node_modules(&ws.join(&wd), ws) {
-                    eprintln!("local-ci: cannot copy node_modules for {label}: {e:#}");
+            let pkg = fs::read_to_string(ws.join(&wd).join("package.json")).ok();
+            if writes_node_modules(&plan::with_scripts(&script, pkg.as_deref())) {
+                if let Err(e) = crate::git::own_node_modules(ws) {
+                    let e = format!("cannot copy node_modules: {e:#}");
+                    push(&mut steps, Outcome::Error(e.clone()), None, None, None);
+                    errored.get_or_insert(format!("{label}: {e}"));
+                    continue;
                 }
             }
             let res = self.shell(

@@ -168,6 +168,49 @@ fn server_re() -> &'static Regex {
     })
 }
 
+/// `run` followed by the `package.json` scripts it starts (`npm test`,
+/// `npm run x`, `yarn x`, `pnpm x`, with their `pre` and `post` scripts) and
+/// the ones those start in turn: what a step runs, as far as the text shows.
+/// `pkg` is the `package.json` of the step's directory.
+pub fn with_scripts(run: &str, pkg: Option<&str>) -> String {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        Regex::new(r"\b(npm|pnpm|yarn)\s+(run(?:-script)?\s+)?([A-Za-z0-9:_.\-]+)").unwrap()
+    });
+    let scripts: serde_json::Map<String, serde_json::Value> = pkg
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("scripts").and_then(|s| s.as_object()).cloned())
+        .unwrap_or_default();
+    let mut out = run.to_string();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut todo = vec![run.to_string()];
+    while let Some(text) = todo.pop() {
+        for c in re.captures_iter(&text) {
+            let (tool, run_kw, name) = (&c[1], c.get(2).is_some(), &c[3]);
+            let name = match (tool, run_kw, name) {
+                ("npm", false, "t" | "tst") => "test",
+                ("npm", false, n @ ("test" | "start" | "stop" | "restart")) => n,
+                ("npm", false, _) => continue,
+                (_, _, n) => n,
+            };
+            for n in [
+                format!("pre{name}"),
+                name.to_string(),
+                format!("post{name}"),
+            ] {
+                if let Some(body) = scripts.get(&n).and_then(|b| b.as_str()) {
+                    if seen.insert(n) {
+                        out.push('\n');
+                        out.push_str(body);
+                        todo.push(body.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn is_installer(run: &str) -> bool {
     !run.contains('\n') && installer().is_match(run.trim())
 }
@@ -502,6 +545,25 @@ jobs:
         let setup: Vec<&str> = p.setup.iter().map(|s| s.key.run.as_str()).collect();
         assert_eq!(setup, vec!["npm ci", "npx prisma generate"]);
         assert!(p.setup.iter().all(|s| s.key.wd == "app"));
+    }
+
+    #[test]
+    fn scripts_a_step_starts() {
+        let pkg = r#"{"scripts": {
+            "pretest": "prisma generate",
+            "test": "jest && npm run lint",
+            "lint": "eslint .",
+            "build": "tsc",
+            "audit": "npm audit"
+        }}"#;
+        let all = with_scripts("npm test", Some(pkg));
+        assert!(
+            all.contains("prisma generate") && all.contains("jest") && all.contains("eslint .")
+        );
+        assert!(!all.contains("tsc") && !all.contains("npm audit"));
+        assert!(with_scripts("yarn build", Some(pkg)).ends_with("\ntsc"));
+        assert_eq!(with_scripts("npm ci", Some(pkg)), "npm ci");
+        assert_eq!(with_scripts("npm test", None), "npm test");
     }
 
     #[test]
