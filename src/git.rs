@@ -215,8 +215,8 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
 }
 
 /// Another worktree of `sha` at `to`, holding a copy of everything in `from`
-/// (setup output included), except that each `node_modules` is a link to
-/// `from`'s. Files are cloned copy-on-write where the filesystem allows it, so
+/// (setup output included), except that each `node_modules` holds links to
+/// what is in `from`'s. Files are cloned copy-on-write where the filesystem allows it, so
 /// this is quick and a write in one copy is never seen in the other.
 pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
     worktree_admin(repo, || {
@@ -278,7 +278,7 @@ fn node_modules_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Copy what is in `from` (at `rel` in the worktree) into `to`. A
-/// `node_modules` directory is linked, not copied: setup installed it and the
+/// `node_modules` directory is linked into, not copied: setup installed it and the
 /// units read it, while a copy is tens of thousands of files per project to
 /// make and then delete again, each one also an event for fseventsd. A unit
 /// that writes into it first makes it its own ([`own_node_modules`]). A
@@ -301,7 +301,7 @@ fn copy_entries(
         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
         let (src, dst, r) = (e.path(), to.join(&name), rel.join(&name));
         if is_dir && name == "node_modules" {
-            std::os::unix::fs::symlink(&src, &dst)
+            link_node_modules(&src, &dst)
                 .with_context(|| format!("cannot link {}", dst.display()))?;
         } else if is_dir && holders.contains(&r) {
             std::fs::create_dir(&dst)?;
@@ -339,15 +339,16 @@ fn cp(srcs: &[PathBuf], into: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Make each `node_modules` that is a link to setup's, in `dir` and the
+/// Make each `node_modules` that links into setup's, in `dir` and the
 /// directories above it up to `ws`, a copy of its own, before a step that may
 /// write into it (an install, `prisma generate`): the other units read setup's.
 pub fn own_node_modules(dir: &Path, ws: &Path) -> Result<()> {
     for d in dir.ancestors().take_while(|d| d.starts_with(ws)) {
         let nm = d.join("node_modules");
-        let Ok(target) = std::fs::read_link(&nm) else {
+        let Ok(target) = std::fs::read_to_string(nm.join(SHARED)) else {
             continue;
         };
+        let target = PathBuf::from(target);
         let tmp = d.join(".node_modules.local-ci");
         let _ = std::fs::remove_dir_all(&tmp);
         if !clone_tree(&target, &tmp) {
@@ -359,9 +360,27 @@ pub fn own_node_modules(dir: &Path, ws: &Path) -> Result<()> {
                 cp(&entries, &tmp)?;
             }
         }
-        std::fs::remove_file(&nm)?;
+        // removes the links, not what they point to
+        std::fs::remove_dir_all(&nm)?;
         std::fs::rename(&tmp, &nm)?;
     }
+    Ok(())
+}
+
+/// Names the `node_modules` a unit's one links into; the npm shim reads it too.
+pub const SHARED: &str = ".local-ci-shared";
+
+/// `dst` as a directory of links to what is in `src`. A directory rather than
+/// one link: `node_modules/` in a `.gitignore` matches only a directory, and
+/// a link to one shows up as untracked. Node resolves a package through its
+/// link to setup's copy and its dependencies from there.
+fn link_node_modules(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        std::os::unix::fs::symlink(e.path(), dst.join(e.file_name()))?;
+    }
+    std::fs::write(dst.join(SHARED), src.as_os_str().as_encoded_bytes())?;
     Ok(())
 }
 
@@ -492,10 +511,19 @@ mod tests {
         let to = tmp.path().join("copy");
         clone_worktree(&repo, &repo, &to, &sha).unwrap();
         let link = |p: &str| std::fs::read_link(to.join(p)).ok();
-        assert_eq!(link("node_modules"), Some(repo.join("node_modules")));
+        // a directory of links, which `node_modules/` in a .gitignore matches
+        assert!(to
+            .join("api/node_modules")
+            .symlink_metadata()
+            .unwrap()
+            .is_dir());
         assert_eq!(
-            link("api/node_modules"),
-            Some(repo.join("api/node_modules"))
+            link("node_modules/top"),
+            Some(repo.join("node_modules/top"))
+        );
+        assert_eq!(
+            link("api/node_modules/x"),
+            Some(repo.join("api/node_modules/x"))
         );
         assert_eq!(link("api/src"), None);
         assert_eq!(link("mobile/.dart_tool"), None);
@@ -506,8 +534,10 @@ mod tests {
             "api/src/b.ts"
         );
         own_node_modules(&to.join("api"), &to).unwrap();
-        assert_eq!(link("api/node_modules"), None);
-        assert_eq!(link("node_modules"), None);
+        assert_eq!(link("api/node_modules/x"), None);
+        assert_eq!(link("node_modules/top"), None);
+        assert!(!to.join("api/node_modules").join(SHARED).exists());
+        assert!(repo.join("api/node_modules/x/index.js").is_file());
         std::fs::write(to.join("api/node_modules/x/index.js"), "changed").unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.join("api/node_modules/x/index.js")).unwrap(),

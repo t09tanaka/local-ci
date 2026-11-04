@@ -146,8 +146,9 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    checkout: a job that edits files for a while (a negative control, a
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
    a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere),
-   except that each `node_modules` is a link to setup's: even a clone makes and
-   later deletes one file per file, and dependencies are most of the files. A
+   except that each `node_modules` holds links to the packages in setup's: even
+   a clone makes and later deletes one file per file, and dependencies are
+   most of the files. A
    step that may write into `node_modules` (an install, `npm rebuild`,
    `prisma generate`, `yarn`, `pnpm`, `patch-package`, or an npm command from
    inside a script) first gets a copy of its own. With canirun,

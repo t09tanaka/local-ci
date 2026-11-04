@@ -397,17 +397,17 @@ fn compose_down(projects: &[String]) {
 /// deletes `node_modules` before installing, so a job installing a directory
 /// (directly or from a script) would break another job running there. A
 /// directory is installed once per run and lockfile; later installs are no-ops.
-/// In a unit's copy `node_modules` is a link to setup's, which the other units
-/// read: a command that writes into it first makes the copy's its own.
+/// In a unit's copy `node_modules` holds links into setup's, which the other
+/// units read: a command that writes into it first makes the copy's its own.
 const NPM_SHIM: &str = r#"#!/bin/sh
 # Written by local-ci for one run.
 real="__REAL__"
 own() {
-  [ -L node_modules ] || return 0
-  t=$(readlink node_modules)
+  [ -f node_modules/.local-ci-shared ] || return 0
+  t=$(cat node_modules/.local-ci-shared)
   rm -rf .node_modules.local-ci
   cp -cR "$t" .node_modules.local-ci 2>/dev/null || cp -a --reflink=auto "$t" .node_modules.local-ci || exit 1
-  rm node_modules && mv .node_modules.local-ci node_modules
+  rm -rf node_modules && mv .node_modules.local-ci node_modules
 }
 sub="$1"
 case "$sub" in
@@ -769,7 +769,7 @@ impl<'a> Runner<'a> {
                 self.tools.to_string_lossy().into_owned(),
             ),
             // a `git push` from inside a script goes nowhere
-            ("GIT_CONFIG_COUNT".into(), "4".into()),
+            ("GIT_CONFIG_COUNT".into(), "3".into()),
             (
                 "GIT_CONFIG_KEY_0".into(),
                 "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
@@ -785,13 +785,6 @@ impl<'a> Runner<'a> {
                 "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
             ),
             ("GIT_CONFIG_VALUE_2".into(), "ssh://".into()),
-            // a unit's `node_modules` is a link, which `node_modules/` in a
-            // .gitignore does not match
-            ("GIT_CONFIG_KEY_3".into(), "core.excludesFile".into()),
-            (
-                "GIT_CONFIG_VALUE_3".into(),
-                self.tools.join("excludes").to_string_lossy().into_owned(),
-            ),
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             ("PATH".into(), path.join(":")),
         ]
@@ -980,10 +973,6 @@ impl<'a> Runner<'a> {
         ] {
             fs::create_dir_all(self.tools.join(d))?;
         }
-        fs::write(
-            self.tools.join("excludes"),
-            "node_modules\n.node_modules.local-ci\n",
-        )?;
         if let Some(npm) = self
             .base_path
             .split(':')
@@ -2625,22 +2614,28 @@ mod tests {
         let calls = fs::read_to_string(&log).unwrap();
         assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\nci\n");
 
-        // Where node_modules is a link to setup's, a read leaves it so and a
+        // Where node_modules links into setup's, a read leaves it so and a
         // write gets a copy of its own first.
         let shared = tmp.path().join("setup/node_modules");
         fs::create_dir_all(shared.join("x")).unwrap();
         fs::write(shared.join("x/index.js"), "x").unwrap();
         let linked = tmp.path().join("linked");
-        fs::create_dir_all(linked.join("proj")).unwrap();
-        fs::write(linked.join("proj/package-lock.json"), "{}").unwrap();
-        std::os::unix::fs::symlink(&shared, linked.join("proj/node_modules")).unwrap();
         let nm = linked.join("proj/node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(linked.join("proj/package-lock.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(shared.join("x"), nm.join("x")).unwrap();
+        fs::write(
+            nm.join(crate::git::SHARED),
+            shared.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
         npm_in(&linked, "copied-marks", &["run", "test"]);
-        assert!(nm.is_symlink());
+        assert!(nm.join("x").is_symlink());
         npm_in(&linked, "copied-marks", &["rebuild"]);
-        assert!(!nm.is_symlink());
+        assert!(!nm.join("x").is_symlink() && !nm.join(crate::git::SHARED).exists());
         assert_eq!(fs::read_to_string(nm.join("x/index.js")).unwrap(), "x");
-        assert!(shared.is_dir() && !linked.join("proj/.node_modules.local-ci").exists());
+        assert!(shared.join("x/index.js").is_file());
+        assert!(!linked.join("proj/.node_modules.local-ci").exists());
     }
 
     #[test]
