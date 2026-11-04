@@ -17,6 +17,8 @@ struct Raw {
     workflows_dirs: Option<Vec<String>>,
     #[serde(rename = "no-cache")]
     no_cache: Option<Vec<String>>,
+    #[serde(rename = "link-node-modules")]
+    link_node_modules: Option<bool>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -27,6 +29,8 @@ pub struct Config {
     /// Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never
     /// reused.
     pub no_cache: Vec<String>,
+    /// Units' copies link to setup's `node_modules` instead of cloning it.
+    pub link_node_modules: bool,
 }
 
 impl Config {
@@ -75,6 +79,7 @@ pub fn parse(text: &str) -> Result<Config> {
     Ok(Config {
         workflows_dirs,
         no_cache,
+        link_node_modules: raw.link_node_modules.unwrap_or(false),
     })
 }
 
@@ -117,6 +122,8 @@ mod tests {
     fn no_cache_lists_workflows_and_jobs() {
         let c = parse("no-cache = [\"audit.yml\", \"api-ci.yml:e2e\"]\n").unwrap();
         assert_eq!(c.no_cache, vec!["audit.yml", "api-ci.yml:e2e"]);
+        assert!(!c.link_node_modules);
+        assert!(parse("link-node-modules = true").unwrap().link_node_modules);
         assert!(parse("no-cache = [\" \"]").is_err());
     }
 

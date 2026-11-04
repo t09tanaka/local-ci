@@ -217,10 +217,20 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
 }
 
 /// Another worktree of `sha` at `to`, holding a copy of everything in `from`
-/// (setup output included), except that each `node_modules` holds links to
-/// what is in `from`'s. Files are cloned copy-on-write where the filesystem allows it, so
-/// this is quick and a write in one copy is never seen in the other.
-pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
+/// (setup output included). Files are cloned copy-on-write where the
+/// filesystem allows it, so this is quick and a write in one copy is never
+/// seen in the other. With `link_node_modules` (`link-node-modules` in
+/// `.local-ci.toml`) each `node_modules` holds links to what is in `from`'s
+/// instead. That is off by default: tools that follow a link to where it
+/// really is and then refuse paths outside the project (TypeScript emitting
+/// declarations, Turbopack's workspace root) fail with it.
+pub fn clone_worktree(
+    repo: &Path,
+    from: &Path,
+    to: &Path,
+    sha: &str,
+    link_node_modules: bool,
+) -> Result<()> {
     worktree_admin(repo, || {
         git(
             repo,
@@ -244,11 +254,20 @@ pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<
     };
     std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
     let mut holders = HashSet::new();
-    for nm in node_modules_dirs(from) {
-        holders.extend(nm.ancestors().skip(1).map(Path::to_path_buf));
+    if link_node_modules {
+        for nm in node_modules_dirs(from) {
+            holders.extend(nm.ancestors().skip(1).map(Path::to_path_buf));
+        }
     }
     let mut rest = Vec::new();
-    copy_entries(from, to, Path::new(""), &holders, &mut rest)?;
+    copy_entries(
+        from,
+        to,
+        Path::new(""),
+        link_node_modules,
+        &holders,
+        &mut rest,
+    )?;
     for (into, srcs) in rest {
         cp(&srcs, &into)?;
     }
@@ -279,7 +298,7 @@ fn node_modules_dirs(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Copy what is in `from` (at `rel` in the worktree) into `to`. A
+/// Copy what is in `from` (at `rel` in the worktree) into `to`. With `link`, a
 /// `node_modules` directory is linked into, not copied: setup installed it and the
 /// units read it, while a copy is tens of thousands of files per project to
 /// make and then delete again, each one also an event for fseventsd. A unit
@@ -290,6 +309,7 @@ fn copy_entries(
     from: &Path,
     to: &Path,
     rel: &Path,
+    link: bool,
     holders: &HashSet<PathBuf>,
     rest: &mut Vec<(PathBuf, Vec<PathBuf>)>,
 ) -> Result<()> {
@@ -305,14 +325,15 @@ fn copy_entries(
         // a matrix entry's copy is made from a unit's: link to setup's again
         let shared = std::fs::read_to_string(src.join(SHARED)).map(PathBuf::from);
         let real = shared.as_deref().unwrap_or(&src);
-        if is_dir && name == "node_modules" && !links_out(real) && !emits_declarations(from) {
+        if is_dir && name == "node_modules" && link && !links_out(real) && !emits_declarations(from)
+        {
             link_node_modules(real, &dst)
                 .with_context(|| format!("cannot link {}", dst.display()))?;
         } else if is_dir && name == "node_modules" && shared.is_ok() {
             copy_dir(real, &dst)?;
         } else if is_dir && holders.contains(&r) {
             std::fs::create_dir(&dst)?;
-            copy_entries(&src, &dst, &r, holders, rest)?;
+            copy_entries(&src, &dst, &r, link, holders, rest)?;
         } else if !clone_tree(&src, &dst) {
             left.push(src);
         }
@@ -617,8 +638,16 @@ mod tests {
         w("api/node_modules/x/index.js");
         w("mobile/.dart_tool/package_config.json");
         let sha = rev(&repo, "HEAD").unwrap();
+        // by default every node_modules is a copy, as before
+        let plain = tmp.path().join("plain");
+        clone_worktree(&repo, &repo, &plain, &sha, false).unwrap();
+        for p in ["node_modules/top", "api/node_modules/x"] {
+            assert!(!plain.join(p).is_symlink(), "{p}");
+            assert!(plain.join(p).join("index.js").is_file(), "{p}");
+        }
+        assert!(!plain.join("api/node_modules").join(SHARED).exists());
         let to = tmp.path().join("copy");
-        clone_worktree(&repo, &repo, &to, &sha).unwrap();
+        clone_worktree(&repo, &repo, &to, &sha, true).unwrap();
         let link = |p: &str| std::fs::read_link(to.join(p)).ok();
         // a directory of links, which `node_modules/` in a .gitignore matches
         assert!(to
@@ -644,7 +673,7 @@ mod tests {
         );
         // a matrix entry's copy, made from the unit's, links to setup's too
         let to2 = tmp.path().join("copy2");
-        clone_worktree(&repo, &to, &to2, &sha).unwrap();
+        clone_worktree(&repo, &to, &to2, &sha, true).unwrap();
         assert_eq!(
             std::fs::read_link(to2.join("api/node_modules/x")).ok(),
             Some(repo.join("api/node_modules/x"))
@@ -748,7 +777,7 @@ mod tests {
                 let (repo, sha, trash) = (&repo, &sha, &trash);
                 let to = tmp.path().join(format!("c{i}"));
                 s.spawn(move || {
-                    clone_worktree(repo, repo, &to, sha).unwrap();
+                    clone_worktree(repo, repo, &to, sha, false).unwrap();
                     assert!(to.join("a.txt").is_file());
                     remove_worktree(repo, &to, trash);
                 });

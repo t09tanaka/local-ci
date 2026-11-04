@@ -124,6 +124,8 @@ pub struct Repo {
     pub workflow_dirs: Vec<String>,
     /// `no-cache` of `.local-ci.toml`.
     pub no_cache: Vec<String>,
+    /// `link-node-modules` of `.local-ci.toml`.
+    pub link_node_modules: bool,
 }
 
 pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
@@ -208,6 +210,7 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
             all: t.all,
             workflow_dirs,
             no_cache: config.no_cache,
+            link_node_modules: config.link_node_modules,
         },
         p,
     ))
