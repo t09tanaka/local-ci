@@ -51,7 +51,7 @@ pub fn parse(text: &str) -> Result<Config> {
                     );
                 }
                 let n = crate::plan::norm_dir(&d);
-                if n.is_empty() {
+                if n.is_empty() || n.split('/').any(|c| c == "..") {
                     bail!(
                         "{FILE}: workflows-dirs {d:?}: give a directory below the repository root"
                     );
@@ -68,9 +68,13 @@ pub fn parse(text: &str) -> Result<Config> {
 
 /// `.local-ci.toml` at `sha`, or the defaults when the commit has none.
 pub fn at(dir: &Path, sha: &str) -> Result<Config> {
-    let listed = crate::git::git(dir, &["ls-tree", "--name-only", sha, "--", FILE])?;
+    // `<mode> <type> <object>\t<path>`, or nothing when the commit has no such path
+    let listed = crate::git::git(dir, &["ls-tree", sha, "--", FILE])?;
     if listed.trim().is_empty() {
         return Ok(Config::default());
+    }
+    if !listed.starts_with("100644 blob ") && !listed.starts_with("100755 blob ") {
+        bail!("{FILE}: not a regular file at {}", &sha[..sha.len().min(7)]);
     }
     parse(&crate::git::git(dir, &["show", &format!("{sha}:{FILE}")])?)
 }
@@ -106,6 +110,11 @@ mod tests {
             ),
             ("workflows-dirs = []", "is empty"),
             ("workflows-dirs = [\".\"]", "below the repository root"),
+            ("workflows-dirs = [\"../wf\"]", "below the repository root"),
+            (
+                "workflows-dirs = [\"a/../../wf\"]",
+                "below the repository root",
+            ),
             ("workflow-dirs = [\".ci/workflows\"]", "unknown field"),
             ("workflows-dirs = \".ci/workflows\"", "cannot read it"),
         ] {

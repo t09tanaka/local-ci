@@ -37,12 +37,14 @@ pub struct Saved {
     pub description: String,
 }
 
-static DEFAULT_WORKFLOWS_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static DEFAULT_WORKFLOWS_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// The directory `short` leaves off: the first `workflows-dirs` entry of
-/// `.local-ci.toml`. Set once, before anything is printed.
+/// `.local-ci.toml`. Set by `resolve`, before anything is printed.
 pub fn set_default_workflows_dir(d: &str) {
-    let _ = DEFAULT_WORKFLOWS_DIR.set(d.to_string());
+    *DEFAULT_WORKFLOWS_DIR
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(d.to_string());
 }
 
 /// How a workflow is named in output: the file name for the default directory
@@ -50,10 +52,13 @@ pub fn set_default_workflows_dir(d: &str) {
 /// for any other, so equal file names stay apart.
 pub fn short(f: &str) -> &str {
     let dir = DEFAULT_WORKFLOWS_DIR
-        .get()
-        .map(String::as_str)
-        .unwrap_or(crate::config::DEFAULT_WORKFLOWS_DIR);
-    short_in(dir, f)
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    short_in(
+        dir.as_deref()
+            .unwrap_or(crate::config::DEFAULT_WORKFLOWS_DIR),
+        f,
+    )
 }
 
 fn short_in<'a>(dir: &str, f: &'a str) -> &'a str {

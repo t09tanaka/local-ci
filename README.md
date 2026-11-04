@@ -91,7 +91,8 @@ workflows-dirs = [".ci/workflows"]
 | `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
 
 Without the file, local-ci reads `.github/workflows` as before. An absolute
-path, an empty list and an unknown key are errors.
+path, a path outside the repository (`..`), an empty list and an unknown key
+are errors.
 
 **CI with local-ci only.** To keep GitHub Actions from running your checks and
 run them with local-ci alone, move the workflows out of `.github/workflows`

@@ -8,9 +8,9 @@
   its workflows where GitHub Actions does not look and run its checks with
   local-ci alone. `--workflows-dir` still adds to them. The workflows of the
   first directory are named by their file name in the output, as those of
-  `.github/workflows` were. An absolute path, an empty list, a directory with
-  no `.yml` / `.yaml` file at the commit, and an unknown key are errors.
-  Without the file nothing changes.
+  `.github/workflows` were. An absolute path, a path outside the repository,
+  an empty list, a directory with no `.yml` / `.yaml` file at the commit, and
+  an unknown key are errors. Without the file nothing changes.
 
 ## 0.4.1
 
