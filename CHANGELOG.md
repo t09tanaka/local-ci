@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - `.local-ci.toml` at the repository root, read from the commit under test like
   the workflows. `workflows-dirs = [".ci/workflows"]` reads the workflows from
