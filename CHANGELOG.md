@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- The copies of finished units are deleted one at a time, across runs, at the
+  lowest CPU priority (`nice -n 19`; the turns are taken with `lockf` on
+  macOS). Many units ended at once and a dozen `rm -rf` of copies holding
+  `node_modules` ran side by side, taking several cores, and as many again in
+  fseventsd and the kernel, from the jobs still running.
+
 ## 0.5.0
 
 - `.local-ci.toml` at the repository root, read from the commit under test like
