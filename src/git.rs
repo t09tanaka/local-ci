@@ -300,9 +300,14 @@ fn copy_entries(
         }
         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
         let (src, dst, r) = (e.path(), to.join(&name), rel.join(&name));
-        if is_dir && name == "node_modules" {
-            link_node_modules(&src, &dst)
+        // a matrix entry's copy is made from a unit's: link to setup's again
+        let shared = std::fs::read_to_string(src.join(SHARED)).map(PathBuf::from);
+        let real = shared.as_deref().unwrap_or(&src);
+        if is_dir && name == "node_modules" && !links_out(real) {
+            link_node_modules(real, &dst)
                 .with_context(|| format!("cannot link {}", dst.display()))?;
+        } else if is_dir && name == "node_modules" && shared.is_ok() {
+            copy_dir(real, &dst)?;
         } else if is_dir && holders.contains(&r) {
             std::fs::create_dir(&dst)?;
             copy_entries(&src, &dst, &r, holders, rest)?;
@@ -339,32 +344,84 @@ fn cp(srcs: &[PathBuf], into: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Make each `node_modules` that links into setup's, in `dir` and the
-/// directories above it up to `ws`, a copy of its own, before a step that may
-/// write into it (an install, `prisma generate`): the other units read setup's.
-pub fn own_node_modules(dir: &Path, ws: &Path) -> Result<()> {
-    for d in dir.ancestors().take_while(|d| d.starts_with(ws)) {
-        let nm = d.join("node_modules");
+/// Make every `node_modules` in the copy `ws` that links into setup's a copy
+/// of its own, before a step that may write into one (an install,
+/// `prisma generate`): the other units read setup's. All of them, as a step
+/// can `cd` anywhere.
+pub fn own_node_modules(ws: &Path) -> Result<()> {
+    for rel in node_modules_dirs(ws) {
+        let nm = ws.join(rel);
         let Ok(target) = std::fs::read_to_string(nm.join(SHARED)) else {
             continue;
         };
-        let target = PathBuf::from(target);
-        let tmp = d.join(".node_modules.local-ci");
+        let tmp = nm.with_file_name(".node_modules.local-ci");
         let _ = std::fs::remove_dir_all(&tmp);
-        if !clone_tree(&target, &tmp) {
-            std::fs::create_dir(&tmp)?;
-            let entries: Vec<PathBuf> = std::fs::read_dir(&target)?
-                .map(|e| e.map(|e| e.path()))
-                .collect::<std::io::Result<_>>()?;
-            if !entries.is_empty() {
-                cp(&entries, &tmp)?;
-            }
-        }
+        copy_dir(Path::new(&target), &tmp)?;
         // removes the links, not what they point to
         std::fs::remove_dir_all(&nm)?;
         std::fs::rename(&tmp, &nm)?;
     }
     Ok(())
+}
+
+/// `from` copied to `to` (which must not exist), cloned where the filesystem allows it.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    if clone_tree(from, to) {
+        return Ok(());
+    }
+    std::fs::create_dir(to)?;
+    let entries: Vec<PathBuf> = std::fs::read_dir(from)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    if !entries.is_empty() {
+        cp(&entries, to)?;
+    }
+    Ok(())
+}
+
+/// Whether a package in `nm` is a link that leaves it (a workspace or
+/// `file:` dependency). Through a link to setup's it would resolve into
+/// setup's tree rather than the unit's, so such a `node_modules` is copied.
+fn links_out(nm: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(nm) else {
+        return false;
+    };
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if e.file_name().to_string_lossy().starts_with('@') && p.is_dir() {
+            entries.extend(
+                std::fs::read_dir(&p)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+        } else {
+            entries.push(p);
+        }
+    }
+    entries.iter().any(|p| {
+        std::fs::read_link(p).is_ok_and(|t| {
+            let to = p.parent().unwrap_or(nm).join(t);
+            !normalize(&to).starts_with(normalize(nm))
+        })
+    })
+}
+
+/// `p` with `.` and `..` taken out, without touching the filesystem.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Names the `node_modules` a unit's one links into; the npm shim reads it too.
@@ -533,7 +590,18 @@ mod tests {
             std::fs::read_to_string(to.join("api/src/b.ts")).unwrap(),
             "api/src/b.ts"
         );
-        own_node_modules(&to.join("api"), &to).unwrap();
+        // a matrix entry's copy, made from the unit's, links to setup's too
+        let to2 = tmp.path().join("copy2");
+        clone_worktree(&repo, &to, &to2, &sha).unwrap();
+        assert_eq!(
+            std::fs::read_link(to2.join("api/node_modules/x")).ok(),
+            Some(repo.join("api/node_modules/x"))
+        );
+        own_node_modules(&to2).unwrap();
+        assert!(!to2.join("api/node_modules/x").is_symlink());
+        assert!(to2.join("api/node_modules/x/index.js").is_file());
+        // owning every node_modules, wherever the step runs
+        own_node_modules(&to).unwrap();
         assert_eq!(link("api/node_modules/x"), None);
         assert_eq!(link("node_modules/top"), None);
         assert!(!to.join("api/node_modules").join(SHARED).exists());
@@ -544,6 +612,18 @@ mod tests {
             "api/node_modules/x/index.js"
         );
         assert!(!to.join("api/.node_modules.local-ci").exists());
+    }
+
+    #[test]
+    fn a_node_modules_linking_into_the_repository_is_not_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("web/node_modules");
+        std::fs::create_dir_all(nm.join("@s")).unwrap();
+        std::fs::create_dir_all(nm.join("plain")).unwrap();
+        std::os::unix::fs::symlink("plain", nm.join("alias")).unwrap();
+        assert!(!links_out(&nm));
+        std::os::unix::fs::symlink("../../../shared", nm.join("@s/w")).unwrap();
+        assert!(links_out(&nm));
     }
 
     #[test]
