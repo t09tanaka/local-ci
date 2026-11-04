@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- A unit's copy of the worktree links each `node_modules` to setup's instead
+  of cloning it. A clone is still one new file per file, so a run of twenty
+  units made and then deleted twenty copies of every project's dependencies
+  (several hundred thousand files each time in a mid-sized monorepo), and
+  fseventsd checked each deletion. A step that may write into
+  `node_modules` (an install, `npm rebuild`, `prisma generate`, `yarn`,
+  `pnpm`, `patch-package`) first gets a copy of its own, and so does an npm
+  command run from inside a script. `node_modules` is added to git's
+  excludes for the steps, as `node_modules/` in a `.gitignore` does not
+  match a link. `.dart_tool` and everything else is cloned as before.
+
 ## 0.5.1
 
 - The copies of finished units are deleted one at a time, across runs, at the

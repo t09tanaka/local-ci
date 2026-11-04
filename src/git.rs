@@ -2,6 +2,7 @@
 //! throwaway worktree to test it in.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -214,9 +215,9 @@ pub fn add_worktree(repo: &Path, path: &Path, sha: &str) -> Result<()> {
 }
 
 /// Another worktree of `sha` at `to`, holding a copy of everything in `from`
-/// (setup output such as `node_modules` included). Files are cloned
-/// copy-on-write where the filesystem allows it, so this is quick and a write
-/// in one copy is never seen in the other.
+/// (setup output included), except that each `node_modules` is a link to
+/// `from`'s. Files are cloned copy-on-write where the filesystem allows it, so
+/// this is quick and a write in one copy is never seen in the other.
 pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<()> {
     worktree_admin(repo, || {
         git(
@@ -240,16 +241,83 @@ pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<
         .map(PathBuf::from)
     };
     std::fs::copy(index(from)?, index(to)?).context("cannot copy the index")?;
+    let mut holders = HashSet::new();
+    for nm in node_modules_dirs(from) {
+        holders.extend(nm.ancestors().skip(1).map(Path::to_path_buf));
+    }
     let mut rest = Vec::new();
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        if e.file_name() != ".git" && !clone_tree(&e.path(), &to.join(e.file_name())) {
-            rest.push(e.path());
+    copy_entries(from, to, Path::new(""), &holders, &mut rest)?;
+    for (into, srcs) in rest {
+        cp(&srcs, &into)?;
+    }
+    Ok(())
+}
+
+/// The `node_modules` directories under `root` (relative to it), not looking
+/// inside them or `.git`.
+fn node_modules_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name();
+            if name == "node_modules" {
+                found.push(rel.join(&name));
+            } else if name != ".git" {
+                todo.push(rel.join(&name));
+            }
         }
     }
-    if rest.is_empty() {
-        return Ok(());
+    found
+}
+
+/// Copy what is in `from` (at `rel` in the worktree) into `to`. A
+/// `node_modules` directory is linked, not copied: setup installed it and the
+/// units read it, while a copy is tens of thousands of files per project to
+/// make and then delete again, each one also an event for fseventsd. A unit
+/// that writes into it first makes it its own ([`own_node_modules`]). A
+/// directory with one further down (`holders`) is walked into; anything else
+/// is cloned whole, or left in `rest` for `cp`.
+fn copy_entries(
+    from: &Path,
+    to: &Path,
+    rel: &Path,
+    holders: &HashSet<PathBuf>,
+    rest: &mut Vec<(PathBuf, Vec<PathBuf>)>,
+) -> Result<()> {
+    let mut left = Vec::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        if rel.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        let (src, dst, r) = (e.path(), to.join(&name), rel.join(&name));
+        if is_dir && name == "node_modules" {
+            std::os::unix::fs::symlink(&src, &dst)
+                .with_context(|| format!("cannot link {}", dst.display()))?;
+        } else if is_dir && holders.contains(&r) {
+            std::fs::create_dir(&dst)?;
+            copy_entries(&src, &dst, &r, holders, rest)?;
+        } else if !clone_tree(&src, &dst) {
+            left.push(src);
+        }
     }
+    if !left.is_empty() {
+        rest.push((to.to_path_buf(), left));
+    }
+    Ok(())
+}
+
+/// Copy `srcs` into the directory `into`, cloning where the filesystem allows it.
+fn cp(srcs: &[PathBuf], into: &Path) -> Result<()> {
     let flags: &[&str] = if cfg!(target_os = "macos") {
         &["-Rp"]
     } else {
@@ -257,16 +325,42 @@ pub fn clone_worktree(repo: &Path, from: &Path, to: &Path, sha: &str) -> Result<
     };
     let out = Command::new("cp")
         .args(flags)
-        .args(&rest)
-        .arg(to)
+        .args(srcs)
+        .arg(into)
         .output()
         .context("failed to run cp")?;
     if !out.status.success() {
         bail!(
-            "cp {}: {}",
-            from.display(),
+            "cp into {}: {}",
+            into.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
+    }
+    Ok(())
+}
+
+/// Make each `node_modules` that is a link to setup's, in `dir` and the
+/// directories above it up to `ws`, a copy of its own, before a step that may
+/// write into it (an install, `prisma generate`): the other units read setup's.
+pub fn own_node_modules(dir: &Path, ws: &Path) -> Result<()> {
+    for d in dir.ancestors().take_while(|d| d.starts_with(ws)) {
+        let nm = d.join("node_modules");
+        let Ok(target) = std::fs::read_link(&nm) else {
+            continue;
+        };
+        let tmp = d.join(".node_modules.local-ci");
+        let _ = std::fs::remove_dir_all(&tmp);
+        if !clone_tree(&target, &tmp) {
+            std::fs::create_dir(&tmp)?;
+            let entries: Vec<PathBuf> = std::fs::read_dir(&target)?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<_>>()?;
+            if !entries.is_empty() {
+                cp(&entries, &tmp)?;
+            }
+        }
+        std::fs::remove_file(&nm)?;
+        std::fs::rename(&tmp, &nm)?;
     }
     Ok(())
 }
@@ -349,6 +443,79 @@ mod tests {
     }
 
     /// Many units make and drop their copies at the same moment.
+    #[test]
+    fn a_copy_links_node_modules_and_owns_it_before_a_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let w = |p: &str| {
+            let f = repo.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, p).unwrap();
+        };
+        w("a.txt");
+        w("api/src/b.ts");
+        let ok = Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        git(&repo, &["add", "."]).unwrap();
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        )
+        .unwrap();
+        // setup output
+        w("node_modules/top/index.js");
+        w("api/node_modules/x/index.js");
+        w("mobile/.dart_tool/package_config.json");
+        let sha = rev(&repo, "HEAD").unwrap();
+        let to = tmp.path().join("copy");
+        clone_worktree(&repo, &repo, &to, &sha).unwrap();
+        let link = |p: &str| std::fs::read_link(to.join(p)).ok();
+        assert_eq!(link("node_modules"), Some(repo.join("node_modules")));
+        assert_eq!(
+            link("api/node_modules"),
+            Some(repo.join("api/node_modules"))
+        );
+        assert_eq!(link("api/src"), None);
+        assert_eq!(link("mobile/.dart_tool"), None);
+        assert!(to.join("api/node_modules/x/index.js").is_file());
+        assert!(to.join("mobile/.dart_tool/package_config.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(to.join("api/src/b.ts")).unwrap(),
+            "api/src/b.ts"
+        );
+        own_node_modules(&to.join("api"), &to).unwrap();
+        assert_eq!(link("api/node_modules"), None);
+        assert_eq!(link("node_modules"), None);
+        std::fs::write(to.join("api/node_modules/x/index.js"), "changed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("api/node_modules/x/index.js")).unwrap(),
+            "api/node_modules/x/index.js"
+        );
+        assert!(!to.join("api/.node_modules.local-ci").exists());
+    }
+
     #[test]
     fn copies_made_and_removed_side_by_side() {
         let tmp = tempfile::tempdir().unwrap();

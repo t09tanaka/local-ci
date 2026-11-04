@@ -394,19 +394,29 @@ fn compose_down(projects: &[String]) {
 /// deletes `node_modules` before installing, so a job installing a directory
 /// (directly or from a script) would break another job running there. A
 /// directory is installed once per run and lockfile; later installs are no-ops.
+/// In a unit's copy `node_modules` is a link to setup's, which the other units
+/// read: a command that writes into it first makes the copy's its own.
 const NPM_SHIM: &str = r#"#!/bin/sh
 # Written by local-ci for one run.
 real="__REAL__"
+own() {
+  [ -L node_modules ] || return 0
+  t=$(readlink node_modules)
+  rm -rf .node_modules.local-ci
+  cp -cR "$t" .node_modules.local-ci 2>/dev/null || cp -a --reflink=auto "$t" .node_modules.local-ci || exit 1
+  rm node_modules && mv .node_modules.local-ci node_modules
+}
 sub="$1"
 case "$sub" in
   ci|install|i) ;;
+  rebuild|rb|uninstall|un|remove|r|update|up|link|ln|prune|dedupe|ddp) own; exec "$real" "$@" ;;
   *) exec "$real" "$@" ;;
 esac
 shift
 for a in "$@"; do
   case "$a" in
     -*) ;;
-    *) exec "$real" "$sub" "$@" ;;
+    *) own; exec "$real" "$sub" "$@" ;;
   esac
 done
 dir=$(pwd -P)
@@ -422,11 +432,21 @@ if [ -f "$marks/$key-$sum" ] && [ -d node_modules ]; then
   echo "local-ci: node_modules in $dir was installed earlier in this run; skipping npm $sub" >&2
   exit 0
 fi
+own
 "$real" "$sub" "$@"
 rc=$?
 if [ "$rc" -eq 0 ]; then : > "$marks/$key-$sum"; fi
 exit "$rc"
 "#;
+
+/// A step that may write into `node_modules`, run outside the npm shim.
+fn writes_node_modules(script: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"\b(npm (ci|install|i|rebuild|uninstall|update|link|prune|dedupe)|prisma generate|patch-package|yarn|pnpm)\b").unwrap()
+    })
+    .is_match(script)
+}
 
 /// GitHub's file commands: `name=value` lines and `name<<DELIM` blocks.
 pub fn parse_file_command(text: &str) -> Vec<(String, String)> {
@@ -746,7 +766,7 @@ impl<'a> Runner<'a> {
                 self.tools.to_string_lossy().into_owned(),
             ),
             // a `git push` from inside a script goes nowhere
-            ("GIT_CONFIG_COUNT".into(), "3".into()),
+            ("GIT_CONFIG_COUNT".into(), "4".into()),
             (
                 "GIT_CONFIG_KEY_0".into(),
                 "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
@@ -762,6 +782,13 @@ impl<'a> Runner<'a> {
                 "url./dev/null/local-ci-blocks-push/.pushInsteadOf".into(),
             ),
             ("GIT_CONFIG_VALUE_2".into(), "ssh://".into()),
+            // a unit's `node_modules` is a link, which `node_modules/` in a
+            // .gitignore does not match
+            ("GIT_CONFIG_KEY_3".into(), "core.excludesFile".into()),
+            (
+                "GIT_CONFIG_VALUE_3".into(),
+                self.tools.join("excludes").to_string_lossy().into_owned(),
+            ),
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             ("PATH".into(), path.join(":")),
         ]
@@ -950,6 +977,10 @@ impl<'a> Runner<'a> {
         ] {
             fs::create_dir_all(self.tools.join(d))?;
         }
+        fs::write(
+            self.tools.join("excludes"),
+            "node_modules\n.node_modules.local-ci\n",
+        )?;
         if let Some(npm) = self
             .base_path
             .split(':')
@@ -1884,6 +1915,11 @@ impl<'a> Runner<'a> {
                 job.id,
                 label
             );
+            if writes_node_modules(&script) {
+                if let Err(e) = crate::git::own_node_modules(&ws.join(&wd), ws) {
+                    eprintln!("local-ci: cannot copy node_modules for {label}: {e:#}");
+                }
+            }
             let res = self.shell(
                 &ws.join(&wd),
                 &script,
@@ -2583,6 +2619,34 @@ mod tests {
         npm_in(&copy, "other-marks", &["ci"]);
         let calls = fs::read_to_string(&log).unwrap();
         assert_eq!(calls, "ci --no-audit\ninstall left-pad\nrun test\nci\nci\n");
+
+        // Where node_modules is a link to setup's, a read leaves it so and a
+        // write gets a copy of its own first.
+        let shared = tmp.path().join("setup/node_modules");
+        fs::create_dir_all(shared.join("x")).unwrap();
+        fs::write(shared.join("x/index.js"), "x").unwrap();
+        let linked = tmp.path().join("linked");
+        fs::create_dir_all(linked.join("proj")).unwrap();
+        fs::write(linked.join("proj/package-lock.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&shared, linked.join("proj/node_modules")).unwrap();
+        let nm = linked.join("proj/node_modules");
+        npm_in(&linked, "copied-marks", &["run", "test"]);
+        assert!(nm.is_symlink());
+        npm_in(&linked, "copied-marks", &["rebuild"]);
+        assert!(!nm.is_symlink());
+        assert_eq!(fs::read_to_string(nm.join("x/index.js")).unwrap(), "x");
+        assert!(shared.is_dir() && !linked.join("proj/.node_modules.local-ci").exists());
+    }
+
+    #[test]
+    fn steps_that_write_node_modules() {
+        assert!(writes_node_modules("npx prisma generate"));
+        assert!(writes_node_modules("cd api && npm ci"));
+        assert!(writes_node_modules("npm i -D left-pad"));
+        assert!(writes_node_modules("yarn install --frozen-lockfile"));
+        assert!(!writes_node_modules("npm run test"));
+        assert!(!writes_node_modules("npm init -y"));
+        assert!(!writes_node_modules("npx prisma migrate deploy"));
     }
 
     #[test]
