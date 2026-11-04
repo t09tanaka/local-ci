@@ -396,3 +396,119 @@ fn workflows_dir_must_be_committed() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("commit them first"), "{err}");
 }
+
+/// The demo with its workflow moved from `.github/workflows` to `.ci/workflows`
+/// and a `.local-ci.toml` pointing there, committed on `feature`.
+fn moved_to_ci_workflows(config: &str) -> Demo {
+    let d = demo("app/lib.sh");
+    std::fs::create_dir_all(d.repo.join(".ci")).unwrap();
+    git(&d.repo, &["mv", ".github/workflows", ".ci/workflows"]);
+    std::fs::write(d.repo.join(".local-ci.toml"), config).unwrap();
+    git(&d.repo, &["add", ".local-ci.toml"]);
+    git(&d.repo, &["commit", "-qm", "move the workflows"]);
+    d
+}
+
+#[test]
+fn config_replaces_the_workflows_dir() {
+    let d = moved_to_ci_workflows("workflows-dirs = [\".ci/workflows\"]\n");
+    assert!(!d.repo.join(".github/workflows").exists());
+    let o = local_ci(&d, &["plan"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    // named without the configured directory, as `.github/workflows/` was
+    assert!(
+        out.contains("unit 1  ci.yml: lint → discover → test → deploy"),
+        "{out}"
+    );
+    assert!(!out.contains(".ci/workflows"), "{out}");
+
+    let o = local_ci(&d, &["run", "--no-status", "--no-canirun", "-j", "lint"]);
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("PASS   ci.yml › lint"), "{out}");
+}
+
+#[test]
+fn config_replaces_github_workflows_instead_of_adding_to_it() {
+    let d = demo("app/lib.sh");
+    std::fs::create_dir_all(d.repo.join(".ci/workflows")).unwrap();
+    std::fs::write(
+        d.repo.join(".ci/workflows/other.yml"),
+        "on: pull_request\njobs:\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo other\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.repo.join(".local-ci.toml"),
+        "workflows-dirs = [\".ci/workflows\"]\n",
+    )
+    .unwrap();
+    git(&d.repo, &["add", "."]);
+    git(&d.repo, &["commit", "-qm", "configure"]);
+    let o = local_ci(&d, &["plan"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("unit 1  other.yml: other"), "{out}");
+    assert!(!out.contains("ci.yml"), "{out}");
+}
+
+#[test]
+fn config_is_read_from_the_commit() {
+    // Written but not committed: the commit has no `.local-ci.toml`, so the
+    // workflows still come from `.github/workflows`.
+    let d = demo("app/lib.sh");
+    std::fs::write(
+        d.repo.join(".local-ci.toml"),
+        "workflows-dirs = [\".ci/workflows\"]\n",
+    )
+    .unwrap();
+    let o = local_ci(&d, &["plan"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("unit 1  ci.yml: lint"), "{out}");
+}
+
+#[test]
+fn config_and_workflows_dir_add_up() {
+    let d = moved_to_ci_workflows("workflows-dirs = [\".ci/workflows\"]\n");
+    std::fs::create_dir_all(d.repo.join("ci/local")).unwrap();
+    std::fs::write(
+        d.repo.join("ci/local/ci.yml"),
+        "on: pull_request\njobs:\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo extra\n",
+    )
+    .unwrap();
+    git(&d.repo, &["add", "."]);
+    git(&d.repo, &["commit", "-qm", "local-only workflow"]);
+    let o = local_ci(&d, &["plan", "--workflows-dir", "ci/local"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("  ci.yml: lint"), "{out}");
+    assert!(out.contains("  ci/local/ci.yml: extra"), "{out}");
+    // naming a configured directory again reads it once
+    let o = local_ci(&d, &["plan", "--workflows-dir", ".ci/workflows/"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert_eq!(out.matches("ci.yml: lint").count(), 1, "{out}");
+}
+
+#[test]
+fn bad_config_is_an_error() {
+    for (config, msg) in [
+        (
+            "workflows-dirs = [\"/etc/workflows\"]\n",
+            "relative to the repository root",
+        ),
+        ("workflows-dir = [\".ci/workflows\"]\n", "unknown field"),
+        (
+            "workflows-dirs = [\".ci/workflows\", \"ci/none\"]\n",
+            ".local-ci.toml: workflows-dirs ci/none: no .yml / .yaml files there",
+        ),
+    ] {
+        let d = moved_to_ci_workflows(config);
+        let o = local_ci(&d, &["plan"]);
+        assert_eq!(o.status.code(), Some(64), "{config}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains(".local-ci.toml"), "{config}: {err}");
+        assert!(err.contains(msg), "{config}: {err}");
+    }
+}

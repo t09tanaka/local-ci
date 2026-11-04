@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `.local-ci.toml` at the repository root, read from the commit under test like
+  the workflows. `workflows-dirs = [".ci/workflows"]` reads the workflows from
+  those directories instead of `.github/workflows`, so a repository can move
+  its workflows where GitHub Actions does not look and run its checks with
+  local-ci alone. `--workflows-dir` still adds to them. The workflows of the
+  first directory are named by their file name in the output, as those of
+  `.github/workflows` were. An absolute path, a path outside the repository,
+  an empty list, a directory with no `.yml` / `.yaml` file at the commit, and
+  an unknown key are errors. Without the file nothing changes.
+
 ## 0.4.1
 
 - Worktree copies are registered one at a time per repository, across runs.
