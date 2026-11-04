@@ -49,6 +49,54 @@ pub fn remove_containers() {
     }
 }
 
+/// Remove the service containers of `local-ci` runs that are gone: a run
+/// killed before it cleaned up left its database behind on the service's
+/// declared port, and later runs could not bind it. A container is named
+/// `local-ci-<pid>-<n>` by the run that started it.
+pub fn remove_orphan_containers() {
+    let Ok(out) = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=local-ci=1",
+            "--format",
+            "{{.Names}}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|n| orphan_owner(n).is_some_and(|pid| !alive(pid)))
+        .map(String::from)
+        .collect();
+    if !names.is_empty() {
+        let _ = Command::new("docker")
+            .args(["rm", "-f"])
+            .args(&names)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// The pid in a `local-ci-<pid>-<n>` container name.
+fn orphan_owner(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix("local-ci-")?;
+    let (pid, n) = rest.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let sent = unsafe { libc::kill(pid, 0) } == 0;
+    sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "result", content = "reason", rename_all = "lowercase")]
 pub enum Outcome {
@@ -92,6 +140,9 @@ pub struct UnitResult {
     /// Time spent copying the worktree for this unit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_secs: Option<f64>,
+    /// Where the reused result comes from (`abc1234, 2h ago`), when the unit did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<String>,
 }
 
 pub struct Opts {
@@ -1250,6 +1301,7 @@ impl<'a> Runner<'a> {
                     jobs,
                     waited_secs: waited,
                     copy_secs: None,
+                    cached: None,
                 }
             }
         };
@@ -1307,6 +1359,7 @@ impl<'a> Runner<'a> {
             jobs,
             waited_secs: waited,
             copy_secs: None,
+            cached: None,
         }
     }
 
@@ -2646,6 +2699,15 @@ mod tests {
         assert!(!writes_node_modules("npm run test"));
         assert!(!writes_node_modules("npm init -y"));
         assert!(!writes_node_modules("npx prisma migrate deploy"));
+    }
+
+    #[test]
+    fn orphan_containers_are_told_by_their_owner() {
+        assert_eq!(orphan_owner("local-ci-28989-214"), Some(28989));
+        assert_eq!(orphan_owner("local-ci-28989"), None);
+        assert_eq!(orphan_owner("local-ci-lc1-x"), None);
+        assert_eq!(orphan_owner("postgres"), None);
+        assert!(alive(std::process::id() as i32));
     }
 
     #[test]

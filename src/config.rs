@@ -15,6 +15,8 @@ pub const DEFAULT_WORKFLOWS_DIR: &str = ".github/workflows";
 struct Raw {
     #[serde(rename = "workflows-dirs")]
     workflows_dirs: Option<Vec<String>>,
+    #[serde(rename = "no-cache")]
+    no_cache: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -22,6 +24,9 @@ pub struct Config {
     /// Directories (relative to the repository root, normalized) that replace
     /// `.github/workflows`. `None` when the file or the key is absent.
     pub workflows_dirs: Option<Vec<String>>,
+    /// Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never
+    /// reused.
+    pub no_cache: Vec<String>,
 }
 
 impl Config {
@@ -63,7 +68,14 @@ pub fn parse(text: &str) -> Result<Config> {
             Some(out)
         }
     };
-    Ok(Config { workflows_dirs })
+    let no_cache = raw.no_cache.unwrap_or_default();
+    if let Some(e) = no_cache.iter().find(|e| e.trim().is_empty()) {
+        bail!("{FILE}: no-cache {e:?}: give a workflow file (`ci.yml`) or a job (`ci.yml:e2e`)");
+    }
+    Ok(Config {
+        workflows_dirs,
+        no_cache,
+    })
 }
 
 /// `.local-ci.toml` at `sha`, or the defaults when the commit has none.
@@ -99,6 +111,13 @@ mod tests {
             Some(vec![".ci/workflows".to_string(), "ci/local".to_string()])
         );
         assert_eq!(c.default_workflows_dir(), ".ci/workflows");
+    }
+
+    #[test]
+    fn no_cache_lists_workflows_and_jobs() {
+        let c = parse("no-cache = [\"audit.yml\", \"api-ci.yml:e2e\"]\n").unwrap();
+        assert_eq!(c.no_cache, vec!["audit.yml", "api-ci.yml:e2e"]);
+        assert!(parse("no-cache = [\" \"]").is_err());
     }
 
     #[test]

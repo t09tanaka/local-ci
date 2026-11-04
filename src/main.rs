@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod exec;
 mod expr;
@@ -85,6 +86,10 @@ struct RunArgs {
     /// Print the result as JSON instead of the text report
     #[arg(long)]
     json: bool,
+    /// Run every unit even when a result from the last day covers it
+    /// (results of this run are still kept)
+    #[arg(long)]
+    no_cache: bool,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +120,10 @@ pub struct Repo {
     pub changed: Vec<String>,
     pub dirty: bool,
     pub all: bool,
+    /// Where the workflows were read from, relative to the root.
+    pub workflow_dirs: Vec<String>,
+    /// `no-cache` of `.local-ci.toml`.
+    pub no_cache: Vec<String>,
 }
 
 pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
@@ -183,6 +192,11 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
         keep_jobs(&mut p, &t.jobs);
     }
     let dirty = git::is_dirty(&root);
+    let mut workflow_dirs = config
+        .workflows_dirs
+        .clone()
+        .unwrap_or_else(|| vec![config::DEFAULT_WORKFLOWS_DIR.to_string()]);
+    workflow_dirs.extend(t.workflows_dirs.iter().map(|d| plan::norm_dir(d)));
     Ok((
         Repo {
             root,
@@ -192,6 +206,8 @@ pub fn resolve(t: &Target) -> Result<(Repo, plan::Plan)> {
             changed,
             dirty,
             all: t.all,
+            workflow_dirs,
+            no_cache: config.no_cache,
         },
         p,
     ))
@@ -270,22 +286,9 @@ fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
         u.jobs.retain(|j| keep.contains(j));
     }
     p.units.retain(|u| !u.jobs.is_empty());
-    let live: Vec<(usize, String)> = p
-        .units
-        .iter()
-        .flat_map(|u| u.jobs.iter().map(move |j| (u.wf, j.clone())))
-        .collect();
-    p.setup.retain(|s| {
-        live.contains(&(s.wf, s.job.clone()))
-            || live.iter().any(|(wf, j)| {
-                let w = &p.selected[*wf].wf;
-                w.jobs.iter().find(|x| &x.id == j).is_some_and(|job| {
-                    job.steps
-                        .iter()
-                        .any(|st| plan::step_key(w, job, st).as_ref() == Some(&s.key))
-                })
-            })
-    });
+    // worked out again rather than filtered: an install kept from a job left
+    // out may be the one that runs, its twin in a kept job marked not to
+    plan::fill_setup(p);
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -392,13 +395,62 @@ fn prune_runs(dir: &std::path::Path, keep: usize) {
 
 fn run(a: RunArgs) -> Result<i32> {
     let t_start = std::time::Instant::now();
-    let (repo, p) = resolve(&a.target)?;
+    let (repo, mut p) = resolve(&a.target)?;
     let cache = cache_dir();
     let key = repo_key(&repo.root);
     let runs = cache.join("runs").join(&key);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
+    let nothing_triggered = p.units.is_empty();
+    // Units whose result from the last day still holds are not run.
+    let store = cache::Store::new(cache.join("results").join(&key));
+    store.prune(stamp);
+    let fingerprints: Vec<Option<String>> = if p.units.is_empty() {
+        vec![]
+    } else {
+        match cache::Inputs::read(
+            &repo.root,
+            &repo.sha,
+            &repo.base,
+            repo.head.as_deref(),
+            &repo.workflow_dirs,
+            &repo.no_cache,
+        ) {
+            Ok(inputs) => p
+                .units
+                .iter()
+                .map(|u| {
+                    let s = &p.selected[u.wf];
+                    inputs.fingerprint(&s.wf, &s.event, u)
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("local-ci: not reusing results: {e:#}");
+                vec![None; p.units.len()]
+            }
+        }
+    };
+    let mut reused = Vec::new();
+    let mut to_run = Vec::new();
+    let mut run_fps = Vec::new();
+    for (u, fp) in std::mem::take(&mut p.units).into_iter().zip(fingerprints) {
+        let hit = fp
+            .as_deref()
+            .filter(|_| !a.no_cache)
+            .and_then(|f| store.get(f, &p.selected[u.wf].wf.file, stamp));
+        match hit {
+            Some(r) => reused.push(r),
+            None => {
+                to_run.push(u);
+                run_fps.push(fp);
+            }
+        }
+    }
+    p.units = to_run;
+    if !reused.is_empty() {
+        plan::fill_setup(&mut p);
+    }
     let run_dir = runs.join(format!("{stamp}-{}", &repo.sha[..7]));
     std::fs::create_dir_all(&run_dir)?;
     std::fs::create_dir_all(cache.join("locks"))?;
@@ -426,6 +478,7 @@ fn run(a: RunArgs) -> Result<i32> {
         std::fs::create_dir_all(cache.join("wt"))?;
         git::add_worktree(&repo.root, &wt, &repo.sha)?;
         ctrlc::set_handler(exec::kill_all).ok();
+        exec::remove_orphan_containers();
         let canirun = if a.no_canirun {
             None
         } else {
@@ -484,9 +537,20 @@ fn run(a: RunArgs) -> Result<i32> {
         }
         result?
     };
+    if !exec::CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        for (u, fp) in units.iter().zip(&run_fps) {
+            if let Some(fp) = fp {
+                store.put(fp, &repo.sha, u, now);
+            }
+        }
+    }
+    let units: Vec<exec::UnitResult> = reused.into_iter().chain(units).collect();
     let state = report::state(&setup, &units);
     let not_covered = report::not_covered(&units);
-    let description = report::description(state, &units, p.units.is_empty(), not_covered.len());
+    let description = report::description(state, &units, nothing_triggered, not_covered.len());
     let result = report::RunResult {
         version: env!("CARGO_PKG_VERSION").into(),
         sha: repo.sha.clone(),

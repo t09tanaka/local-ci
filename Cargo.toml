@@ -1,6 +1,6 @@
 [package]
 name = "local-ci"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run the GitHub Actions jobs a branch would trigger, locally, in an isolated worktree, and print a short report"

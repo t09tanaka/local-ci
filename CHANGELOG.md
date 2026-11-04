@@ -1,17 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
+- A unit whose jobs passed in the last 24 hours is not run again when
+  nothing it depends on has changed: the files its workflow's `paths` (or all
+  but its `paths-ignore`) cover, every file at the repository root, the
+  workflows and local actions, the merge base and branch, the versions of
+  Node and of the tools its steps name, and local-ci itself. This trusts
+  `paths` to name what the workflow depends on. The report marks such jobs
+  `cached (abc1234, 2h ago)` and keeps what they did not cover; when every
+  unit is reused, nothing is checked out or installed. Units running
+  `npm audit` or other advisory checks, also from a `package.json` script,
+  always run, as do workflows and jobs listed in the new `no-cache` key of
+  `.local-ci.toml`. `--no-cache` runs everything.
 - In a unit's copy of the worktree, each `node_modules` is a directory of
   links to what is in setup's instead of a clone of it. A clone is still one
   new file per file, so a run of twenty units made and then deleted twenty
   copies of every project's dependencies (several hundred thousand files
   each time in a mid-sized monorepo), and fseventsd checked each deletion.
-  Now a copy holds one link per package. A step that may write into
+  Now a copy holds one link per package. Before a step that may write into
   `node_modules` (an install, `npm rebuild`, `prisma generate`, `yarn`,
-  `pnpm`, `patch-package`) first gets a copy of its own, and so does an npm
-  command run from inside a script. `.dart_tool` and everything else is
-  cloned as before.
+  `pnpm`, `patch-package`, also from a `package.json` script or an npm
+  command inside one), the copy gets its own. A `node_modules` linking out of
+  itself (workspaces, `file:` dependencies), `.dart_tool` and everything else
+  is cloned as before.
+- Service containers left by a run that was killed are removed by the next
+  run. One holding a service's declared port made every later run's
+  services fail to start.
+- `--job` works out the setup again for the jobs it keeps, instead of
+  filtering it: an install could stay marked not to run while its twin that
+  did was dropped.
 
 ## 0.5.1
 
