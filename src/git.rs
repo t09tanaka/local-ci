@@ -2,9 +2,11 @@
 //! throwaway worktree to test it in.
 
 use anyhow::{bail, Context, Result};
+use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -303,7 +305,7 @@ fn copy_entries(
         // a matrix entry's copy is made from a unit's: link to setup's again
         let shared = std::fs::read_to_string(src.join(SHARED)).map(PathBuf::from);
         let real = shared.as_deref().unwrap_or(&src);
-        if is_dir && name == "node_modules" && !links_out(real) {
+        if is_dir && name == "node_modules" && !links_out(real) && !emits_declarations(from) {
             link_node_modules(real, &dst)
                 .with_context(|| format!("cannot link {}", dst.display()))?;
         } else if is_dir && name == "node_modules" && shared.is_ok() {
@@ -407,6 +409,56 @@ fn links_out(nm: &Path) -> bool {
             !normalize(&to).starts_with(normalize(nm))
         })
     })
+}
+
+/// Whether a `tsconfig*.json` in `dir` (or one it extends by a relative
+/// path) emits declarations (`declaration` or `composite`). TypeScript
+/// resolves a linked package to where it really is, and a declaration that
+/// would have to name a path outside the project fails with TS2742, even
+/// under `--noEmit`. Such a project's `node_modules` is copied, not linked.
+fn emits_declarations(dir: &Path) -> bool {
+    static ON: OnceLock<Regex> = OnceLock::new();
+    static EXTENDS: OnceLock<Regex> = OnceLock::new();
+    let on = ON.get_or_init(|| Regex::new(r#""(declaration|composite)"\s*:\s*true"#).unwrap());
+    let extends =
+        EXTENDS.get_or_init(|| Regex::new(r#""extends"\s*:\s*(\[[^\]]*\]|"[^"]*")"#).unwrap());
+    let mut todo: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy();
+            n.starts_with("tsconfig") && n.ends_with(".json")
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(f) = todo.pop() {
+        if seen.len() > 20 || !seen.insert(f.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        if on.is_match(&text) {
+            return true;
+        }
+        let base = f.parent().unwrap_or(dir);
+        for c in extends.captures_iter(&text) {
+            for name in c[1].split('"').skip(1).step_by(2) {
+                if name.starts_with('.') {
+                    // as TypeScript does: the name as given, else with `.json` added
+                    let p = base.join(name);
+                    todo.push(if p.is_file() {
+                        p
+                    } else {
+                        PathBuf::from(format!("{}.json", p.display()))
+                    });
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `p` with `.` and `..` taken out, without touching the filesystem.
@@ -612,6 +664,43 @@ mod tests {
             "api/node_modules/x/index.js"
         );
         assert!(!to.join("api/.node_modules.local-ci").exists());
+    }
+
+    #[test]
+    fn a_project_emitting_declarations_does_not_share_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api = tmp.path().join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        // comments and trailing commas, as tsconfig allows
+        std::fs::write(
+            api.join("tsconfig.json"),
+            "{\n  // shared\n  \"extends\": \"../tsconfig.base\",\n  \"compilerOptions\": { \"strict\": true, },\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            api.join("tsconfig.build.json"),
+            "{ \"extends\": \"./tsconfig.json\" }",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"declaration\": false } }",
+        )
+        .unwrap();
+        assert!(!emits_declarations(&api));
+        std::fs::write(
+            tmp.path().join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"declaration\": true } }",
+        )
+        .unwrap();
+        assert!(emits_declarations(&api));
+        std::fs::write(
+            api.join("tsconfig.json"),
+            "{ \"extends\": [\"@tsconfig/node20\"], \"compilerOptions\": { \"composite\": true } }",
+        )
+        .unwrap();
+        assert!(emits_declarations(&api));
+        assert!(!emits_declarations(tmp.path().join("web").as_path()));
     }
 
     #[test]
