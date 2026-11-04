@@ -298,13 +298,11 @@ pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
     let target = trash.join(path.file_name().unwrap_or_default());
     if std::fs::rename(path, &target).is_ok() {
         let _ = worktree_admin(repo, || git(repo, &["worktree", "prune"]));
-        let _ = Command::new("rm")
-            .arg("-rf")
-            .arg(&target)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        if spawn_quiet(delete_later(&target, &trash.join(".lock"))).is_err() {
+            let mut rm = Command::new("rm");
+            rm.arg("-rf").arg(&target);
+            let _ = spawn_quiet(rm);
+        }
     } else {
         let _ = worktree_admin(repo, || {
             git(
@@ -313,6 +311,30 @@ pub fn remove_worktree(repo: &Path, path: &Path, trash: &Path) {
             )
         });
     }
+}
+
+/// `rm -rf` at the lowest priority, one deletion at a time across runs. Many
+/// units end together, and a dozen copies holding `node_modules` deleted side
+/// by side took several cores, and as many again in fseventsd and the kernel,
+/// from the jobs still running. On macOS `lockf` waits for the deletion before
+/// it. Only the CPU priority is lowered: `taskpolicy -b` also throttled the
+/// disk, and on a busy machine it deleted a thousand files in two minutes, so
+/// the copies would pile up faster than they went.
+fn delete_later(target: &Path, lock: &Path) -> Command {
+    let mut cmd = Command::new("nice");
+    cmd.args(["-n", "19"]);
+    if cfg!(target_os = "macos") {
+        cmd.args(["lockf", "-k"]).arg(lock);
+    }
+    cmd.args(["rm", "-rf"]).arg(target);
+    cmd
+}
+
+fn spawn_quiet(mut cmd: Command) -> std::io::Result<std::process::Child> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
 }
 
 #[cfg(test)]
@@ -370,5 +392,17 @@ mod tests {
             git(&repo, &["worktree", "list"]).unwrap().lines().count(),
             1
         );
+        // The deletions queue behind one another and still all finish.
+        let left = || {
+            std::fs::read_dir(&trash)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != ".lock")
+                .count()
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while left() > 0 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(left(), 0);
     }
 }
