@@ -188,7 +188,7 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    waited a second or more for something says what it waited for and how long
    it really ran: `PASS  ci.yml › e2e  3m00s (ran 2m20s · waited slot 5m00s, queue 40s)`.
    The job's `time` in `result.json` and in `--json` has the same split, in
-   seconds: `work_secs` (the steps running), `wait_lock_secs` (the
+   seconds: `work_secs` (the job running: its services' start and its steps), `wait_lock_secs` (the
    per-repository lock), `wait_slot_secs` (one of the `--containers` slots),
    `wait_queue_secs` (canirun letting a step start, summed over the steps) and
    `wait_parallel_secs` (one of the `--parallel` places). The job's `secs`

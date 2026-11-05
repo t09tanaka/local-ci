@@ -144,7 +144,8 @@ pub struct JobResult {
 /// jobs is not counted twice.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct JobTime {
-    /// The steps running: `secs` without `wait_queue_secs`.
+    /// The job's own running, setup of its services and environment included:
+    /// `secs` without `wait_queue_secs`.
     pub work_secs: f64,
     /// For the per-repository lock.
     pub wait_lock_secs: f64,
@@ -937,7 +938,23 @@ impl<'a> Runner<'a> {
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let file = self.tools.join(format!("scripts/step-{n}.sh"));
-        fs::write(&file, script)?;
+        // With canirun the script touches this file as its first act, on the
+        // line the script starts on, so canirun still sees the same command and
+        // the script keeps its line numbers. The file's time tells how long the
+        // step waited for its turn, even if it prints nothing. Scripts of other
+        // shells are not changed (a Python script may begin with
+        // `from __future__`); their wait is read from the log.
+        let turn = self.tools.join(format!("scripts/step-{n}.turn"));
+        let queued = self.opts.canirun.is_some() && key.is_some();
+        let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
+        if marked {
+            let mark = shlex::try_quote(&turn.to_string_lossy())
+                .map(|q| format!(": > {q} 2>/dev/null || true; "))
+                .unwrap_or_default();
+            fs::write(&file, format!("{mark}{script}"))?;
+        } else {
+            fs::write(&file, script)?;
+        }
         let f = file.to_string_lossy().into_owned();
         let mut argv: Vec<String> = match shell.map(str::trim) {
             None | Some("bash") => vec![
@@ -954,10 +971,6 @@ impl<'a> Runner<'a> {
                 .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
             Some(other) => bail!("unsupported shell `{other}`"),
         };
-        // The command touches this file when canirun lets it start; the file's
-        // time tells how long it waited, even for a command that prints nothing.
-        let turn = self.tools.join(format!("scripts/step-{n}.turn"));
-        let queued = self.opts.canirun.is_some() && key.is_some();
         if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
             let mut w = vec![
                 c.to_string_lossy().into_owned(),
@@ -965,11 +978,6 @@ impl<'a> Runner<'a> {
                 "--key".into(),
                 k,
                 "--".into(),
-                "sh".into(),
-                "-c".into(),
-                r#": > "$1"; shift; exec "$@""#.into(),
-                "local-ci".into(),
-                turn.to_string_lossy().into_owned(),
             ];
             w.append(&mut argv);
             argv = w;
@@ -1015,7 +1023,7 @@ impl<'a> Runner<'a> {
             if let Some(st) = child.try_wait()? {
                 break st;
             }
-            if started.is_none() && queued && turn.exists() {
+            if started.is_none() && marked && turn.exists() {
                 started = Some(Instant::now());
             }
             if started.is_none() {
@@ -1052,9 +1060,11 @@ impl<'a> Runner<'a> {
         };
         PGIDS.lock().unwrap().retain(|&p| p != pid);
         let _ = fs::remove_file(&file);
-        // Waiting for its turn: until the command touched `turn`, or, when it
-        // never did (canirun gave up, the step was stopped), until it was over.
-        let waited = if queued {
+        // Waiting for its turn: until the script touched `turn`, or the first
+        // line of output that is not canirun's own, or, when neither came
+        // (canirun gave up, the step was stopped, a silent step of another
+        // shell), until it was over.
+        let waited = if marked {
             let got_turn = fs::metadata(&turn).and_then(|m| m.modified()).ok();
             let _ = fs::remove_file(&turn);
             match got_turn {
@@ -1062,6 +1072,11 @@ impl<'a> Runner<'a> {
                 Some(t) => t.duration_since(spawned.1).unwrap_or(Duration::ZERO),
                 None => spawned.0.elapsed(),
             }
+        } else if queued {
+            started.map_or_else(
+                || spawned.0.elapsed(),
+                |s| s.saturating_duration_since(spawned.0),
+            )
         } else {
             Duration::ZERO
         };

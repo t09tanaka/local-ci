@@ -7,9 +7,11 @@
   container slot, canirun and a `--parallel` place (`wait_lock_secs`,
   `wait_slot_secs`, `wait_queue_secs`, `wait_parallel_secs`). The report names
   the waits of a job that waited a second or more. The step's own time
-  (`secs`) is as before. With canirun, a step now starts through a small
-  `sh -c` that notes the moment it got its turn; a step that prints nothing
-  no longer counts as still waiting.
+  (`secs`) is as before. With canirun, a `bash` or `sh` step's script now
+  begins by noting the moment it got its turn (on its own first line, so the
+  command canirun sees and the line numbers are unchanged); a step that prints
+  nothing no longer counts as still waiting. Steps of other shells still
+  count as waiting until their first line of output.
 
 ## 0.6.2
 

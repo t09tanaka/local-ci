@@ -343,7 +343,10 @@ jobs:
     let fake = bin.join("canirun");
     std::fs::write(
         &fake,
-        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 2\nexec \"$@\"\n",
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}/argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 2\nexec \"$@\"\n",
+            d.home.display()
+        ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -365,6 +368,13 @@ jobs:
     let queue = t["wait_queue_secs"].as_f64().unwrap();
     assert!((3.5..15.0).contains(&queue), "two steps, 2s each: {t}");
     assert!(t["work_secs"].as_f64().unwrap() < queue, "{t}");
+    // canirun is given the step's own command, as before: its history shows it
+    let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
+    assert!(
+        argv.lines()
+            .all(|l| l.contains("-- bash --noprofile --norc -eo pipefail ")),
+        "{argv}"
+    );
     // the summary names the wait in the job's own line
     let o = local_ci_path(
         &d,
