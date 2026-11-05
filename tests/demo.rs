@@ -262,6 +262,244 @@ fn json_result_is_saved() {
     assert!(saved.is_file());
 }
 
+fn add_workflow(d: &Demo, file: &str, yaml: &str) {
+    std::fs::write(d.repo.join(".github/workflows").join(file), yaml).unwrap();
+    git(&d.repo, &["add", "."]);
+    git(&d.repo, &["commit", "-qm", file]);
+}
+
+/// The `time` of each job of a `local-ci run --json`, by job id.
+fn job_times(o: &Output) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)));
+    let mut times = serde_json::Map::new();
+    for u in v["units"].as_array().unwrap() {
+        for j in u["jobs"].as_array().unwrap() {
+            times.insert(j["job"].as_str().unwrap().into(), j["time"].clone());
+        }
+    }
+    times.into()
+}
+
+const SLOW_E2E: &str = r#"name: Slow
+on: pull_request
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ran
+"#;
+
+#[test]
+fn job_time_counts_the_running_and_no_waits_on_an_idle_machine() {
+    let d = demo("app/lib.sh");
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-canirun",
+            "--json",
+            "-j",
+            "lint",
+        ],
+    );
+    let t = &job_times(&o)["lint"];
+    assert!(t["work_secs"].as_f64().unwrap() > 0.0, "{t}");
+    for k in [
+        "wait_lock_secs",
+        "wait_slot_secs",
+        "wait_queue_secs",
+        "wait_parallel_secs",
+    ] {
+        assert!(t[k].as_f64().unwrap() < 1.0, "{k}: {t}");
+    }
+    // the fields that were there keep their place
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["units"][0]["jobs"][0]["secs"].is_number());
+    assert!(v["units"][0]["waited_secs"].is_number());
+}
+
+#[test]
+fn canirun_queue_is_counted_apart_from_the_running() {
+    let d = demo("app/lib.sh");
+    add_workflow(
+        &d,
+        "queue.yml",
+        r#"name: Queue
+on: pull_request
+jobs:
+  waiter:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+      - run: echo two
+"#,
+    );
+    // a canirun that lets every command start 2 seconds late
+    let bin = d.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("canirun");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 2\nexec \"$@\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = local_ci_path(
+        &d,
+        &path,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--json",
+            "-w",
+            "queue.yml",
+        ],
+    );
+    let t = &job_times(&o)["waiter"];
+    let queue = t["wait_queue_secs"].as_f64().unwrap();
+    assert!((3.5..15.0).contains(&queue), "two steps, 2s each: {t}");
+    assert!(t["work_secs"].as_f64().unwrap() < queue, "{t}");
+    // the summary names the wait in the job's own line
+    let o = local_ci_path(
+        &d,
+        &path,
+        &["run", "--no-status", "--no-cache", "-w", "queue.yml"],
+    );
+    let out = stdout(&o);
+    assert!(
+        out.contains("PASS   queue.yml › waiter") && out.contains("waited queue 4s"),
+        "{out}"
+    );
+}
+
+#[test]
+fn container_slot_and_repository_lock_waits_are_counted() {
+    use fs2::FileExt;
+    let d = demo("app/lib.sh");
+    add_workflow(&d, "slow.yml", SLOW_E2E);
+    // a first run creates the repository's lock file
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-canirun",
+            "--json",
+            "-w",
+            "slow.yml",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0));
+    let locks = d.home.join("locks");
+    let repo_lock = std::fs::read_dir(&locks)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            !p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("containers-")
+        })
+        .expect("the run took the repository lock");
+    let open = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(p)
+            .unwrap()
+    };
+    let repo_hold = open(&repo_lock);
+    let slot_hold = open(&locks.join("containers-0.lock"));
+    repo_hold.lock_exclusive().unwrap();
+    slot_hold.lock_exclusive().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_local-ci"))
+        .args([
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-canirun",
+            "--json",
+            "--containers",
+            "1",
+            "-w",
+            "slow.yml",
+        ])
+        .current_dir(&d.repo)
+        .env("LOCAL_CI_HOME", &d.home)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The run needs a moment to get as far as the lock, longer on a busy machine.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    // the lock comes first, then the slot
+    repo_hold.unlock().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    slot_hold.unlock().unwrap();
+    let o = child.wait_with_output().unwrap();
+    let t = &job_times(&o)["e2e"];
+    assert!(t["wait_lock_secs"].as_f64().unwrap() >= 1.0, "{t}");
+    assert!(t["wait_slot_secs"].as_f64().unwrap() >= 2.0, "{t}");
+    assert!(t["work_secs"].as_f64().unwrap() < 3.0, "{t}");
+}
+
+#[test]
+fn a_unit_waiting_for_a_parallel_place_is_counted() {
+    let d = demo("app/lib.sh");
+    add_workflow(
+        &d,
+        "two.yml",
+        r#"name: Two
+on: pull_request
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 2; echo first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 2; echo second
+"#,
+    );
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-canirun",
+            "--json",
+            "--parallel",
+            "1",
+            "-w",
+            "two.yml",
+        ],
+    );
+    let t = job_times(&o);
+    let waits: Vec<f64> = ["first", "second"]
+        .iter()
+        .map(|j| t[*j]["wait_parallel_secs"].as_f64().unwrap())
+        .collect();
+    // one of them went first
+    assert!(
+        waits.iter().cloned().fold(0.0, f64::max) >= 1.5,
+        "{waits:?}"
+    );
+    assert!(
+        waits.iter().cloned().fold(f64::MAX, f64::min) < 1.0,
+        "{waits:?}"
+    );
+}
+
 #[test]
 fn services_get_their_own_port() {
     if !docker_available() {

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Each job that ran has a `time` in `result.json` and `--json`: how long its
+  steps ran (`work_secs`) and how long it waited for the repository lock, a
+  container slot, canirun and a `--parallel` place (`wait_lock_secs`,
+  `wait_slot_secs`, `wait_queue_secs`, `wait_parallel_secs`). The report names
+  the waits of a job that waited a second or more. The step's own time
+  (`secs`) is as before. With canirun, a step now starts through a small
+  `sh -c` that notes the moment it got its turn; a step that prints nothing
+  no longer counts as still waiting.
+
 ## 0.6.2
 
 - Units' copies clone `node_modules` again, as up to 0.5.1. Linking to

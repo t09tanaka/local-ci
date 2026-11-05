@@ -294,6 +294,7 @@ impl Store {
                     None => Outcome::Pass,
                 },
                 secs: 0.0,
+                time: None,
                 steps: j
                     .steps
                     .into_iter()
@@ -543,6 +544,7 @@ jobs:
                     note: None,
                 },
             ],
+            time: None,
         };
         let u = |o: Outcome| UnitResult {
             workflow: "ci.yml".into(),

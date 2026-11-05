@@ -130,6 +130,59 @@ pub struct JobResult {
     pub outcome: Outcome,
     pub secs: f64,
     pub steps: Vec<StepResult>,
+    /// Where the time went. Absent for jobs that did not run and for reused results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<JobTime>,
+}
+
+/// What a job waited for, and how long it really ran, in seconds.
+///
+/// `secs` of the job counts from the start of its steps and so holds the wait
+/// for canirun (`wait_queue_secs`); the other waits come before it. The waits
+/// of a whole unit (`wait_lock_secs` for the repository lock, `wait_parallel_secs`
+/// for a `--parallel` place) are charged to its first job, so that the sum over
+/// jobs is not counted twice.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct JobTime {
+    /// The steps running: `secs` without `wait_queue_secs`.
+    pub work_secs: f64,
+    /// For the per-repository lock.
+    pub wait_lock_secs: f64,
+    /// For one of the `--containers` slots, shared by all runs on the machine.
+    pub wait_slot_secs: f64,
+    /// For canirun to let a step start, summed over the steps.
+    pub wait_queue_secs: f64,
+    /// For one of the `--parallel` places of this run.
+    pub wait_parallel_secs: f64,
+}
+
+/// The waits of a unit before any of its jobs started.
+#[derive(Debug, Clone, Copy, Default)]
+struct UnitWait {
+    lock: f64,
+    parallel: f64,
+}
+
+impl UnitWait {
+    fn total(self) -> f64 {
+        self.lock + self.parallel
+    }
+}
+
+/// Charge the waits of a unit to its first job.
+fn charge(jobs: &mut [JobResult], w: UnitWait) {
+    if w.total() <= 0.0 {
+        return;
+    }
+    if let Some(j) = jobs.first_mut() {
+        let secs = j.secs;
+        let t = j.time.get_or_insert_with(|| JobTime {
+            work_secs: secs,
+            ..JobTime::default()
+        });
+        t.wait_lock_secs += w.lock;
+        t.wait_parallel_secs += w.parallel;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -838,9 +891,9 @@ impl<'a> Runner<'a> {
         ]
     }
 
-    /// Run one shell step. Output goes to `log`; returns how it ended. When
-    /// canirun's ledger lock times out the command never started, so it is
-    /// tried again, a few times.
+    /// Run one shell step. Output goes to `log`; returns how it ended and how
+    /// long canirun kept it waiting for its turn. When canirun's ledger lock
+    /// times out the command never started, so it is tried again, a few times.
     #[allow(clippy::too_many_arguments)]
     fn shell(
         &self,
@@ -851,18 +904,20 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
-    ) -> Result<Exit> {
+    ) -> Result<(Exit, Duration)> {
         let mut attempt = 0;
+        let mut queued = Duration::ZERO;
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
-            let r = self.shell_once(cwd, script, shell, env, timeout, log, key.clone())?;
+            let (r, q) = self.shell_once(cwd, script, shell, env, timeout, log, key.clone())?;
+            queued += q;
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
                 && attempt < 3
                 && self.opts.canirun.is_some()
                 && ledger_timed_out(log, from))
             {
-                return Ok(r);
+                return Ok((r, queued));
             }
             attempt += 1;
             std::thread::sleep(Duration::from_secs(attempt));
@@ -879,7 +934,7 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
-    ) -> Result<Exit> {
+    ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let file = self.tools.join(format!("scripts/step-{n}.sh"));
         fs::write(&file, script)?;
@@ -899,6 +954,10 @@ impl<'a> Runner<'a> {
                 .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
             Some(other) => bail!("unsupported shell `{other}`"),
         };
+        // The command touches this file when canirun lets it start; the file's
+        // time tells how long it waited, even for a command that prints nothing.
+        let turn = self.tools.join(format!("scripts/step-{n}.turn"));
+        let queued = self.opts.canirun.is_some() && key.is_some();
         if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
             let mut w = vec![
                 c.to_string_lossy().into_owned(),
@@ -906,6 +965,11 @@ impl<'a> Runner<'a> {
                 "--key".into(),
                 k,
                 "--".into(),
+                "sh".into(),
+                "-c".into(),
+                r#": > "$1"; shift; exec "$@""#.into(),
+                "local-ci".into(),
+                turn.to_string_lossy().into_owned(),
             ];
             w.append(&mut argv);
             argv = w;
@@ -918,7 +982,7 @@ impl<'a> Runner<'a> {
                     cwd.display()
                 ),
             )?;
-            return Ok(Exit::Code(1));
+            return Ok((Exit::Code(1), Duration::ZERO));
         }
         let out = OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
@@ -936,6 +1000,7 @@ impl<'a> Runner<'a> {
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
         let pid = child.id() as i32;
+        let spawned = (Instant::now(), std::time::SystemTime::now());
         PGIDS.lock().unwrap().push(pid);
         // With canirun the clock starts when the command gets its turn, not while it waits.
         let mut started: Option<Instant> = if self.opts.canirun.is_some() {
@@ -949,6 +1014,9 @@ impl<'a> Runner<'a> {
         let status = loop {
             if let Some(st) = child.try_wait()? {
                 break st;
+            }
+            if started.is_none() && queued && turn.exists() {
+                started = Some(Instant::now());
             }
             if started.is_none() {
                 if let Ok(mut lf) = File::open(log) {
@@ -984,15 +1052,31 @@ impl<'a> Runner<'a> {
         };
         PGIDS.lock().unwrap().retain(|&p| p != pid);
         let _ = fs::remove_file(&file);
+        // Waiting for its turn: until the command touched `turn`, or, when it
+        // never did (canirun gave up, the step was stopped), until it was over.
+        let waited = if queued {
+            let got_turn = fs::metadata(&turn).and_then(|m| m.modified()).ok();
+            let _ = fs::remove_file(&turn);
+            match got_turn {
+                // a time before the spawn is the file system's rounding
+                Some(t) => t.duration_since(spawned.1).unwrap_or(Duration::ZERO),
+                None => spawned.0.elapsed(),
+            }
+        } else {
+            Duration::ZERO
+        };
         if timed_out {
-            return Ok(Exit::Timeout);
+            return Ok((Exit::Timeout, waited));
         }
         if CANCEL.load(Ordering::SeqCst) {
-            return Ok(Exit::Cancelled);
+            return Ok((Exit::Cancelled, waited));
         }
-        Ok(Exit::Code(status.code().unwrap_or(
-            128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0),
-        )))
+        Ok((
+            Exit::Code(status.code().unwrap_or(
+                128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0),
+            )),
+            waited,
+        ))
     }
 
     fn log_path(&self, wf: &str, job: &str, n: usize, label: &str) -> PathBuf {
@@ -1084,15 +1168,17 @@ impl<'a> Runner<'a> {
             let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.key.wd, s.label));
             let t0 = Instant::now();
             let cwd = self.wt.join(&s.key.wd);
-            let res = self.shell(
-                &cwd,
-                &s.key.run,
-                s.shell.as_deref(),
-                &env,
-                Some(Duration::from_secs(1800)),
-                &log,
-                None,
-            );
+            let res = self
+                .shell(
+                    &cwd,
+                    &s.key.run,
+                    s.shell.as_deref(),
+                    &env,
+                    Some(Duration::from_secs(1800)),
+                    &log,
+                    None,
+                )
+                .map(|(exit, _)| exit);
             let label = format!(
                 "{}$ {}",
                 if s.key.wd.is_empty() { "." } else { &s.key.wd },
@@ -1139,8 +1225,12 @@ impl<'a> Runner<'a> {
                     } else {
                         None
                     };
+                    let locked_at = t0.elapsed().as_secs_f64();
                     sem.acquire();
-                    let waited = t0.elapsed().as_secs_f64();
+                    let waited = UnitWait {
+                        lock: locked_at,
+                        parallel: t0.elapsed().as_secs_f64() - locked_at,
+                    };
                     let r = if isolate && !CANCEL.load(Ordering::SeqCst) {
                         self.run_unit_in_copy(i + 1, u, waited)
                     } else {
@@ -1270,7 +1360,7 @@ impl<'a> Runner<'a> {
     /// Run the unit in its own copy of the worktree, as each GitHub job gets its
     /// own checkout: a unit that edits tracked files for a while (a negative
     /// control, a formatter) must not change what the units beside it read.
-    fn run_unit_in_copy(&self, n: usize, u: &Unit, waited: f64) -> UnitResult {
+    fn run_unit_in_copy(&self, n: usize, u: &Unit, waited: UnitWait) -> UnitResult {
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
@@ -1290,7 +1380,7 @@ impl<'a> Runner<'a> {
             Err(e) => {
                 let w = &self.plan.selected[u.wf].wf;
                 let reason = format!("cannot copy the worktree: {e:#}");
-                let jobs = u
+                let mut jobs: Vec<JobResult> = u
                     .jobs
                     .iter()
                     .map(|id| JobResult {
@@ -1300,12 +1390,14 @@ impl<'a> Runner<'a> {
                         outcome: Outcome::Error(reason.clone()),
                         secs: 0.0,
                         steps: vec![],
+                        time: None,
                     })
                     .collect();
+                charge(&mut jobs, waited);
                 UnitResult {
                     workflow: w.file.clone(),
                     jobs,
-                    waited_secs: waited,
+                    waited_secs: waited.total(),
                     copy_secs: None,
                     cached: None,
                 }
@@ -1328,7 +1420,7 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn run_unit(&self, u: &Unit, waited: f64, ws: &Path) -> UnitResult {
+    fn run_unit(&self, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
         let sel = &self.plan.selected[u.wf];
         let w = &sel.wf;
         let mut needs_ctx = Map::new();
@@ -1360,10 +1452,11 @@ impl<'a> Runner<'a> {
             needs_ctx.insert(id.clone(), json!({"result": result, "outputs": outputs}));
             jobs.extend(job_results.drain(..).map(|r| r.0));
         }
+        charge(&mut jobs, waited);
         UnitResult {
             workflow: w.file.clone(),
             jobs,
-            waited_secs: waited,
+            waited_secs: waited.total(),
             copy_secs: None,
             cached: None,
         }
@@ -1391,6 +1484,7 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Skip(reason),
                     secs: 0.0,
                     steps: vec![],
+                    time: None,
                 },
                 Map::new(),
             )
@@ -1404,6 +1498,7 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Error(reason),
                     secs: 0.0,
                     steps: vec![],
+                    time: None,
                 },
                 Map::new(),
             )
@@ -1504,11 +1599,14 @@ impl<'a> Runner<'a> {
         let one = |ws: &Path, cm: Map<String, Value>, display: String| {
             // Something rewriting cannot reach (a `container_name:`) still needs
             // the lock. Taken before the slot, in the order units take them.
+            let t_lock = Instant::now();
             let lock = if exclusive && !locked && self.fixed_resources(ws, w, job, &cm) {
                 self.lock().ok()
             } else {
                 None
             };
+            let wait_lock = t_lock.elapsed().as_secs_f64();
+            let t_slot = Instant::now();
             let slot = if exclusive {
                 match self.container_slot() {
                     Ok(Some(s)) => Some(s),
@@ -1519,15 +1617,23 @@ impl<'a> Runner<'a> {
             } else {
                 None
             };
+            let wait_slot = t_slot.elapsed().as_secs_f64();
             if CANCEL.load(Ordering::SeqCst) {
                 return skip(display, "cancelled".into());
             }
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
             }
-            let r = self.run_combo(ws, w, job, cm, display, stop);
+            let mut r = self.run_combo(ws, w, job, cm, display, stop);
             drop(slot);
             drop(lock);
+            let secs = r.0.secs;
+            let t = r.0.time.get_or_insert_with(|| JobTime {
+                work_secs: secs,
+                ..JobTime::default()
+            });
+            t.wait_lock_secs += wait_lock;
+            t.wait_slot_secs += wait_slot;
             if matches!(r.0.outcome, Outcome::Fail | Outcome::Error(_)) {
                 failed.store(true, Ordering::SeqCst);
             }
@@ -1615,6 +1721,7 @@ impl<'a> Runner<'a> {
             outcome,
             secs: t0.elapsed().as_secs_f64(),
             steps,
+            time: None,
         };
 
         // services
@@ -1714,6 +1821,8 @@ impl<'a> Runner<'a> {
             .unwrap()
             .push(compose_default.clone());
         let mut errored: Option<String> = None;
+        // canirun's queue, summed over the steps
+        let mut queue = Duration::ZERO;
 
         for (n, s) in job.steps.iter().enumerate() {
             let raw_label = s.label();
@@ -1972,18 +2081,23 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             }
-            let res = self.shell(
-                &ws.join(&wd),
-                &script,
-                s.shell
-                    .as_deref()
-                    .or(job.shell.as_deref())
-                    .or(w.shell.as_deref()),
-                &env,
-                Some(timeout),
-                &log,
-                Some(key),
-            );
+            let res = self
+                .shell(
+                    &ws.join(&wd),
+                    &script,
+                    s.shell
+                        .as_deref()
+                        .or(job.shell.as_deref())
+                        .or(w.shell.as_deref()),
+                    &env,
+                    Some(timeout),
+                    &log,
+                    Some(key),
+                )
+                .map(|(exit, queued)| {
+                    queue += queued;
+                    exit
+                });
             let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
             let mut outputs = Map::new();
             for (k, v) in parse_file_command(&read("output")) {
@@ -2085,7 +2199,13 @@ impl<'a> Runner<'a> {
         } else {
             Outcome::Pass
         };
-        (finish(outcome, steps, t0), outputs)
+        let mut result = finish(outcome, steps, t0);
+        result.time = Some(JobTime {
+            work_secs: (result.secs - queue.as_secs_f64()).max(0.0),
+            wait_queue_secs: queue.as_secs_f64(),
+            ..JobTime::default()
+        });
+        (result, outputs)
     }
 
     /// `uses:` steps: version checks for setup actions, skips for the rest.
@@ -2409,6 +2529,61 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_with_secs(secs: f64) -> JobResult {
+        JobResult {
+            workflow: "ci.yml".into(),
+            job: "j".into(),
+            display: "j".into(),
+            outcome: Outcome::Pass,
+            secs,
+            steps: vec![],
+            time: None,
+        }
+    }
+
+    #[test]
+    fn a_units_waits_are_charged_to_its_first_job_once() {
+        let mut jobs = vec![job_with_secs(5.0), job_with_secs(7.0)];
+        charge(
+            &mut jobs,
+            UnitWait {
+                lock: 30.0,
+                parallel: 2.0,
+            },
+        );
+        assert_eq!(
+            jobs[0].time,
+            Some(JobTime {
+                work_secs: 5.0,
+                wait_lock_secs: 30.0,
+                wait_parallel_secs: 2.0,
+                ..JobTime::default()
+            })
+        );
+        assert_eq!(jobs[1].time, None);
+        // nothing waited: nothing recorded
+        let mut jobs = vec![job_with_secs(5.0)];
+        charge(&mut jobs, UnitWait::default());
+        assert_eq!(jobs[0].time, None);
+    }
+
+    #[test]
+    fn job_time_is_added_to_the_json_and_left_out_when_unknown() {
+        let mut j = job_with_secs(5.0);
+        let v = serde_json::to_value(&j).unwrap();
+        assert!(v.get("time").is_none(), "{v}");
+        assert_eq!(v["secs"], 5.0);
+        j.time = Some(JobTime {
+            work_secs: 4.0,
+            wait_queue_secs: 1.0,
+            ..JobTime::default()
+        });
+        let v = serde_json::to_value(&j).unwrap();
+        assert_eq!(v["time"]["work_secs"], 4.0);
+        assert_eq!(v["time"]["wait_queue_secs"], 1.0);
+        assert_eq!(v["time"]["wait_slot_secs"], 0.0);
+    }
 
     #[test]
     fn file_commands() {
