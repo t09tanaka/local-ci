@@ -194,7 +194,9 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    `wait_parallel_secs` (one of the `--parallel` places). The job's `secs`
    still counts from its first step and so includes `wait_queue_secs`; the
    other waits come before it. The waits of a unit before its jobs start go to
-   its first job. Jobs that did not run, and reused results, have no `time`.
+   its first job. Jobs that did not run, and reused results, have no `time`. Steps of a shell
+other than bash or sh that print nothing count as waiting for canirun until
+they end.
 5. **Commit status.** The state is posted as the `local-ci` commit status with
    `gh` when the commit is on GitHub. Before you push it is not; run
    `local-ci status` after pushing. `--no-status` skips this.

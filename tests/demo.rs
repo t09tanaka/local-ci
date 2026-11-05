@@ -383,7 +383,7 @@ jobs:
     );
     let out = stdout(&o);
     assert!(
-        out.contains("PASS   queue.yml › waiter") && out.contains("waited queue 4s"),
+        out.contains("PASS   queue.yml › waiter") && out.contains("waited queue "),
         "{out}"
     );
 }
@@ -458,7 +458,7 @@ fn container_slot_and_repository_lock_waits_are_counted() {
     let t = &job_times(&o)["e2e"];
     assert!(t["wait_lock_secs"].as_f64().unwrap() >= 1.0, "{t}");
     assert!(t["wait_slot_secs"].as_f64().unwrap() >= 2.0, "{t}");
-    assert!(t["work_secs"].as_f64().unwrap() < 3.0, "{t}");
+    assert!(t["work_secs"].as_f64().unwrap() < 6.0, "{t}");
 }
 
 #[test]

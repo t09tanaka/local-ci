@@ -170,12 +170,13 @@ impl UnitWait {
     }
 }
 
-/// Charge the waits of a unit to its first job.
+/// Charge the waits of a unit to its first job that ran (else its first).
 fn charge(jobs: &mut [JobResult], w: UnitWait) {
     if w.total() <= 0.0 {
         return;
     }
-    if let Some(j) = jobs.first_mut() {
+    let at = jobs.iter().position(|j| j.time.is_some()).unwrap_or(0);
+    if let Some(j) = jobs.get_mut(at) {
         let secs = j.secs;
         let t = j.time.get_or_insert_with(|| JobTime {
             work_secs: secs,
@@ -2581,6 +2582,22 @@ mod tests {
         let mut jobs = vec![job_with_secs(5.0)];
         charge(&mut jobs, UnitWait::default());
         assert_eq!(jobs[0].time, None);
+        // a job that did not run is passed over
+        let mut ran = job_with_secs(3.0);
+        ran.time = Some(JobTime {
+            work_secs: 3.0,
+            ..JobTime::default()
+        });
+        let mut jobs = vec![job_with_secs(0.0), ran];
+        charge(
+            &mut jobs,
+            UnitWait {
+                lock: 4.0,
+                parallel: 0.0,
+            },
+        );
+        assert_eq!(jobs[0].time, None);
+        assert_eq!(jobs[1].time.as_ref().unwrap().wait_lock_secs, 4.0);
     }
 
     #[test]
