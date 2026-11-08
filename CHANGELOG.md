@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 - Each job that ran has a `time` in `result.json` and `--json`: how long its
   steps ran (`work_secs`) and how long it waited for the repository lock, a
