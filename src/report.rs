@@ -1,6 +1,6 @@
 //! The result of a run: its state, the short text report, and the JSON file.
 
-use crate::exec::{tail, JobResult, Outcome, StepResult, UnitResult};
+use crate::exec::{tail, JobResult, JobTime, Outcome, StepResult, UnitResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,26 @@ fn dur(secs: f64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// ` (ran 2m20s · waited slot 5m00s, queue 40s)` for a job that waited a second
+/// or more for something; empty otherwise.
+fn waits(t: Option<&JobTime>) -> String {
+    let Some(t) = t else { return String::new() };
+    let list: Vec<String> = [
+        ("lock", t.wait_lock_secs),
+        ("slot", t.wait_slot_secs),
+        ("queue", t.wait_queue_secs),
+        ("parallel", t.wait_parallel_secs),
+    ]
+    .iter()
+    .filter(|(_, s)| *s >= 1.0)
+    .map(|(n, s)| format!("{n} {}", dur(*s)))
+    .collect();
+    if list.is_empty() {
+        return String::new();
+    }
+    format!(" (ran {} · waited {})", dur(t.work_secs), list.join(", "))
 }
 
 pub struct Counts {
@@ -276,14 +296,18 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         match &j.outcome {
             Outcome::Pass => match &u.cached {
                 Some(from) => println!("PASS   {name}  cached ({from})"),
-                None => println!("PASS   {name}  {}", dur(j.secs)),
+                None => println!("PASS   {name}  {}{}", dur(j.secs), waits(j.time.as_ref())),
             },
             Outcome::Fail => {
                 let s = failed_step(j);
                 let what = s
                     .map(|s| format!(" › {} (exit {})", s.label, s.exit.unwrap_or(-1)))
                     .unwrap_or_default();
-                println!("FAIL   {name}{what}  {}", dur(j.secs));
+                println!(
+                    "FAIL   {name}{what}  {}{}",
+                    dur(j.secs),
+                    waits(j.time.as_ref())
+                );
             }
             Outcome::Error(e) => println!("ERROR  {name}  {}", e.lines().next().unwrap_or("")),
             Outcome::Skip(reason) => skipped_jobs.push(format!("{} ({reason})", j.display)),
@@ -376,6 +400,7 @@ mod tests {
             outcome,
             secs: 1.0,
             steps: vec![],
+            time: None,
         }
     }
 
@@ -417,6 +442,27 @@ mod tests {
             "ci.yml: success: pass 1 / fail 0 / error 0 / skip 0, 2 not covered"
         );
         assert!(d.len() <= 140);
+    }
+
+    #[test]
+    fn waits_are_named_only_when_there_were_some() {
+        let t = |lock, slot, queue, parallel| JobTime {
+            work_secs: 140.0,
+            wait_lock_secs: lock,
+            wait_slot_secs: slot,
+            wait_queue_secs: queue,
+            wait_parallel_secs: parallel,
+        };
+        assert_eq!(waits(None), "");
+        assert_eq!(waits(Some(&t(0.0, 0.4, 0.0, 0.2))), "");
+        assert_eq!(
+            waits(Some(&t(0.0, 300.0, 40.0, 0.0))),
+            " (ran 2m20s · waited slot 5m00s, queue 40s)"
+        );
+        assert_eq!(
+            waits(Some(&t(2.0, 0.0, 0.0, 3.0))),
+            " (ran 2m20s · waited lock 2s, parallel 3s)"
+        );
     }
 
     #[test]
