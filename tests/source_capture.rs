@@ -1954,9 +1954,14 @@ fn a_worker_without_the_program_of_a_filter_is_refused_with_a_typed_error() {
         .manifest;
     assert_eq!(m.canonical.filters.len(), 1);
     assert_eq!(m.canonical.filters[0].name, "lfs");
+    // A PATH of its own with only `sh`: the system directories cannot be
+    // used, a Linux image may have `git-lfs` in /usr/bin.
+    let bare = f.home.join("bare-bin");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", bare.join("sh")).unwrap();
     let bare_path = ExecContext::new(
         [
-            ("PATH", "/usr/bin:/bin".to_string()),
+            ("PATH", bare.display().to_string()),
             ("HOME", f.home.display().to_string()),
             ("LOCAL_CI_HOME", f.home.display().to_string()),
         ]
