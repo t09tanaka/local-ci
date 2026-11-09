@@ -298,6 +298,11 @@ pub enum SourceError {
     /// After the captured settings were applied, Git in the workspace still
     /// sees these paths as different from the commit.
     WorkspaceNotClean { paths: Vec<String> },
+    /// The repository that was captured from (the original, where a local run
+    /// happens) no longer has the settings the capture ran with. They cannot
+    /// be repeated without writing the original's shared config, which a run
+    /// never does: capture again.
+    OriginalConfigChanged { keys: Vec<String> },
 }
 
 impl fmt::Display for SourceError {
@@ -341,6 +346,11 @@ impl fmt::Display for SourceError {
             SourceError::FilterMissing { filter, command } => write!(
                 f,
                 "this worker has no {filter} filter program ({command:?}): the captured files cannot be made into the commit's blobs here"
+            ),
+            SourceError::OriginalConfigChanged { keys } => write!(
+                f,
+                "the original repository's settings changed after the capture ({}): capture again; a run does not write the original's config",
+                keys.join(", ")
             ),
             SourceError::WorkspaceNotClean { paths } => write!(
                 f,

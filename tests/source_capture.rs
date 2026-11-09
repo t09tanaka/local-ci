@@ -2142,3 +2142,154 @@ fn a_dirty_submodule_inside_a_dirty_submodule_comes_along() {
         b"inner, edited\n"
     );
 }
+
+// ---- a run in the original itself never writes its config -------------------
+
+const LOCAL_WORKFLOW: &str = "name: ci\non: pull_request\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: test -f a.txt\n";
+
+/// A repository with a workflow and a dirty `a.txt`, and the options of a run
+/// in it over `m`.
+fn local_pair(autocrlf: bool) -> Pair {
+    let p = pair(|w| {
+        std::fs::create_dir_all(w.join(".github/workflows")).unwrap();
+        std::fs::write(w.join(".github/workflows/ci.yml"), LOCAL_WORKFLOW).unwrap();
+        if autocrlf {
+            git(w, &["config", "core.autocrlf", "true"]);
+        }
+        std::fs::write(w.join("a.txt"), "a\r\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    dirty_crlf(&p.work);
+    p
+}
+
+fn run_options(p: &Pair, m: &local_ci::source::SourceManifest) -> local_ci::RunOptions {
+    local_ci::RunOptions {
+        target: local_ci::Target {
+            base: Some("main".into()),
+            sha: m.execution_commit.clone().unwrap(),
+            all: false,
+            include_disabled: true,
+            workflows_dirs: vec![],
+            workflows: vec![],
+            jobs: vec![],
+            dir: p.work.clone(),
+        },
+        parallel: Some(1),
+        no_canirun: true,
+        no_portool: true,
+        containers: 1,
+        keep: false,
+        job_timeout: 5.0,
+        no_cache: true,
+        cache_dir: p.home.clone(),
+        source: Some(m.clone()),
+    }
+}
+
+fn config_bytes(dir: &Path) -> Vec<u8> {
+    std::fs::read(dir.join(".git/config")).unwrap()
+}
+
+#[test]
+fn a_local_run_leaves_the_config_of_the_original_as_it_was() {
+    for autocrlf in [false, true] {
+        let p = local_pair(autocrlf);
+        let c = ctx(&p.home);
+        let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+        let before = config_bytes(&p.work);
+        // the commit of the capture has to be in the repository the run is in
+        import_objects(&c, &p.work, &export_objects(&c, &m).unwrap(), &m).unwrap();
+        let r = local_ci::run(&c, run_options(&p, &m), &mut local_ci::Quiet)
+            .unwrap()
+            .result;
+        assert_eq!(r.state, "success", "{}", r.description);
+        assert_eq!(config_bytes(&p.work), before, "autocrlf={autocrlf}");
+        assert_eq!(
+            config_of(
+                &p.work,
+                &["config", "--local", "--get", "extensions.worktreeconfig"]
+            ),
+            None
+        );
+    }
+}
+
+#[test]
+fn a_changed_setting_of_the_original_stops_a_local_run_without_writing_to_it() {
+    let p = local_pair(true);
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    import_objects(&c, &p.work, &export_objects(&c, &m).unwrap(), &m).unwrap();
+    git(&p.work, &["config", "core.autocrlf", "false"]);
+    let before = config_bytes(&p.work);
+    let e = match local_ci::run(&c, run_options(&p, &m), &mut local_ci::Quiet) {
+        Ok(r) => panic!("ran: {}", r.result.description),
+        Err(e) => e,
+    };
+    match e.downcast_ref::<SourceError>() {
+        Some(SourceError::OriginalConfigChanged { keys }) => {
+            assert_eq!(keys, &vec!["core.autocrlf".to_string()]);
+        }
+        other => panic!("{e:#} ({other:?})"),
+    }
+    assert_eq!(config_bytes(&p.work), before);
+}
+
+#[test]
+fn a_worker_clone_is_written_to_in_its_worktree_config_and_the_switch() {
+    let p = pair(crlf_original);
+    dirty_crlf(&p.work);
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    let wt = worker_workspace(&c, &p, &m).unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+    // the clone is not a capture source, so the switch is the one write
+    assert_eq!(
+        config_of(
+            &p.worker,
+            &[
+                "config",
+                "--local",
+                "--bool",
+                "--get",
+                "extensions.worktreeconfig"
+            ]
+        )
+        .as_deref(),
+        Some("true")
+    );
+    // and the original was only read
+    assert_eq!(
+        config_of(
+            &p.work,
+            &["config", "--local", "--get", "extensions.worktreeconfig"]
+        ),
+        None
+    );
+}
+
+#[test]
+fn info_attributes_that_disagree_with_gitattributes_end_in_an_explicit_error() {
+    // Git reads info/attributes first, the worker repeats it in
+    // core.attributesFile, which Git reads last: here `-text` loses to
+    // `text eol=crlf`, so the files differ from the commit and that is said
+    let p = pair(|w| {
+        std::fs::write(w.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        std::fs::write(w.join(".git/info/attributes"), "*.txt -text\n").unwrap();
+        std::fs::write(w.join("a.txt"), "a\r\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    std::fs::write(p.work.join("a.txt"), "x\r\ny\r\n").unwrap();
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    let e = worker_workspace(&c, &p, &m).unwrap_err();
+    match e.downcast_ref::<SourceError>() {
+        Some(SourceError::WorkspaceNotClean { paths }) => {
+            assert!(paths.contains(&"a.txt".to_string()), "{paths:?}");
+        }
+        other => panic!("{e:#} ({other:?})"),
+    }
+}

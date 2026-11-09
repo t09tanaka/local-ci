@@ -7,11 +7,15 @@
   LFS payloads) in a private content-addressed store and describes it in a
   `SourceManifest` (schema 2). The synthetic commit holds Git's canonical
   blobs, so a clean repository has the tree of `HEAD`; a worker writes the raw
-  bytes into a `--no-checkout` worktree (`source::add_worktree`) after
-  repeating, in that worktree only, the settings the manifest records
-  (`core.autocrlf` / `eol` / `safecrlf`, `info/attributes`, the filters in
-  use), and fails with a typed `SourceError` when it lacks a filter program
-  (`FilterMissing`) or Git still sees a change (`WorkspaceNotClean`). A
+  bytes into a `--no-checkout` worktree (`source::add_worktree`). When the
+  repository already reads the settings the manifest records (`core.autocrlf`
+  / `eol` / `safecrlf`, `info/attributes`, the filters in use), as the
+  original does in a local run, no config is written; otherwise a worker
+  repeats them in that worktree only, and the original is never written to
+  (`OriginalConfigChanged` when its settings changed after the capture). It
+  fails with a typed `SourceError` when it lacks a filter program
+  (`FilterMissing`) or Git still sees a change (`WorkspaceNotClean`; also what
+  an `info/attributes` / `.gitattributes` conflict ends in). A
   shallow clone and a SHA-256 repository are refused up front. Skip-worktree
   and assume-unchanged files are hashed from the disk, and attributes come from
   the captured `.gitattributes` files, not from the original's working tree.

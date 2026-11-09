@@ -289,10 +289,18 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
   new.
 - The manifest records the settings that turned the captured bytes into Git's
   blobs (`core.autocrlf`, `core.eol`, `core.safecrlf`, the attribute rules that
-  are not in the tree, and the `filter.<name>.*` definitions in use). A worker
-  repeats them in its worktree only (`extensions.worktreeConfig` is the one
-  switch written to its shared config), so `git status` there agrees with the
-  commit. A worker without the program of a filter the capture ran gets
+  are not in the tree, and the `filter.<name>.*` definitions in use). When the
+  repository a run happens in already reads the same values (a run in the
+  original itself always does) nothing is written. A worker whose settings
+  differ repeats them in its worktree only (`extensions.worktreeConfig` is the
+  one switch written to its shared config, and only in a clone that was not
+  captured from); if the original's own settings changed after the capture the
+  run stops with `SourceError::OriginalConfigChanged` instead of writing to
+  it. Either way `git status` agrees with the commit. One known limit: Git
+  reads `info/attributes` before `.gitattributes`, but a worker repeats those
+  rules where Git reads them last, so when they disagree about a path the
+  result is `SourceError::WorkspaceNotClean`, never silently different
+  content. A worker without the program of a filter the capture ran gets
   `SourceError::FilterMissing` and can be left out; a workspace that Git still
   sees as changed is `SourceError::WorkspaceNotClean`.
 - Not supported yet: shallow clones (`git fetch --unshallow` first) and

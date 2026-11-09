@@ -98,7 +98,7 @@ pub(crate) fn og(ctx: &ExecContext, root: &Path, args: &[&str]) -> Result<Vec<u8
     )
 }
 
-fn og_str(ctx: &ExecContext, root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn og_str(ctx: &ExecContext, root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&og(ctx, root, args)?)
         .trim()
         .to_string())
@@ -777,6 +777,12 @@ pub(crate) fn check_digest(m: &SourceManifest) -> Result<()> {
 
 // ---- the private repository ----------------------------------------------
 
+/// The store key of the private repository of a repository: its id and where
+/// its common Git directory is on this host.
+pub(crate) fn private_key(repository_id: &str, common_dir: &str) -> String {
+    sha256_hex(format!("{repository_id}\0{common_dir}").as_bytes())[..16].to_string()
+}
+
 /// The bare repository that holds the synthetic commits of one repository.
 ///
 /// It owns its objects: [`import_history`] copies in the history a capture
@@ -795,8 +801,7 @@ fn private_repo(
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    let key = &sha256_hex(format!("{repository_id}\0{common}").as_bytes())[..16];
-    let dir = store.git_dir(key);
+    let dir = store.git_dir(&private_key(repository_id, &common));
     if !dir.join("HEAD").is_file() {
         let out = ctx
             .command("git")
@@ -947,7 +952,7 @@ fn write_blobs(
 
 /// The global attributes file the original's Git reads: `core.attributesFile`,
 /// else the default one under `$XDG_CONFIG_HOME` / `~/.config`, when it exists.
-fn global_attributes_path(ctx: &ExecContext, root: &Path) -> Option<PathBuf> {
+pub(crate) fn global_attributes_path(ctx: &ExecContext, root: &Path) -> Option<PathBuf> {
     let configured = og_str(
         ctx,
         root,
@@ -1078,6 +1083,22 @@ fn check_attr(
         .collect())
 }
 
+/// The attribute rules that are not in the tree: the global attributes file,
+/// then `info/attributes` of the repository at `git_dir`.
+pub(crate) fn attribute_rules(ctx: &ExecContext, root: &Path, git_dir: &Path) -> Vec<u8> {
+    let mut rules = vec![];
+    if let Some(g) = global_attributes_path(ctx, root) {
+        rules.extend(std::fs::read(g).unwrap_or_default());
+    }
+    if let Ok(info) = std::fs::read(git_dir.join("info/attributes")) {
+        if !rules.is_empty() && !rules.ends_with(b"\n") {
+            rules.push(b'\n');
+        }
+        rules.extend(info);
+    }
+    rules
+}
+
 /// The settings that made the blobs, for a worker to repeat.
 fn canonical_config(
     ctx: &ExecContext,
@@ -1092,16 +1113,7 @@ fn canonical_config(
             .ok()
             .filter(|v| !v.is_empty())
     };
-    let mut rules = vec![];
-    if let Some(g) = global_attributes_path(ctx, root) {
-        rules.extend(std::fs::read(g).unwrap_or_default());
-    }
-    if let Ok(info) = std::fs::read(git_dir.join("info/attributes")) {
-        if !rules.is_empty() && !rules.ends_with(b"\n") {
-            rules.push(b'\n');
-        }
-        rules.extend(info);
-    }
+    let rules = attribute_rules(ctx, root, git_dir);
     let paths: Vec<&RelPath> = entries.iter().map(|e| &e.path).collect();
     let used: BTreeSet<String> = check_attr(ctx, git_dir, attrs, cfg, &["filter"], &paths)?
         .into_iter()

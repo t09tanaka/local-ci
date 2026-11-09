@@ -178,6 +178,13 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
 /// smudge filters over them a second time. So the worktree is made without a
 /// checkout, the manifest's bytes are written, and the index is read from the
 /// commit; Git then sees the same content as clean that the capture saw.
+///
+/// The settings of the manifest are compared with what `repo` reads. If they
+/// all agree (a run on the machine that captured, in the original itself,
+/// always does) no config is written anywhere. If not, they are repeated in
+/// the worktree only, but never when `repo` is a repository the manifest was
+/// captured from: a run does not write the original's config, so that is
+/// `SourceError::OriginalConfigChanged` and nothing is added.
 pub fn add_worktree(
     ctx: &ExecContext,
     store: &ObjectStore,
@@ -189,8 +196,18 @@ pub fn add_worktree(
         bail!("{} has no execution commit", m.source_id);
     };
     check_filters(ctx, &m.canonical)?;
+    // decided before anything is added to `repo`
+    let differs = !differing_settings(ctx, repo, &m.canonical).is_empty();
+    if differs {
+        let keys = differing_settings(ctx, repo, &m.canonical);
+        if is_capture_source(ctx, store, repo, m) {
+            return Err(SourceError::OriginalConfigChanged { keys }.into());
+        }
+    }
     crate::git::add_worktree_no_checkout(ctx, repo, path, commit)?;
-    apply_canonical(ctx, repo, path, &m.canonical)?;
+    if differs {
+        apply_canonical(ctx, repo, path, &m.canonical)?;
+    }
     materialize_from(store, m, path)?;
     crate::git::git(ctx, path, &["read-tree", "HEAD"])?;
     // stat data for the index, so `git status` does not hash every file
@@ -244,10 +261,88 @@ fn check_filters(ctx: &ExecContext, c: &CanonicalConfig) -> Result<()> {
     Ok(())
 }
 
-/// Repeat the settings that made the blobs in the worktree at `path`, and in
-/// nothing else: they go to the worktree's own config (which needs
-/// `extensions.worktreeConfig`, the one thing written to the shared config)
-/// and to an attributes file in the worktree's own Git directory.
+/// The keys of `c` that `repo` does not have the same value for, as its own
+/// Git reads them. The attribute rules are compared as bytes, in the order the
+/// capture wrote them.
+fn differing_settings(ctx: &ExecContext, repo: &Path, c: &CanonicalConfig) -> Vec<String> {
+    use super::capture::{attribute_rules, og_str};
+    let get = |k: &str| {
+        og_str(ctx, repo, &["config", "--get", k])
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let mut keys = vec![];
+    for (k, want) in [
+        ("core.autocrlf", &c.autocrlf),
+        ("core.eol", &c.eol),
+        ("core.safecrlf", &c.safecrlf),
+    ] {
+        if &get(k) != want {
+            keys.push(k.to_string());
+        }
+    }
+    let git_dir = og_str(
+        ctx,
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    let rules = git_dir
+        .map(|d| attribute_rules(ctx, repo, Path::new(&d)))
+        .unwrap_or_default();
+    if super::store::hex(&rules) != c.attributes {
+        keys.push("attributes".to_string());
+    }
+    for f in &c.filters {
+        for (var, want) in [
+            ("clean", &f.clean),
+            ("smudge", &f.smudge),
+            ("process", &f.process),
+            ("required", &f.required),
+        ] {
+            let key = format!("filter.{}.{var}", f.name);
+            if &get(&key) != want {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Whether `repo` is a repository `m` was captured from on this host: the
+/// store holds the private repository of its id and common Git directory.
+fn is_capture_source(
+    ctx: &ExecContext,
+    store: &ObjectStore,
+    repo: &Path,
+    m: &SourceManifest,
+) -> bool {
+    let Some(id) = &m.repository_id else {
+        return false;
+    };
+    let Ok(common) = super::capture::og_str(
+        ctx,
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return false;
+    };
+    store
+        .git_dir(&super::capture::private_key(id, &common))
+        .join("HEAD")
+        .is_file()
+}
+
+/// Make Git in the worktree at `path` read the settings that made the blobs,
+/// when `repo` does not already read them (see `add_worktree`): they go to the
+/// worktree's own config (which needs `extensions.worktreeConfig` in the
+/// shared config of `repo`: only a worker's own clone is written that way) and
+/// to an attributes file in the worktree's own Git directory.
+///
+/// One difference remains: Git reads `info/attributes` before the
+/// `.gitattributes` files, but the repeated rules sit in
+/// `core.attributesFile`, which it reads last. When the two disagree about a
+/// path the worktree is not the commit, and that is `WorkspaceNotClean`, never
+/// a different content without an error.
 fn apply_canonical(ctx: &ExecContext, repo: &Path, path: &Path, c: &CanonicalConfig) -> Result<()> {
     use crate::git::git;
     crate::git::enable_worktree_config(ctx, repo)?;
