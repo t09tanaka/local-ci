@@ -202,28 +202,42 @@ pub fn import_objects(
             .into());
         }
     }
-    // a dirty submodule's commit is what the gitlink names: it has come along
-    for sub in m.submodules.iter().filter(|s| s.dirty) {
-        let path = String::from_utf8_lossy(&sub.path.0).into_owned();
-        let line = String::from_utf8_lossy(&git_run(
-            ctx,
-            &pre,
-            &["ls-tree", commit, "--", &path],
-            &[],
-            None,
-        )?)
-        .into_owned();
-        let sha = line.split_whitespace().nth(2).unwrap_or("");
-        if !is_hex40(sha)
-            || git_run(
+    // a dirty submodule's commit is what the gitlink names: it has come along,
+    // and so have the dirty ones below it (known from their manifests, when
+    // this host has them)
+    let store = default_store(ctx).ok();
+    check_gitlinks(ctx, &pre, commit, &m.submodules, store.as_ref())?;
+    Ok(got)
+}
+
+/// The gitlink of every dirty submodule in `subs`, read from `commit` (the
+/// tree of the repository they are in), must name a commit that is here; so
+/// must those of its own dirty submodules, down as far as manifests tell.
+fn check_gitlinks(
+    ctx: &ExecContext,
+    pre: &[std::ffi::OsString],
+    commit: &str,
+    subs: &[SubmoduleRef],
+    store: Option<&ObjectStore>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    for sub in subs.iter().filter(|s| s.dirty) {
+        let mut args: Vec<std::ffi::OsString> = pre.to_vec();
+        args.extend(["ls-tree", "-z", commit, "--"].map(std::ffi::OsString::from));
+        args.push(std::ffi::OsString::from_vec(sub.path.0.clone()));
+        let line = super::capture::git_run_os(ctx, None, &args, &[], None)?;
+        let line = String::from_utf8_lossy(&line).into_owned();
+        let sha = line.split_whitespace().nth(2).unwrap_or("").to_string();
+        let here = is_hex40(&sha)
+            && git_run(
                 ctx,
-                &pre,
+                pre,
                 &["cat-file", "-e", &format!("{sha}^{{commit}}")],
                 &[],
                 None,
             )
-            .is_err()
-        {
+            .is_ok();
+        if !here {
             return Err(SourceError::Corrupt {
                 what: format!(
                     "the commit of submodule {} is not in the bundle",
@@ -232,6 +246,14 @@ pub fn import_objects(
             }
             .into());
         }
+        let nested = match (&sub.source_id, store) {
+            (Some(id), Some(st)) => st.load_manifest(id)?,
+            _ => None,
+        };
+        if let Some(n) = nested {
+            check_ids(&n)?;
+            check_gitlinks(ctx, pre, &sha, &n.submodules, store)?;
+        }
     }
-    Ok(got)
+    Ok(())
 }

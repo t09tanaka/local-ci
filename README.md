@@ -276,6 +276,29 @@ into a prefix of the run, so neither changes your machine.
   other worktree has. The workflow's own `env` still wins. The block is given
   back when the copy is removed. `--no-portool` turns this off.
 
+## Capturing a working directory (library)
+
+`source::capture_source` fixes the input of a run as the working directory is
+right now (staged and unstaged changes, untracked files, deletions, modes,
+symlinks, submodules, LFS payloads) in a private store, and describes it in a
+`SourceManifest`. The repository itself is only read.
+
+- The first capture of a repository copies the history of `HEAD` into a
+  private bare repository under the store, so a rewrite or `git gc` of the
+  original cannot break an export later; the next captures fetch only what is
+  new.
+- The manifest records the settings that turned the captured bytes into Git's
+  blobs (`core.autocrlf`, `core.eol`, `core.safecrlf`, the attribute rules that
+  are not in the tree, and the `filter.<name>.*` definitions in use). A worker
+  repeats them in its worktree only (`extensions.worktreeConfig` is the one
+  switch written to its shared config), so `git status` there agrees with the
+  commit. A worker without the program of a filter the capture ran gets
+  `SourceError::FilterMissing` and can be left out; a workspace that Git still
+  sees as changed is `SourceError::WorkspaceNotClean`.
+- Not supported yet: shallow clones (`git fetch --unshallow` first) and
+  repositories that use SHA-256 object names. Both are refused with an
+  explicit error.
+
 ## Files
 
 The cache directory is `~/Library/Caches/local-ci` on macOS and

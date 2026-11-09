@@ -1746,3 +1746,399 @@ fn a_change_inside_a_submodule_while_the_superproject_is_read_is_noticed() {
         "{err:#}"
     );
 }
+
+// ---- a worker that has none of the original's settings ----------------------
+
+/// A repository (`work`, set up by the caller and committed) and a clone of
+/// it (`worker`) that has none of its configuration, attributes or filters.
+struct Pair {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    work: PathBuf,
+    worker: PathBuf,
+}
+
+fn pair(setup: impl FnOnce(&Path)) -> Pair {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    setup(&work);
+    git(
+        tmp.path(),
+        &["clone", "-q", work.to_str().unwrap(), "worker"],
+    );
+    Pair {
+        worker: tmp.path().join("worker"),
+        _tmp: tmp,
+        home,
+        work,
+    }
+}
+
+fn config_of(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Take the snapshot to the worker and make a workspace of it there, with the
+/// worker's own environment.
+fn worker_workspace(
+    c: &ExecContext,
+    p: &Pair,
+    m: &local_ci::source::SourceManifest,
+) -> anyhow::Result<PathBuf> {
+    let bundle = export_objects(c, m)?;
+    import_objects(&ctx(&p.home), &p.worker, &bundle, m)?;
+    let wt = p.home.join("wt");
+    local_ci::source::add_worktree(
+        &ctx(&p.home),
+        &ObjectStore::open(p.home.join("sources")).unwrap(),
+        &p.worker,
+        &wt,
+        m,
+    )?;
+    Ok(wt)
+}
+
+fn crlf_original(w: &Path) {
+    git(w, &["config", "core.autocrlf", "true"]);
+    std::fs::write(w.join("a.txt"), "a\r\n").unwrap();
+    git(w, &["add", "."]);
+    git(w, &["commit", "-qm", "base"]);
+}
+
+fn dirty_crlf(w: &Path) {
+    std::fs::write(w.join("a.txt"), "b\r\nc\r\n").unwrap();
+    std::fs::write(w.join("new.txt"), "n\r\n").unwrap();
+}
+
+#[test]
+fn a_worker_without_the_originals_autocrlf_sees_a_clean_status_and_keeps_its_own_config() {
+    let p = pair(crlf_original);
+    dirty_crlf(&p.work);
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    assert_eq!(m.canonical.autocrlf.as_deref(), Some("true"));
+    let wt = worker_workspace(&c, &p, &m).unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+    git(&wt, &["diff", "--exit-code"]);
+    assert_eq!(std::fs::read(wt.join("a.txt")).unwrap(), b"b\r\nc\r\n");
+    assert_eq!(std::fs::read(wt.join("new.txt")).unwrap(), b"n\r\n");
+    // the settings are the worktree's, not the clone's or its main checkout's
+    assert_eq!(
+        config_of(&wt, &["config", "--get", "core.autocrlf"]).as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        config_of(&p.worker, &["config", "--get", "core.autocrlf"]),
+        None
+    );
+    assert_eq!(
+        config_of(&p.worker, &["config", "--local", "--get", "core.eol"]),
+        None
+    );
+}
+
+#[test]
+fn a_worker_without_the_originals_info_attributes_sees_a_clean_status() {
+    let p = pair(|w| {
+        std::fs::write(w.join(".git/info/attributes"), "*.txt text eol=crlf\n").unwrap();
+        std::fs::write(w.join("a.txt"), "a\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    std::fs::write(p.work.join("a.txt"), "x\r\ny\r\n").unwrap();
+    std::fs::write(p.work.join("n.txt"), "n\r\n").unwrap();
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    assert!(!m.canonical.attributes.is_empty());
+    let wt = worker_workspace(&c, &p, &m).unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+    assert_eq!(std::fs::read(wt.join("a.txt")).unwrap(), b"x\r\ny\r\n");
+    // other worktrees of the worker do not get the rules
+    assert!(!p.worker.join(".git/info/attributes").exists());
+    assert_eq!(
+        config_of(
+            &p.worker,
+            &["config", "--local", "--get", "core.attributesfile"]
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_filter_the_worker_does_not_define_is_reproduced_from_the_manifest() {
+    // a clean that is not idempotent: running it twice is not running it once
+    let p = pair(|w| {
+        git(w, &["config", "filter.pre.clean", "sed 's/^/>/'"]);
+        git(w, &["config", "filter.pre.smudge", "sed 's/^>//'"]);
+        std::fs::write(w.join(".gitattributes"), "*.pf filter=pre\n").unwrap();
+        std::fs::write(w.join("x.pf"), "x\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    std::fs::write(p.work.join("x.pf"), "y\n").unwrap();
+    std::fs::write(p.work.join("n.pf"), "n\n").unwrap();
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    assert_eq!(m.canonical.filters.len(), 1);
+    assert_eq!(m.canonical.filters[0].name, "pre");
+    let exec = m.execution_commit.clone().unwrap();
+    assert_eq!(
+        git_out(
+            &private_repo_of(&p.home),
+            &["show", &format!("{exec}:x.pf")]
+        ),
+        ">y"
+    );
+    assert_eq!(
+        config_of(&p.worker, &["config", "--get", "filter.pre.clean"]),
+        None
+    );
+    let wt = worker_workspace(&c, &p, &m).unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+    assert_eq!(std::fs::read(wt.join("x.pf")).unwrap(), b"y\n");
+    assert_eq!(std::fs::read(wt.join("n.pf")).unwrap(), b"n\n");
+    assert_eq!(
+        config_of(&p.worker, &["config", "--get", "filter.pre.clean"]),
+        None
+    );
+}
+
+#[test]
+fn a_worker_without_the_program_of_a_filter_is_refused_with_a_typed_error() {
+    let (f, _oid, _payload) = lfs_fixture(true, true);
+    let tool = f.home.join("bin");
+    std::fs::create_dir_all(&tool).unwrap();
+    std::fs::write(
+        tool.join("git-lfs"),
+        "#!/bin/sh\ncat >/dev/null\nprintf 'pointer\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(tool.join("git-lfs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &f.dir,
+        &["config", "filter.lfs.clean", "git-lfs clean -- %f"],
+    );
+    git(
+        &f.dir,
+        &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+    );
+    let tmp = f.dir.parent().unwrap().to_path_buf();
+    git(&tmp, &["clone", "-q", f.dir.to_str().unwrap(), "worker"]);
+    let worker = tmp.join("worker");
+    // the original has the program, the worker does not
+    let with_tool = ExecContext::new(
+        [
+            ("PATH", format!("{}:/usr/bin:/bin", tool.display())),
+            ("HOME", f.home.display().to_string()),
+            ("LOCAL_CI_HOME", f.home.display().to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
+    let m = capture_source(&with_tool, &f.dir, &opts())
+        .unwrap()
+        .manifest;
+    assert_eq!(m.canonical.filters.len(), 1);
+    assert_eq!(m.canonical.filters[0].name, "lfs");
+    let bare_path = ExecContext::new(
+        [
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("HOME", f.home.display().to_string()),
+            ("LOCAL_CI_HOME", f.home.display().to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
+    let wt = f.home.join("wt");
+    let e = local_ci::source::add_worktree(
+        &bare_path,
+        &ObjectStore::open(f.home.join("sources")).unwrap(),
+        &worker,
+        &wt,
+        &m,
+    )
+    .unwrap_err();
+    match e.downcast_ref::<SourceError>() {
+        Some(SourceError::FilterMissing { filter, command }) => {
+            assert_eq!((filter.as_str(), command.as_str()), ("lfs", "git-lfs"));
+        }
+        other => panic!("{e:#} ({other:?})"),
+    }
+    // nothing was made
+    assert!(!wt.exists());
+    assert_eq!(git_out(&worker, &["worktree", "list"]).lines().count(), 1);
+}
+
+#[test]
+fn a_workspace_that_git_still_sees_as_changed_is_an_error_naming_the_paths() {
+    let p = pair(crlf_original);
+    dirty_crlf(&p.work);
+    let c = ctx(&p.home);
+    let real = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    let bundle = export_objects(&c, &real).unwrap();
+    import_objects(&ctx(&p.home), &p.worker, &bundle, &real).unwrap();
+    // the settings that made the blobs are not passed on
+    let mut m = real.clone();
+    m.canonical = Default::default();
+    let m = seal_manifest(m);
+    let e = local_ci::source::add_worktree(
+        &ctx(&p.home),
+        &ObjectStore::open(p.home.join("sources")).unwrap(),
+        &p.worker,
+        &p.home.join("wt"),
+        &m,
+    )
+    .unwrap_err();
+    match e.downcast_ref::<SourceError>() {
+        Some(SourceError::WorkspaceNotClean { paths }) => {
+            assert!(paths.contains(&"a.txt".to_string()), "{paths:?}");
+        }
+        other => panic!("{e:#} ({other:?})"),
+    }
+}
+
+#[test]
+fn a_shallow_clone_is_refused_before_anything_is_written() {
+    let f = fixture();
+    std::fs::write(f.dir.join("a.txt"), "a2\n").unwrap();
+    git(&f.dir, &["commit", "-qam", "second"]);
+    let tmp = f.dir.parent().unwrap().to_path_buf();
+    git(
+        &tmp,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", f.dir.display()),
+            "shallow",
+        ],
+    );
+    let e = capture_source(&f.ctx(), &tmp.join("shallow"), &opts()).unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<SourceError>(),
+        Some(&SourceError::ShallowClone),
+        "{e:#}"
+    );
+    let repos = std::fs::read_dir(f.home.join("sources/git"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(repos, 0);
+}
+
+#[test]
+fn a_sha256_repository_is_refused_with_an_explicit_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q", "--object-format=sha256", "-b", "main"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    if !init.status.success() {
+        return; // this git has no SHA-256 repositories
+    }
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "base"]);
+    let home = tmp.path().join("home");
+    let e = capture_source(&ctx(&home), &dir, &opts()).unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<SourceError>(),
+        Some(&SourceError::UnsupportedObjectFormat {
+            format: "sha256".into()
+        }),
+        "{e:#}"
+    );
+}
+
+#[test]
+fn skip_worktree_and_assume_unchanged_files_are_taken_as_they_are_on_disk() {
+    let f = fixture();
+    git(&f.dir, &["update-index", "--skip-worktree", "staged.txt"]);
+    git(
+        &f.dir,
+        &["update-index", "--assume-unchanged", "unstaged.txt"],
+    );
+    std::fs::write(f.dir.join("staged.txt"), "skip, edited\n").unwrap();
+    std::fs::write(f.dir.join("unstaged.txt"), "assume, edited\n").unwrap();
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let exec = m.execution_commit.clone().unwrap();
+    let private = private_repo_of(&f.home);
+    assert_eq!(
+        git_out(&private, &["show", &format!("{exec}:staged.txt")]),
+        "skip, edited"
+    );
+    assert_eq!(
+        git_out(&private, &["show", &format!("{exec}:unstaged.txt")]),
+        "assume, edited"
+    );
+}
+
+#[test]
+fn a_dirty_submodule_inside_a_dirty_submodule_comes_along() {
+    let f = with_submodule();
+    let tmp = f.dir.parent().unwrap().to_path_buf();
+    // the library gets a submodule of its own
+    let inner = tmp.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q", "-b", "main"]);
+    std::fs::write(inner.join("i.txt"), "inner\n").unwrap();
+    git(&inner, &["add", "."]);
+    git(&inner, &["commit", "-qm", "inner"]);
+    let lib = f.dir.join("vendor/lib");
+    git(
+        &lib,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            inner.to_str().unwrap(),
+            "deep/inner",
+        ],
+    );
+    git(&lib, &["commit", "-qm", "add inner"]);
+    git(&f.dir, &["add", "vendor/lib"]);
+    git(&f.dir, &["commit", "-qm", "bump lib"]);
+    std::fs::write(lib.join("deep/inner/i.txt"), "inner, edited\n").unwrap();
+
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    assert!(m.submodules[0].dirty);
+    git(&tmp, &["clone", "-q", f.dir.to_str().unwrap(), "worker"]);
+    let worker = tmp.join("worker");
+    let bundle = export_objects(&c, &m).unwrap();
+    import_objects(&c, &worker, &bundle, &m).unwrap();
+    let wt = f.home.join("wt");
+    local_ci::source::add_worktree(
+        &c,
+        &ObjectStore::open(f.home.join("sources")).unwrap(),
+        &worker,
+        &wt,
+        &m,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(wt.join("vendor/lib/deep/inner/i.txt")).unwrap(),
+        b"inner, edited\n"
+    );
+}

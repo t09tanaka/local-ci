@@ -795,10 +795,6 @@ fn private_repo(
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    let format = og_str(ctx, root, &["rev-parse", "--show-object-format"]).unwrap_or_default();
-    if !format.is_empty() && format != "sha1" {
-        bail!("object format {format} is not supported");
-    }
     let key = &sha256_hex(format!("{repository_id}\0{common}").as_bytes())[..16];
     let dir = store.git_dir(key);
     if !dir.join("HEAD").is_file() {
@@ -825,6 +821,20 @@ fn private_repo(
 /// The history of `head` (so the merge base and the unpushed commits too),
 /// fetched from the original into the private repository. Reads the original,
 /// writes only the private one.
+/// A shallow clone has no history to copy, and only SHA-1 object names fit
+/// the manifest: both are refused before anything is written.
+fn check_supported(ctx: &ExecContext, root: &Path) -> Result<()> {
+    let shallow = og_str(ctx, root, &["rev-parse", "--is-shallow-repository"]).unwrap_or_default();
+    if shallow == "true" {
+        return Err(SourceError::ShallowClone.into());
+    }
+    let format = og_str(ctx, root, &["rev-parse", "--show-object-format"]).unwrap_or_default();
+    if !format.is_empty() && format != "sha1" {
+        return Err(SourceError::UnsupportedObjectFormat { format }.into());
+    }
+    Ok(())
+}
+
 fn import_history(ctx: &ExecContext, git_dir: &Path, root: &Path, head: &str) -> Result<()> {
     let r = format!("refs/local-ci/heads/{head}");
     if pg(
@@ -858,6 +868,15 @@ fn import_history(ctx: &ExecContext, git_dir: &Path, root: &Path, head: &str) ->
         None,
     )
     .context("cannot copy the history of HEAD into the source store")?;
+    // a fetch that warns and exits 0 leaves no ref behind
+    pg(
+        ctx,
+        git_dir,
+        &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")],
+        &[],
+        None,
+    )
+    .with_context(|| format!("the history of {head} did not arrive in the source store"))?;
     Ok(())
 }
 
@@ -926,6 +945,29 @@ fn write_blobs(
     Ok(shas)
 }
 
+/// The global attributes file the original's Git reads: `core.attributesFile`,
+/// else the default one under `$XDG_CONFIG_HOME` / `~/.config`, when it exists.
+fn global_attributes_path(ctx: &ExecContext, root: &Path) -> Option<PathBuf> {
+    let configured = og_str(
+        ctx,
+        root,
+        &["config", "--type=path", "--get", "core.attributesfile"],
+    )
+    .ok()
+    .filter(|s| !s.is_empty());
+    let p = match configured {
+        Some(c) => PathBuf::from(c),
+        None => {
+            let base = match ctx.var("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+                Some(x) => PathBuf::from(x),
+                None => PathBuf::from(ctx.home()?).join(".config"),
+            };
+            base.join("git/attributes")
+        }
+    };
+    p.is_file().then_some(p)
+}
+
 /// `-c key=value` arguments for the settings of the original that decide how
 /// content becomes a blob: filters and line-ending conversion. They are passed
 /// on the command line, so the original's config is read and never written.
@@ -937,7 +979,7 @@ fn filter_config(ctx: &ExecContext, root: &Path) -> Vec<OsString> {
             "config",
             "-z",
             "--get-regexp",
-            r"^(filter\..*|core\.(autocrlf|eol|safecrlf|attributesfile|whitespace))$",
+            r"^(filter\..*|core\.(autocrlf|eol|safecrlf|whitespace))$",
         ],
     )
     .unwrap_or_default();
@@ -950,16 +992,175 @@ fn filter_config(ctx: &ExecContext, root: &Path) -> Vec<OsString> {
         args.push(OsString::from("-c"));
         args.push(OsString::from_vec(kv));
     }
+    if let Some(p) = global_attributes_path(ctx, root) {
+        args.push(OsString::from("-c"));
+        let mut kv = b"core.attributesfile=".to_vec();
+        kv.extend_from_slice(p.as_os_str().as_bytes());
+        args.push(OsString::from_vec(kv));
+    }
     args
 }
 
-/// Hash `content` as Git would when adding the file `path` of the original:
-/// attributes from the original's working tree, filters and line endings
-/// from its config. The blob goes to the private repository.
-fn hash_filtered(
+/// A scratch directory holding the `.gitattributes` files of the capture, as
+/// captured: attributes are read from here and not from the original's
+/// working tree, which may have moved since.
+struct AttrTree {
+    dir: PathBuf,
+}
+
+impl AttrTree {
+    fn new(store: &ObjectStore, entries: &[FileEntry]) -> Result<Self> {
+        let dir = store::tmp_name(&store.tmp_dir(), "attrs");
+        std::fs::create_dir_all(&dir)?;
+        let tree = AttrTree { dir };
+        for e in entries {
+            let name = &e.path.0;
+            let is_attrs = name.ends_with(b".gitattributes")
+                && (name.len() == 14 || name[name.len() - 15] == b'/');
+            if !is_attrs || e.mode == 0o120000 {
+                continue;
+            }
+            let target = tree.dir.join(e.path.to_path());
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, store.read(&e.hash)?)?;
+        }
+        Ok(tree)
+    }
+}
+
+impl Drop for AttrTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The value of each of `names` for each of `paths`, by the attributes of the
+/// capture: `(path, attribute, value)`.
+fn check_attr(
+    ctx: &ExecContext,
+    git_dir: &Path,
+    attrs: &AttrTree,
+    cfg: &[OsString],
+    names: &[&str],
+    paths: &[&RelPath],
+) -> Result<Vec<(RelPath, String, String)>> {
+    if paths.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut input = vec![];
+    for p in paths {
+        input.extend_from_slice(&p.0);
+        input.push(0);
+    }
+    let mut args: Vec<OsString> = vec![
+        "--git-dir".into(),
+        git_dir.into(),
+        "--work-tree".into(),
+        attrs.dir.clone().into(),
+    ];
+    args.extend(cfg.iter().cloned());
+    args.extend(["check-attr", "-z", "--stdin"].map(OsString::from));
+    args.extend(names.iter().map(OsString::from));
+    let out = git_run_os(ctx, Some(&attrs.dir), &args, &[], Some(input))?;
+    let fields: Vec<&[u8]> = out.split(|&c| c == 0).collect();
+    Ok(fields
+        .chunks(3)
+        .filter(|r| r.len() == 3)
+        .map(|r| {
+            (
+                RelPath(r[0].to_vec()),
+                String::from_utf8_lossy(r[1]).into_owned(),
+                String::from_utf8_lossy(r[2]).into_owned(),
+            )
+        })
+        .collect())
+}
+
+/// The settings that made the blobs, for a worker to repeat.
+fn canonical_config(
     ctx: &ExecContext,
     root: &Path,
     git_dir: &Path,
+    cfg: &[OsString],
+    attrs: &AttrTree,
+    entries: &[FileEntry],
+) -> Result<CanonicalConfig> {
+    let get = |k: &str| {
+        og_str(ctx, root, &["config", "--get", k])
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let mut rules = vec![];
+    if let Some(g) = global_attributes_path(ctx, root) {
+        rules.extend(std::fs::read(g).unwrap_or_default());
+    }
+    if let Ok(info) = std::fs::read(git_dir.join("info/attributes")) {
+        if !rules.is_empty() && !rules.ends_with(b"\n") {
+            rules.push(b'\n');
+        }
+        rules.extend(info);
+    }
+    let paths: Vec<&RelPath> = entries.iter().map(|e| &e.path).collect();
+    let used: BTreeSet<String> = check_attr(ctx, git_dir, attrs, cfg, &["filter"], &paths)?
+        .into_iter()
+        .map(|(_, _, v)| v)
+        .filter(|v| !matches!(v.as_str(), "unspecified" | "unset" | "set"))
+        .collect();
+    let mut defs: BTreeMap<String, FilterDef> = BTreeMap::new();
+    if !used.is_empty() {
+        let out = og(
+            ctx,
+            root,
+            &["config", "-z", "--get-regexp", r"^filter\..*\.[^.]+$"],
+        )
+        .unwrap_or_default();
+        for rec in out.split(|&c| c == 0).filter(|r| !r.is_empty()) {
+            let text = String::from_utf8_lossy(rec).into_owned();
+            let (key, val) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+            let Some((name, var)) = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if !used.contains(name) {
+                continue;
+            }
+            let d = defs.entry(name.to_string()).or_insert_with(|| FilterDef {
+                name: name.to_string(),
+                clean: None,
+                smudge: None,
+                process: None,
+                required: None,
+            });
+            let v = Some(val.to_string());
+            match var {
+                "clean" => d.clean = v,
+                "smudge" => d.smudge = v,
+                "process" => d.process = v,
+                "required" => d.required = v,
+                _ => {}
+            }
+        }
+    }
+    Ok(CanonicalConfig {
+        autocrlf: get("core.autocrlf"),
+        eol: get("core.eol"),
+        safecrlf: get("core.safecrlf"),
+        attributes: store::hex(&rules),
+        filters: defs.into_values().collect(),
+    })
+}
+
+/// Hash `content` as Git would when adding the file `path` of the original:
+/// attributes from the capture (the `.gitattributes` files it holds, the
+/// original's `info/attributes` in the private repository), filters and line
+/// endings from the original's config. The blob goes to the private
+/// repository.
+fn hash_filtered(
+    ctx: &ExecContext,
+    git_dir: &Path,
+    attrs: &AttrTree,
     cfg: &[OsString],
     path: &RelPath,
     content: Vec<u8>,
@@ -968,14 +1169,14 @@ fn hash_filtered(
         "--git-dir".into(),
         git_dir.into(),
         "--work-tree".into(),
-        root.into(),
+        attrs.dir.clone().into(),
     ];
     args.extend(cfg.iter().cloned());
     args.extend(["hash-object", "-w", "--stdin"].map(OsString::from));
     args.push(OsString::from_vec(
         [b"--path=".as_slice(), &path.0].concat(),
     ));
-    let out = git_run_os(ctx, Some(root), &args, &[], Some(content))
+    let out = git_run_os(ctx, Some(&attrs.dir), &args, &[], Some(content))
         .with_context(|| format!("cannot hash {}", path.display()))?;
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
@@ -997,24 +1198,21 @@ fn hash_plain(ctx: &ExecContext, git_dir: &Path, content: Vec<u8>) -> Result<Str
 fn untouched_paths(
     ctx: &ExecContext,
     root: &Path,
+    git_dir: &Path,
+    attrs: &AttrTree,
+    cfg: &[OsString],
     paths: &[&RelPath],
 ) -> Result<BTreeSet<RelPath>> {
     let autocrlf = og_str(ctx, root, &["config", "--get", "core.autocrlf"]).unwrap_or_default();
     if !(autocrlf.is_empty() || autocrlf == "false") || paths.is_empty() {
         return Ok(BTreeSet::new());
     }
-    let mut input = vec![];
-    for p in paths {
-        input.extend_from_slice(&p.0);
-        input.push(0);
-    }
-    let out = og_with_stdin(
+    let found = check_attr(
         ctx,
-        root,
+        git_dir,
+        attrs,
+        cfg,
         &[
-            "check-attr",
-            "-z",
-            "--stdin",
             "text",
             "eol",
             "filter",
@@ -1022,30 +1220,18 @@ fn untouched_paths(
             "working-tree-encoding",
             "crlf",
         ],
-        input,
+        paths,
     )?;
-    let fields: Vec<&[u8]> = out.split(|&c| c == 0).collect();
-    let mut touched = BTreeSet::new();
-    for rec in fields.chunks(3) {
-        if rec.len() == 3 && rec[2] != b"unspecified" {
-            touched.insert(RelPath(rec[0].to_vec()));
-        }
-    }
+    let touched: BTreeSet<RelPath> = found
+        .into_iter()
+        .filter(|(_, _, v)| v != "unspecified")
+        .map(|(p, _, _)| p)
+        .collect();
     Ok(paths
         .iter()
         .filter(|p| !touched.contains(**p))
         .map(|p| (*p).clone())
         .collect())
-}
-
-fn og_with_stdin(ctx: &ExecContext, root: &Path, args: &[&str], stdin: Vec<u8>) -> Result<Vec<u8>> {
-    git_run(
-        ctx,
-        &["-C".into(), root.into()],
-        args,
-        &[("GIT_OPTIONAL_LOCKS", OsStr::new("0"))],
-        Some(stdin),
-    )
 }
 
 /// Make sure the blobs `shas` of the original are in the private repository
@@ -1095,6 +1281,8 @@ fn blob_ids(
     entries: &[FileEntry],
     tracked: &[(u32, String, RelPath)],
     lfs: &[LfsRef],
+    attrs: &AttrTree,
+    cfg: &[OsString],
 ) -> Result<Vec<String>> {
     let lfs_by: HashMap<&RelPath, &LfsRef> = lfs.iter().map(|l| (&l.path, l)).collect();
     let index: HashMap<&RelPath, &str> = tracked
@@ -1102,10 +1290,19 @@ fn blob_ids(
         .filter(|t| t.0 == 0o100644 || t.0 == 0o100755)
         .map(|t| (&t.2, t.1.as_str()))
         .collect();
-    let changed: BTreeSet<RelPath> = split_z(&og(ctx, root, &["diff-files", "--name-only", "-z"])?)
-        .into_iter()
-        .map(|p| RelPath(p.to_vec()))
-        .collect();
+    let mut changed: BTreeSet<RelPath> =
+        split_z(&og(ctx, root, &["diff-files", "--name-only", "-z"])?)
+            .into_iter()
+            .map(|p| RelPath(p.to_vec()))
+            .collect();
+    // skip-worktree and assume-unchanged paths are never compared against the
+    // index, so a working file that differs from it is not reported: hash them
+    let listing = og(ctx, root, &["ls-files", "-v", "-z"])?;
+    for rec in split_z(&listing) {
+        if rec.len() > 2 && (rec[0] == b'S' || rec[0].is_ascii_lowercase()) {
+            changed.insert(RelPath(rec[2..].to_vec()));
+        }
+    }
 
     let mut shas: Vec<Option<String>> = vec![None; entries.len()];
     let mut from_index: Vec<String> = vec![];
@@ -1125,6 +1322,9 @@ fn blob_ids(
     let untouched = untouched_paths(
         ctx,
         root,
+        git_dir,
+        attrs,
+        cfg,
         &need_attrs
             .iter()
             .map(|&i| &entries[i].path)
@@ -1142,7 +1342,6 @@ fn blob_ids(
     raw.dedup();
     let raw_ids = write_blobs(ctx, store, git_dir, &raw)?;
 
-    let cfg = filter_config(ctx, root);
     for (i, e) in entries.iter().enumerate() {
         if shas[i].is_some() {
             continue;
@@ -1154,7 +1353,7 @@ fn blob_ids(
         } else if untouched.contains(&e.path) {
             raw_ids[&e.hash].clone()
         } else {
-            hash_filtered(ctx, root, git_dir, &cfg, &e.path, store.read(&e.hash)?)?
+            hash_filtered(ctx, git_dir, attrs, cfg, &e.path, store.read(&e.hash)?)?
         });
     }
     let from_index: Vec<&str> = from_index.iter().map(String::as_str).collect();
@@ -1352,6 +1551,7 @@ fn capture_worktree(
     let cwd = std::fs::canonicalize(repo_dir)?;
     let cwd_relative = RelPath::new(cwd.strip_prefix(&root).unwrap_or(Path::new("")));
     let o = build_opts(opts)?;
+    check_supported(ctx, &root)?;
     let repo_id = repository_id(ctx, &root)?;
     let git_dir = private_repo(ctx, store, &root, &repo_id)?;
 
@@ -1494,6 +1694,8 @@ fn finish(
         .map(|(s, g)| (s.path.clone(), g.clone()))
         .collect();
     import_history(ctx, git_dir, root, &head)?;
+    let cfg = filter_config(ctx, root);
+    let attrs = AttrTree::new(store, &p.read.entries)?;
     let shas = blob_ids(
         ctx,
         store,
@@ -1502,7 +1704,10 @@ fn finish(
         &p.read.entries,
         &p.sel.meta.tracked,
         &p.lfs,
+        &attrs,
+        &cfg,
     )?;
+    let canonical = canonical_config(ctx, root, git_dir, &cfg, &attrs, &p.read.entries)?;
     let worktree_tree = build_tree(ctx, store, git_dir, &p.read.entries, &shas, &gitlinks)?;
     let commit = synthetic_commit(ctx, git_dir, &worktree_tree, &head)?;
     let itree = index_tree(ctx, store, root, git_dir, &p.sel.index_bytes)?;
@@ -1573,6 +1778,7 @@ fn finish(
         },
         submodules,
         lfs,
+        canonical,
         secret_files,
     });
     pg(
@@ -1651,6 +1857,7 @@ pub fn capture_directory(
                     },
                     submodules: vec![],
                     lfs,
+                    canonical: CanonicalConfig::default(),
                     secret_files: vec![],
                 });
                 opts.call(Stage::BeforePublish)?;

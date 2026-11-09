@@ -188,12 +188,99 @@ pub fn add_worktree(
     let Some(commit) = &m.execution_commit else {
         bail!("{} has no execution commit", m.source_id);
     };
+    check_filters(ctx, &m.canonical)?;
     crate::git::add_worktree_no_checkout(ctx, repo, path, commit)?;
+    apply_canonical(ctx, repo, path, &m.canonical)?;
     materialize_from(store, m, path)?;
     crate::git::git(ctx, path, &["read-tree", "HEAD"])?;
-    // stat data for the index, so `git status` does not hash every file; a
-    // filter that cannot run here only makes it do so
-    let _ = crate::git::git(ctx, path, &["update-index", "-q", "--refresh"]);
+    // stat data for the index, so `git status` does not hash every file
+    crate::git::git(ctx, path, &["update-index", "-q", "--refresh"])?;
+    // and what `git status` will say: the commit and the bytes must agree
+    let pre = ["-C".into(), path.into()];
+    let diff = super::capture::git_run(ctx, &pre, &["diff-files", "--name-only", "-z"], &[], None)?;
+    let paths: Vec<String> = diff
+        .split(|&c| c == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    if !paths.is_empty() {
+        return Err(SourceError::WorkspaceNotClean { paths }.into());
+    }
+    Ok(())
+}
+
+/// The program a filter command line starts with, skipping `VAR=value`
+/// prefixes.
+fn program_of(cmd: &str) -> Option<&str> {
+    cmd.split(|c: char| c.is_whitespace() || ";|&()<>".contains(c))
+        .find(|t| !t.is_empty() && !t.contains('='))
+}
+
+/// Every filter the capture ran needs its program here: without it Git passes
+/// the bytes through, and they would not hash to the blobs of the commit.
+fn check_filters(ctx: &ExecContext, c: &CanonicalConfig) -> Result<()> {
+    for f in &c.filters {
+        // `process` takes the place of `clean` when it is set
+        let Some(cmd) = f.process.as_ref().or(f.clean.as_ref()) else {
+            continue;
+        };
+        let Some(prog) = program_of(cmd) else {
+            continue;
+        };
+        let found = ctx
+            .command("sh")
+            .args(["-c", "command -v -- \"$1\" >/dev/null 2>&1", "sh", prog])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !found {
+            return Err(SourceError::FilterMissing {
+                filter: f.name.clone(),
+                command: prog.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Repeat the settings that made the blobs in the worktree at `path`, and in
+/// nothing else: they go to the worktree's own config (which needs
+/// `extensions.worktreeConfig`, the one thing written to the shared config)
+/// and to an attributes file in the worktree's own Git directory.
+fn apply_canonical(ctx: &ExecContext, repo: &Path, path: &Path, c: &CanonicalConfig) -> Result<()> {
+    use crate::git::git;
+    crate::git::enable_worktree_config(ctx, repo)?;
+    let set = |k: &str, v: &str| git(ctx, path, &["config", "--worktree", k, v]).map(|_| ());
+    // an unset value is a default, and the worker's own setting must not win
+    set("core.autocrlf", c.autocrlf.as_deref().unwrap_or("false"))?;
+    set("core.eol", c.eol.as_deref().unwrap_or("native"))?;
+    if let Some(v) = &c.safecrlf {
+        set("core.safecrlf", v)?;
+    }
+    let git_dir = git(
+        ctx,
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+    let file = Path::new(git_dir.trim()).join("local-ci-attributes");
+    let rules = super::store::unhex(&c.attributes).ok_or_else(|| SourceError::Corrupt {
+        what: "the attribute rules of the manifest are not hex".into(),
+    })?;
+    std::fs::write(&file, rules)?;
+    set("core.attributesFile", &file.to_string_lossy())?;
+    for f in &c.filters {
+        for (var, v) in [
+            ("clean", &f.clean),
+            ("smudge", &f.smudge),
+            ("process", &f.process),
+            ("required", &f.required),
+        ] {
+            if let Some(v) = v {
+                set(&format!("filter.{}.{var}", f.name), v)?;
+            }
+        }
+    }
     Ok(())
 }
 

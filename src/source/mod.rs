@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Bumped when the shape of a [`SourceManifest`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A `secret_files` capture needs a key of at least this many bytes: an empty
 /// or short key makes the recorded HMACs a guessable fingerprint of the file.
@@ -117,6 +117,35 @@ pub struct SecretEntry {
     pub hmac: String,
 }
 
+/// A Git filter the capture ran (`filter.<name>.*` of the original). A worker
+/// that has to make the same blobs out of the same bytes needs the same
+/// definition, whatever its own configuration says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterDef {
+    pub name: String,
+    pub clean: Option<String>,
+    pub smudge: Option<String>,
+    pub process: Option<String>,
+    pub required: Option<String>,
+}
+
+/// What turned the captured bytes into Git's blobs: the settings of the
+/// original that decide the canonical form. A worker applies them to its
+/// worktree (and to nothing else), so `git status` there agrees with the
+/// commit about which files are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalConfig {
+    pub autocrlf: Option<String>,
+    pub eol: Option<String>,
+    pub safecrlf: Option<String>,
+    /// Hex of the attribute rules that are not in the tree: the global
+    /// attributes file, then `.git/info/attributes` (empty when there are
+    /// none). The `.gitattributes` files are in the captured entries.
+    pub attributes: String,
+    /// The filters the captured paths go through, sorted by name.
+    pub filters: Vec<FilterDef>,
+}
+
 /// The input of a run (spec chapter 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceManifest {
@@ -147,6 +176,8 @@ pub struct SourceManifest {
     pub object_manifest: ObjectManifest,
     pub submodules: Vec<SubmoduleRef>,
     pub lfs: Vec<LfsRef>,
+    /// How the captured bytes became Git's blobs.
+    pub canonical: CanonicalConfig,
     /// Sorted by path.
     pub secret_files: Vec<SecretEntry>,
 }
@@ -256,6 +287,17 @@ pub enum SourceError {
     Corrupt { what: String },
     /// `secret_files` is declared with a key that is empty or too short.
     SecretKeyTooShort { len: usize },
+    /// A shallow clone: its history is not all there to copy.
+    ShallowClone,
+    /// A repository that does not use SHA-1 object names.
+    UnsupportedObjectFormat { format: String },
+    /// The worker has no program for a filter the capture ran, so it cannot
+    /// make the blobs of the commit out of the captured bytes. A scheduler
+    /// can leave this worker out.
+    FilterMissing { filter: String, command: String },
+    /// After the captured settings were applied, Git in the workspace still
+    /// sees these paths as different from the commit.
+    WorkspaceNotClean { paths: Vec<String> },
 }
 
 impl fmt::Display for SourceError {
@@ -287,6 +329,24 @@ impl fmt::Display for SourceError {
             SourceError::SecretKeyTooShort { len } => write!(
                 f,
                 "secret_files needs a secret key of at least {MIN_SECRET_KEY} bytes (got {len})"
+            ),
+            SourceError::ShallowClone => write!(
+                f,
+                "shallow clones are not supported: run `git fetch --unshallow` and capture again"
+            ),
+            SourceError::UnsupportedObjectFormat { format } => write!(
+                f,
+                "object format {format} is not supported (only sha1)"
+            ),
+            SourceError::FilterMissing { filter, command } => write!(
+                f,
+                "this worker has no {filter} filter program ({command:?}): the captured files cannot be made into the commit's blobs here"
+            ),
+            SourceError::WorkspaceNotClean { paths } => write!(
+                f,
+                "the workspace differs from the commit for {} path(s) after applying the captured settings: {}",
+                paths.len(),
+                paths.join(", ")
             ),
         }
     }

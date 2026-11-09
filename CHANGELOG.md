@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Library: `source::capture_source` fixes the input of a run (staged and
+  unstaged changes, untracked files, deletions, modes, symlinks, submodules,
+  LFS payloads) in a private content-addressed store and describes it in a
+  `SourceManifest` (schema 2). The synthetic commit holds Git's canonical
+  blobs, so a clean repository has the tree of `HEAD`; a worker writes the raw
+  bytes into a `--no-checkout` worktree (`source::add_worktree`) after
+  repeating, in that worktree only, the settings the manifest records
+  (`core.autocrlf` / `eol` / `safecrlf`, `info/attributes`, the filters in
+  use), and fails with a typed `SourceError` when it lacks a filter program
+  (`FilterMissing`) or Git still sees a change (`WorkspaceNotClean`). A
+  shallow clone and a SHA-256 repository are refused up front. Skip-worktree
+  and assume-unchanged files are hashed from the disk, and attributes come from
+  the captured `.gitattributes` files, not from the original's working tree.
+  The first capture copies the history of `HEAD` into the private repository.
 - Library: planning and executing are separate. `build_frozen_plan` returns a
   `FrozenPlan` (serde, schema version and sha256 digest, no host paths) and
   `execute_plan` runs it in a given `Workspace`; `run` composes them with the

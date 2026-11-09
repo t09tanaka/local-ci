@@ -233,6 +233,23 @@ pub fn add_worktree_no_checkout(
     add_worktree_with(ctx, repo, path, sha, false)
 }
 
+/// Let worktrees of `repo` have a config of their own (`git config
+/// --worktree`). The switch is in the shared config, so it is written under
+/// the same lock as worktree adds, and only when it is not on yet.
+pub fn enable_worktree_config(ctx: &ExecContext, repo: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        let on = git_ok(
+            ctx,
+            repo,
+            &["config", "--type=bool", "extensions.worktreeConfig"],
+        );
+        if on.as_deref() != Some("true") {
+            git(ctx, repo, &["config", "extensions.worktreeConfig", "true"])?;
+        }
+        Ok(())
+    })
+}
+
 fn add_worktree_with(
     ctx: &ExecContext,
     repo: &Path,
