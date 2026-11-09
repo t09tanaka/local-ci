@@ -42,10 +42,22 @@
   persistent scope, freshness, secret digests) says when prepared work may be
   reused, and `TemplateStore` keeps finished templates read-only and hands out
   copies. git, cp, portool and the version probes now start with the context's
-  environment too. A local run is unchanged except that setup goes through
-  canirun when it is installed, a step that writes `GITHUB_ENV`/`GITHUB_PATH`
-  or builds a Python venv (`pip install` included) is no longer hoisted, and
-  setup uses the step's resolved shell instead of the step's own only.
+  environment too. A receipt is believed only in the workspace it was made in
+  (`execute_setup` puts an id in `.local-ci/workspace-id`; a copy carries it),
+  for the same commit and under the template key the task's recipe has with
+  the `TemplateContext` given to `execute_task`; otherwise the task does its
+  setup itself and `TaskResult::receipt_ignored` says why. A local run changes
+  as follows: setup goes through canirun when it is installed; a step that
+  writes `GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_OUTPUT`/`GITHUB_STATE`, builds a
+  Python venv (`pip install` included), has an env that depends on
+  `needs`/`matrix`/`steps`, or runs with a shell local-ci cannot start
+  (`defaults.run.shell: pwsh`) is no longer hoisted and runs in its job (the
+  steps after it in that job stay too); an install that two jobs run in one
+  directory with another env or shell is not hoisted either, so each job gets
+  the result of its own install; setup uses the resolved shell and env
+  (workflow, job, step) instead of the step's own only; a step that comes up
+  again after others in a job runs again. `local-ci plan` lists the setup it
+  could not work out instead of leaving it out.
 
 ## 0.7.0
 

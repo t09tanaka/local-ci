@@ -607,6 +607,7 @@ fn spawn_quiet(mut cmd: Command) -> std::io::Result<std::process::Child> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests build their own commands
 mod tests {
     use super::*;
 

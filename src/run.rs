@@ -468,7 +468,7 @@ pub fn execute_plan(
                 .or_insert_with(|| done.receipt.restricted_to(recipe, &key));
             receipts.insert(task.clone(), r.clone());
         }
-        runner.set_receipts(receipts);
+        runner.set_receipts(receipts, tctx);
         let setup = done.steps;
         let units = if ok && !ctx.cancel.is_cancelled() {
             runner.run_units()

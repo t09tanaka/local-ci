@@ -39,7 +39,14 @@ pub struct Unit {
 pub struct StepKey {
     pub wd: String,
     pub run: String,
+    /// The shell the step runs with (step, else job, else workflow); `None`
+    /// is the default, bash.
+    pub shell: Option<String>,
+    /// The workflow, job and step `env:` put together, sorted by name, without
+    /// the values that are expressions.
     pub env: Vec<(String, String)>,
+    /// The `env:` entries whose value is an expression evaluated at run time.
+    pub open_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,11 +90,50 @@ pub fn step_dir(w: &Workflow, j: &Job, s: &Step) -> String {
     norm_dir(d.map(String::as_str).unwrap_or(""))
 }
 
+/// The shell `s` runs with: its own, else the job's, else the workflow's.
+pub fn resolved_shell(w: &Workflow, j: &Job, s: &Step) -> Option<String> {
+    s.shell
+        .clone()
+        .or_else(|| j.shell.clone())
+        .or_else(|| w.shell.clone())
+}
+
+/// Whether [`crate::exec`] can run a script with `shell` (`None` is bash).
+pub(crate) fn shell_supported(shell: Option<&str>) -> bool {
+    match shell.map(str::trim) {
+        None | Some("bash") | Some("sh") | Some("python") => true,
+        Some(custom) => custom.contains("{0}"),
+    }
+}
+
+type EnvPairs = Vec<(String, String)>;
+
+/// The `env:` of workflow, job and step put together (the step wins), as
+/// (values known now, values that are expressions), each sorted by name.
+pub fn effective_env(w: &Workflow, j: &Job, s: &Step) -> (EnvPairs, EnvPairs) {
+    let mut all: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for (k, v) in w.env.iter().chain(j.env.iter()).chain(s.env.iter()) {
+        all.insert(k, v);
+    }
+    let (mut env, mut open) = (vec![], vec![]);
+    for (k, v) in all {
+        if v.contains("${{") {
+            open.push((k.to_string(), v.to_string()));
+        } else {
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
+    (env, open)
+}
+
 pub fn step_key(w: &Workflow, j: &Job, s: &Step) -> Option<StepKey> {
+    let (env, open_env) = effective_env(w, j, s);
     Some(StepKey {
         wd: step_dir(w, j, s),
         run: s.run.as_ref()?.trim().to_string(),
-        env: s.env.clone(),
+        shell: resolved_shell(w, j, s),
+        env,
+        open_env,
     })
 }
 
@@ -268,6 +314,12 @@ pub enum StayReason {
     EnvFileEffect,
     /// It makes an environment tied to an absolute path (a Python venv).
     AbsolutePath,
+    /// It runs with a shell local-ci cannot start (`pwsh`, ...).
+    UnsupportedShell,
+    /// Another job installs the same thing in the same directory with another
+    /// shell or env; one workspace cannot hold both, so each job installs for
+    /// itself.
+    ConflictingInstall,
 }
 
 impl StayReason {
@@ -279,6 +331,10 @@ impl StayReason {
             StayReason::ServiceDependent => "may need the job's services",
             StayReason::EnvFileEffect => "writes GITHUB_ENV, GITHUB_PATH or a step output",
             StayReason::AbsolutePath => "builds an environment tied to an absolute path",
+            StayReason::UnsupportedShell => "runs with a shell local-ci does not support",
+            StayReason::ConflictingInstall => {
+                "another job installs the same thing here with another shell or env"
+            }
         }
     }
 }
@@ -291,8 +347,10 @@ fn env_file_re() -> &'static Regex {
 fn absolute_env_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
+        // `venv` and friends only as the command being run (or `python -m
+        // venv`), so `npm run lint:venv` is not taken for one.
         Regex::new(
-            r"\b(venv|virtualenv|pipenv|conda)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\b",
+            r"(?m)(?:^|[;&|(])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:virtualenv|pipenv|conda)(?:\s|$)|\bpython3?\s+-m\s+(?:venv|virtualenv)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\b",
         )
         .unwrap()
     })
@@ -326,6 +384,9 @@ pub(crate) fn stay_reason(w: &Workflow, j: &Job, s: &Step) -> Option<StayReason>
     }
     if absolute_env_re().is_match(run) {
         return Some(StayReason::AbsolutePath);
+    }
+    if !shell_supported(resolved_shell(w, j, s).as_deref()) {
+        return Some(StayReason::UnsupportedShell);
     }
     if !j.services.is_empty() && (!is_installer(run) || mentions_service_port(j, run)) {
         // anything but an install may need the job's database
@@ -480,11 +541,27 @@ pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
     plan
 }
 
+/// Which leading steps of the jobs of a plan count as setup.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Hoist {
+    pub keys: BTreeSet<StepKey>,
+    /// Installs that would have been setup but that jobs run with different
+    /// shells or env in one directory; they stay in their jobs.
+    pub conflicting: BTreeSet<StepKey>,
+}
+
+#[cfg(test)]
+pub(crate) fn hoisted_keys(plan: &Plan) -> BTreeSet<StepKey> {
+    hoist(plan).keys
+}
+
 /// The steps that count as setup: from the common head of the jobs, those
 /// that are installs, or that several jobs repeat word for word, as long as
-/// everything before them in each of those jobs is also setup. Worked out from
-/// the plan alone, so it is the same wherever it is asked.
-pub(crate) fn hoisted_keys(plan: &Plan) -> BTreeSet<StepKey> {
+/// everything before them in each of those jobs is also setup. An install that
+/// two jobs run in one directory under different shells or env is not setup
+/// (one workspace cannot hold both results). Worked out from the plan alone, so
+/// it is the same wherever it is asked.
+pub(crate) fn hoist(plan: &Plan) -> Hoist {
     let mut prefixes: Vec<Vec<StepKey>> = Vec::new();
     for u in &plan.units {
         let w = &plan.selected[u.wf].wf;
@@ -508,6 +585,30 @@ pub(crate) fn hoisted_keys(plan: &Plan) -> BTreeSet<StepKey> {
         .filter(|(k, c)| **c >= 2 || is_installer(&k.run))
         .map(|(k, _)| (*k).clone())
         .collect();
+    // one install of a kind per directory: two ways of doing it conflict
+    type Way<'a> = (&'a Option<String>, &'a EnvPairs, &'a EnvPairs);
+    let mut ways: HashMap<(&str, String), BTreeSet<Way>> = HashMap::new();
+    for k in &hoisted {
+        if let Some(family) = install_family(&k.run) {
+            ways.entry((k.wd.as_str(), family)).or_default().insert((
+                &k.shell,
+                &k.env,
+                &k.open_env,
+            ));
+        }
+    }
+    let conflicting: BTreeSet<StepKey> = hoisted
+        .iter()
+        .filter(|k| {
+            install_family(&k.run)
+                .and_then(|f| ways.get(&(k.wd.as_str(), f)))
+                .is_some_and(|w| w.len() > 1)
+        })
+        .cloned()
+        .collect();
+    for k in &conflicting {
+        hoisted.remove(k);
+    }
     loop {
         let mut drop = BTreeSet::new();
         for p in &prefixes {
@@ -527,7 +628,10 @@ pub(crate) fn hoisted_keys(plan: &Plan) -> BTreeSet<StepKey> {
             hoisted.remove(&k);
         }
     }
-    hoisted
+    Hoist {
+        keys: hoisted,
+        conflicting,
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +828,54 @@ jobs:
                 (vec!["lint".to_string()], false)
             ]
         );
+    }
+
+    #[test]
+    fn a_venv_is_told_by_the_command_not_by_a_name() {
+        let tied = |r: &str| absolute_env_re().is_match(r);
+        for r in [
+            "python3 -m venv .venv",
+            "python -m virtualenv env",
+            "virtualenv env",
+            "pipenv install",
+            "conda create -n x",
+            "cd api && conda install y",
+            "FOO=1 pipenv sync",
+            "pip install -r requirements.txt",
+            "python3 -m pip install x",
+        ] {
+            assert!(tied(r), "{r}");
+        }
+        for r in [
+            "npm run lint:venv",
+            "my-venv-tool --check",
+            "./scripts/venv-report.sh",
+            "echo conda-forge",
+            "npm ci",
+        ] {
+            assert!(!tied(r), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_shell_local_ci_cannot_start_keeps_a_step_out_of_setup() {
+        let wf = "on: pull_request\ndefaults:\n  run:\n    shell: pwsh\njobs:\n  a:\n    steps:\n      - run: npm ci\n";
+        let w = parse("x.yml", wf).unwrap();
+        let j = &w.jobs[0];
+        assert_eq!(
+            stay_reason(&w, j, &j.steps[0]),
+            Some(StayReason::UnsupportedShell)
+        );
+        for ok in [
+            None,
+            Some("bash"),
+            Some("sh"),
+            Some("python"),
+            Some("perl {0}"),
+        ] {
+            assert!(shell_supported(ok), "{ok:?}");
+        }
+        assert!(!shell_supported(Some("pwsh")));
     }
 
     #[test]

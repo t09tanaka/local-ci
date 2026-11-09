@@ -10,7 +10,7 @@ use crate::context::ExecContext;
 use crate::dag::{JobNode, NodeKind};
 use crate::exec::{JobResult, Opts, Outcome, Runner, Workspace};
 use crate::frozen::FrozenPlan;
-use crate::setup::{PreparedReceipt, PreparedSetup, SetupRecipe, TemplateKey};
+use crate::setup::{PreparedReceipt, PreparedSetup, SetupRecipe, TemplateContext, TemplateKey};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -101,6 +101,10 @@ pub struct TaskResult {
     /// Each job of the task as a whole, in the order they ran. For a task that
     /// is one variant of a matrix: that variant.
     pub outcomes: Vec<JobOutcome>,
+    /// Why the receipt that came with the task was not believed (another
+    /// commit, another workspace, another template key); the task then did all
+    /// its setup itself. `None` when there was no receipt or it was used.
+    pub receipt_ignored: Option<String>,
 }
 
 /// One job, or one matrix entry of it, from its result and outputs.
@@ -213,8 +217,12 @@ pub fn execute_setup(
 ///
 /// The workspace is a checkout of the planned commit. `prepared` says which
 /// install steps of the task were done in it already (see [`execute_setup`]);
-/// those are skipped and every other one is run by the task. With `None` the
-/// task prepares everything itself. The workspace is left for the caller to
+/// those are skipped and every other one is run by the task. The receipt is
+/// believed only when it was made on this commit, in this very workspace
+/// (its id is in the workspace) and under the template key the task's recipe
+/// has with the given [`TemplateContext`]; otherwise it is ignored, the task
+/// does all its setup itself, and `receipt_ignored` of the result says why.
+/// With `None` the task prepares everything itself. The workspace is left for the caller to
 /// remove.
 /// Containers the task started are gone when this returns.
 ///
@@ -226,7 +234,7 @@ pub fn execute_task(
     fp: &FrozenPlan,
     task_id: &str,
     inputs: &TaskInputs,
-    prepared: Option<&PreparedReceipt>,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
     ws: &Workspace,
     opts: Opts,
 ) -> Result<TaskResult> {

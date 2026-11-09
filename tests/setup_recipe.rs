@@ -5,8 +5,8 @@
 
 use local_ci::exec::{Opts, Outcome, Workspace};
 use local_ci::setup::{
-    derive_setup_recipe, Freshness, PreparedHow, PreparedReceipt, PreparedStep, RecipeStep,
-    ReuseScope, SecretDigest, SetupRecipe, TemplateContext,
+    derive_setup_recipe, Freshness, PreparedReceipt, RecipeStep, ReuseScope, SecretDigest,
+    SetupRecipe, TemplateContext,
 };
 use local_ci::template::TemplateStore;
 use local_ci::{ExecContext, FrozenPlan, Quiet, Target, TaskInputs, TaskResult};
@@ -73,14 +73,21 @@ const INSTALL: &str = "echo installed > installed.marker\n";
 
 /// A repository whose one workflow is `jobs`, with the install scripts.
 fn lab(jobs: &str) -> (tempfile::TempDir, PathBuf, FrozenPlan) {
+    lab_files(&[(F, format!("name: ci\non: pull_request\njobs:\n{jobs}"))])
+}
+
+/// A repository with these workflow files (path, text), and the install scripts.
+fn lab_files(files: &[(&str, String)]) -> (tempfile::TempDir, PathBuf, FrozenPlan) {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
-    std::fs::write(
-        dir.join(F),
-        format!("name: ci\non: pull_request\njobs:\n{jobs}"),
-    )
-    .unwrap();
+    for (path, text) in files {
+        std::fs::write(dir.join(path), text).unwrap();
+    }
+    for d in ["d1", "d2"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+        std::fs::write(dir.join(d).join(".keep"), "").unwrap();
+    }
     std::fs::write(dir.join("install.sh"), INSTALL).unwrap();
     std::fs::write(dir.join("install2.sh"), "echo two > two.marker\n").unwrap();
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
@@ -146,18 +153,32 @@ impl<'a> Place<'a> {
         }
     }
 
+    fn tctx(&self) -> TemplateContext {
+        TemplateContext::local(self.fp, "run-1")
+    }
+
     fn setup(&self, ws: &Workspace, recipe: &SetupRecipe) -> local_ci::setup::PreparedSetup {
-        let key = recipe.template_key(&TemplateContext::local(self.fp, "run-1"));
+        let key = recipe.template_key(&self.tctx());
         local_ci::execute_setup(&ctx(self.home), self.fp, recipe, &key, ws, self.opts()).unwrap()
     }
 
     fn task(&self, ws: &Workspace, task: &str, prepared: Option<&PreparedReceipt>) -> TaskResult {
+        self.task_in(ws, task, prepared, &self.tctx())
+    }
+
+    fn task_in(
+        &self,
+        ws: &Workspace,
+        task: &str,
+        prepared: Option<&PreparedReceipt>,
+        tctx: &TemplateContext,
+    ) -> TaskResult {
         local_ci::execute_task(
             &ctx(self.home),
             self.fp,
             task,
             &TaskInputs::default(),
-            prepared,
+            prepared.map(|r| (r, tctx)),
             ws,
             self.opts(),
         )
@@ -261,7 +282,7 @@ fn a_job_that_stays_in_place_still_runs_the_step_itself() {
 // ---- A15 ----
 
 #[test]
-fn a15_a_consumer_in_another_workspace_still_gets_its_install() {
+fn a15_a_receipt_is_believed_only_in_the_workspace_it_was_made_in() {
     let (tmp, dir, fp) = lab(TWO_JOBS);
     let place = Place::new(&tmp, &dir, &fp);
     let recipe_a = derive_setup_recipe(&fp, &id("a")).unwrap();
@@ -272,22 +293,88 @@ fn a15_a_consumer_in_another_workspace_still_gets_its_install() {
     assert!(done.ok());
     assert!(ws_a.root.join("installed.marker").is_file());
     assert_eq!(done.receipt.steps.len(), 1);
+    assert_eq!(
+        done.receipt.workspace,
+        local_ci::setup::workspace_id(&ws_a.root).unwrap()
+    );
+
+    // in that workspace the receipt is believed
+    let r = place.task(&ws_a, &id("a"), Some(&done.receipt));
+    assert_eq!(r.receipt_ignored, None);
+    assert_eq!(r.jobs[0].steps[0].outcome, skipped_setup());
 
     // job `b` runs somewhere else, in a checkout the install never reached.
-    // Without a receipt it does its own install, so nothing is missing.
+    // The receipt of the other workspace is ignored: it does its own install,
+    // so nothing is missing, and the result says why.
     let ws_b = place.workspace("consumer");
     assert!(!ws_b.root.join("installed.marker").exists());
-    let r = place.task(&ws_b, &id("b"), None);
+    let r = place.task(&ws_b, &id("b"), Some(&done.receipt));
     assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
     assert!(ws_b.root.join("installed.marker").is_file());
+    assert!(
+        r.receipt_ignored.as_deref().unwrap().contains("workspace"),
+        "{:?}",
+        r.receipt_ignored
+    );
 
-    // and with a receipt from a workspace that is not its own, a step the
-    // receipt names is skipped (the caller vouches for the receipt, so it must
-    // pass the receipt of the workspace the task runs in)
+    // a workspace that has been prepared on its own has another id
     let ws_c = place.workspace("consumer2");
+    let other = place.setup(&ws_c, &recipe_a);
+    assert_ne!(other.receipt.workspace, done.receipt.workspace);
+    std::fs::remove_file(ws_c.root.join("installed.marker")).unwrap();
     let r = place.task(&ws_c, &id("b"), Some(&done.receipt));
-    assert_eq!(r.jobs[0].steps[0].outcome, skipped_setup());
-    assert!(!ws_c.root.join("installed.marker").exists());
+    assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
+
+    // without a receipt the task prepares everything itself
+    let ws_d = place.workspace("consumer3");
+    let r = place.task(&ws_d, &id("b"), None);
+    assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
+    assert_eq!(r.receipt_ignored, None);
+}
+
+#[test]
+fn a15_a_receipt_of_another_toolchain_or_host_is_ignored() {
+    let (tmp, dir, fp) = lab(
+        "  a:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n      - uses: actions/setup-node@v4\n        with:\n          node-version: '20'\n  b:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n",
+    );
+    let place = Place::new(&tmp, &dir, &fp);
+    let recipe = derive_setup_recipe(&fp, &id("a")).unwrap();
+    assert_eq!(recipe.toolchain.len(), 1);
+    let ws = place.workspace("rep");
+    let done = place.setup(&ws, &recipe);
+
+    let check = |receipt: &PreparedReceipt, tctx: &TemplateContext, what: &str| {
+        std::fs::remove_file(ws.root.join("installed.marker")).ok();
+        let r = place.task_in(&ws, &id("a"), Some(receipt), tctx);
+        assert!(r.receipt_ignored.is_some(), "{what}");
+        assert_eq!(r.jobs[0].steps[0].outcome, Outcome::Pass, "{what}");
+        assert!(ws.root.join("installed.marker").is_file(), "{what}");
+    };
+    // the same workspace and receipt, believed
+    let r = place.task(&ws, &id("a"), Some(&done.receipt));
+    assert_eq!(r.receipt_ignored, None);
+
+    // made for a recipe with another toolchain
+    let mut other_tool = recipe.clone();
+    other_tool.toolchain[0].version = "22".into();
+    let mut receipt = done.receipt.clone();
+    receipt.template_key = other_tool.template_key(&place.tctx()).digest().into();
+    check(&receipt, &place.tctx(), "toolchain");
+
+    // the host the task runs on is another os, arch or profile
+    for (what, f) in [
+        (
+            "os",
+            Box::new(|c: &mut TemplateContext| c.os = "x".into())
+                as Box<dyn Fn(&mut TemplateContext)>,
+        ),
+        ("arch", Box::new(|c| c.arch = "x".into())),
+        ("profile", Box::new(|c| c.profile = "x".into())),
+    ] {
+        let mut c = place.tctx();
+        f(&mut c);
+        check(&done.receipt, &c, what);
+    }
 }
 
 #[test]
@@ -296,33 +383,102 @@ fn a_receipt_skips_only_the_steps_it_names() {
     let place = Place::new(&tmp, &dir, &fp);
     let recipe = derive_setup_recipe(&fp, &id("a")).unwrap();
     assert_eq!(recipe.steps.len(), 2);
-    let key = recipe.template_key(&TemplateContext::local(&fp, "r"));
-    // a receipt for the first install only
-    let receipt = PreparedReceipt {
-        template_key: key.digest().into(),
-        source: fp.source.sha.clone(),
-        steps: vec![PreparedStep {
-            id: recipe.steps[0].id.clone(),
-            how: PreparedHow::Ran,
-        }],
-        artifacts: vec![],
-    };
     let ws = place.workspace("w");
+    let done = place.setup(&ws, &recipe);
+    // a receipt for the first install only
+    let mut receipt = done.receipt.clone();
+    receipt.steps.truncate(1);
+    assert_eq!(receipt.steps[0].id, recipe.steps[0].id);
+    std::fs::remove_file(ws.root.join("two.marker")).unwrap();
     let r = place.task(&ws, &id("a"), Some(&receipt));
     let o = outcomes(&r);
     assert_eq!(o[0], skipped_setup());
     // the second install is not named, so the task runs it
     assert_eq!(o[1], Outcome::Pass);
     assert!(ws.root.join("two.marker").is_file());
-    assert!(!ws.root.join("installed.marker").exists());
 
     // a receipt of another commit is not believed at all
     let mut other = receipt.clone();
     other.source = "0".repeat(40);
-    let ws = place.workspace("w2");
     let r = place.task(&ws, &id("a"), Some(&other));
     assert_eq!(outcomes(&r)[0], Outcome::Pass);
-    assert!(ws.root.join("installed.marker").is_file());
+    assert!(r.receipt_ignored.is_some());
+}
+
+#[test]
+fn a_step_that_comes_again_after_others_is_run_again() {
+    // install A, install B, install A: the second A is not the same
+    // preparation as the first (B came between), so the job runs it
+    let job = |n: &str| {
+        format!("  {n}:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n      - run: sh install2.sh\n      - run: sh install.sh\n      - run: test -f two.marker\n")
+    };
+    let (tmp, dir, fp) = lab(&format!("{}{}", job("a"), job("b")));
+    let place = Place::new(&tmp, &dir, &fp);
+    let recipe = derive_setup_recipe(&fp, &id("a")).unwrap();
+    assert_eq!(recipe.steps.len(), 2);
+    // the second `sh install.sh` is not a place of the first
+    assert_eq!(
+        recipe.steps[0]
+            .at
+            .iter()
+            .map(|a| a.index)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    let ws = place.workspace("w");
+    let done = place.setup(&ws, &recipe);
+    let r = place.task(&ws, &id("a"), Some(&done.receipt));
+    assert_eq!(
+        outcomes(&r),
+        vec![
+            skipped_setup(),
+            skipped_setup(),
+            Outcome::Pass,
+            Outcome::Pass
+        ]
+    );
+}
+
+#[test]
+fn a_receipt_lists_only_the_artifacts_of_its_tasks_directories() {
+    let job = |n: &str, d: &str| {
+        format!("  {n}:\n    runs-on: x\n    defaults:\n      run:\n        working-directory: {d}\n    steps:\n      - run: sh ../install.sh\n")
+    };
+    let (tmp, dir, fp) = lab(&format!(
+        "{}{}{}{}",
+        job("a1", "d1"),
+        job("a2", "d1"),
+        job("b1", "d2"),
+        job("b2", "d2")
+    ));
+    let place = Place::new(&tmp, &dir, &fp);
+    let ra = derive_setup_recipe(&fp, &id("a1")).unwrap();
+    let rb = derive_setup_recipe(&fp, &id("b1")).unwrap();
+    assert_eq!((ra.steps.len(), rb.steps.len()), (1, 1));
+    let all = SetupRecipe::union(&[&ra, &rb]);
+    let ws = place.workspace("w");
+    let done = place.setup(&ws, &all);
+    assert!(done.ok());
+    let paths = |r: &PreparedReceipt| {
+        r.artifacts
+            .iter()
+            .map(|a| a.path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        paths(&done.receipt),
+        vec!["d1/installed.marker", "d2/installed.marker"]
+    );
+    let key = ra.template_key(&place.tctx());
+    assert_eq!(
+        paths(&done.receipt.restricted_to(&ra, &key)),
+        vec!["d1/installed.marker"]
+    );
+    let key = rb.template_key(&place.tctx());
+    assert_eq!(
+        paths(&done.receipt.restricted_to(&rb, &key)),
+        vec!["d2/installed.marker"]
+    );
 }
 
 #[test]
@@ -356,8 +512,11 @@ fn a16_the_same_script_with_another_env_or_shell_is_another_key() {
         "  same1:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n",
         "  same2:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n",
         "  env1:\n    runs-on: x\n    env:\n      NODE_ENV: production\n    steps:\n      - run: sh install.sh\n",
+        "  env1b:\n    runs-on: x\n    env:\n      NODE_ENV: production\n    steps:\n      - run: sh install.sh\n",
         "  env2:\n    runs-on: x\n    env:\n      NODE_ENV: development\n    steps:\n      - run: sh install.sh\n",
+        "  env2b:\n    runs-on: x\n    env:\n      NODE_ENV: development\n    steps:\n      - run: sh install.sh\n",
         "  sh1:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n        shell: sh\n",
+        "  sh1b:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n        shell: sh\n",
     ));
     let c = TemplateContext::local(&fp, "run-1");
     let k = |j: &str| key_of(&fp, j, &c);
@@ -374,6 +533,163 @@ fn a16_the_same_script_with_another_env_or_shell_is_another_key() {
     assert_ne!(step("env1"), step("env2"));
     assert_ne!(step("same1"), step("sh1"));
     assert_eq!(step("same1"), step("same2"));
+}
+
+/// Run the whole plan in a workspace of its own with an `npm` that records the
+/// `NODE_ENV` it was run with in `dep.marker` of the directory it ran in.
+fn run_with_fake_npm(
+    tmp: &tempfile::TempDir,
+    dir: &Path,
+    fp: &FrozenPlan,
+    parallel: usize,
+) -> local_ci::report::RunResult {
+    let bin = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("npm"),
+        "#!/bin/sh\nprintf '%s' \"$NODE_ENV\" > dep.marker\n",
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("npm"))
+        .status()
+        .unwrap();
+    let c = ctx_with(
+        tmp.path(),
+        &format!(
+            "{}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            bin.display()
+        ),
+    );
+    let mut place = Place::new(tmp, dir, fp);
+    place.home = tmp.path();
+    let ws = place.workspace(&format!("whole{parallel}"));
+    let mut opts = place.opts();
+    opts.parallel = parallel;
+    opts.keep = false;
+    local_ci::execute_plan(&c, fp, &ws, opts).unwrap()
+}
+
+fn passed(r: &local_ci::report::RunResult) -> Vec<(String, Outcome)> {
+    assert!(
+        r.setup.iter().all(|s| s.outcome == Outcome::Pass),
+        "{:?}",
+        r.setup
+    );
+    r.units
+        .iter()
+        .flat_map(|u| u.jobs.iter().map(|j| (j.job.clone(), j.outcome.clone())))
+        .collect()
+}
+
+fn stays_for_conflict(fp: &FrozenPlan, task: &str) {
+    let r = derive_setup_recipe(fp, task).unwrap();
+    assert!(r.steps.is_empty(), "{task}: {:?}", r.steps);
+    assert!(
+        r.left_in_place
+            .iter()
+            .any(|l| l.reason == local_ci::plan::StayReason::ConflictingInstall),
+        "{task}: {:?}",
+        r.left_in_place
+    );
+}
+
+fn npm_job(name: &str, extra: &str, check: &str) -> String {
+    format!("  {name}:\n    runs-on: x\n{extra}    steps:\n      - run: npm ci\n      - run: test \"$(cat dep.marker)\" = {check}\n")
+}
+
+#[test]
+fn a16_installs_with_another_env_in_one_directory_stay_in_their_jobs() {
+    // a and b install in the same directory with another NODE_ENV: one
+    // workspace cannot hold both results, so neither is setup and each job
+    // sees the result of its own install
+    let (tmp, dir, fp) = lab(&format!(
+        "{}{}",
+        npm_job("a", "    env:\n      NODE_ENV: production\n", "production"),
+        npm_job(
+            "b",
+            "    env:\n      NODE_ENV: development\n",
+            "development"
+        ),
+    ));
+    stays_for_conflict(&fp, &id("a"));
+    stays_for_conflict(&fp, &id("b"));
+    for parallel in [1, 2] {
+        let r = run_with_fake_npm(&tmp, &dir, &fp, parallel);
+        let p = passed(&r);
+        assert_eq!(p.len(), 2);
+        assert!(
+            p.iter().all(|(_, o)| *o == Outcome::Pass),
+            "parallel {parallel}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn a16_installs_with_another_shell_stay_in_their_jobs() {
+    let (_t, _d, fp) = lab(&format!(
+        "{}{}",
+        npm_job("a", "", "x"),
+        npm_job("b", "    defaults:\n      run:\n        shell: sh\n", "x"),
+    ));
+    stays_for_conflict(&fp, &id("a"));
+    stays_for_conflict(&fp, &id("b"));
+}
+
+#[test]
+fn a16_installs_with_another_workflow_env_stay_in_their_jobs() {
+    let wf = |env: &str| {
+        format!(
+            "name: ci\non: pull_request\nenv:\n  NODE_ENV: {env}\njobs:\n{}",
+            npm_job("j", "", env)
+        )
+    };
+    let (_t, _d, fp) = lab_files(&[
+        (".github/workflows/one.yml", wf("production")),
+        (".github/workflows/two.yml", wf("development")),
+    ]);
+    for f in ["one", "two"] {
+        stays_for_conflict(&fp, &format!(".github/workflows/{f}.yml::j"));
+    }
+}
+
+#[test]
+fn a16_installs_in_other_directories_are_still_setup() {
+    let (tmp, dir, fp) = lab(&format!(
+        "{}{}",
+        npm_job("a", "    defaults:\n      run:\n        working-directory: d1\n    env:\n      NODE_ENV: production\n", "production"),
+        npm_job("b", "    defaults:\n      run:\n        working-directory: d2\n    env:\n      NODE_ENV: development\n", "development"),
+    ));
+    for j in ["a", "b"] {
+        let r = derive_setup_recipe(&fp, &id(j)).unwrap();
+        assert_eq!(r.steps.len(), 1, "{j}");
+        assert!(r.left_in_place.is_empty());
+    }
+    let r = run_with_fake_npm(&tmp, &dir, &fp, 2);
+    assert!(passed(&r).iter().all(|(_, o)| *o == Outcome::Pass));
+}
+
+#[test]
+fn a_shell_local_ci_cannot_start_leaves_its_setup_in_the_job_and_the_run_goes_on() {
+    let (tmp, dir, fp) = lab(&format!(
+        "{}{}",
+        npm_job("a", "    defaults:\n      run:\n        shell: pwsh\n", "x"),
+        "  b:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n  c:\n    runs-on: x\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n",
+    ));
+    let a = derive_setup_recipe(&fp, &id("a")).unwrap();
+    assert!(a.steps.is_empty());
+    assert_eq!(
+        a.left_in_place.iter().map(|l| l.reason).collect::<Vec<_>>(),
+        vec![local_ci::plan::StayReason::UnsupportedShell]
+    );
+    let r = run_with_fake_npm(&tmp, &dir, &fp, 2);
+    let p = passed(&r);
+    assert_eq!(p.len(), 3);
+    let o = |j: &str| p.iter().find(|(x, _)| x == j).unwrap().1.clone();
+    assert!(matches!(o("a"), Outcome::Fail | Outcome::Error(_)), "{p:?}");
+    assert_eq!(o("b"), Outcome::Pass);
+    assert_eq!(o("c"), Outcome::Pass);
 }
 
 #[test]
@@ -528,15 +844,6 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     // A is in use by one consumer when A+B is built
     let use1 = tmp.path().join("use1");
     a.materialize(&c1, &use1).unwrap();
-    let built_ab = tmp.path().join("built-ab");
-    std::fs::create_dir_all(built_ab.join("node_modules/a")).unwrap();
-    std::fs::create_dir_all(built_ab.join("node_modules/b")).unwrap();
-    std::fs::write(built_ab.join("node_modules/a/index.js"), "a").unwrap();
-    std::fs::write(built_ab.join("node_modules/b/index.js"), "b").unwrap();
-    let rec_ab = PreparedReceipt::empty(kab.digest(), "src");
-    let ab = store.publish(&c1, &kab, &rec_ab, &built_ab).unwrap();
-    assert_eq!(tree_digest(&a.tree()), before);
-    assert_ne!(tree_digest(&ab.tree()), before);
 
     // the template cannot be written, and a second publish of the same key
     // does not replace it
@@ -557,16 +864,74 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     std::fs::write(&own, "edited").unwrap();
     assert_eq!(std::fs::read_to_string(&tpl_file).unwrap(), "a");
 
-    // one consumer is cancelled; the other, and the template, are not affected
-    c1.cancel.cancel();
-    assert!(c1.cancel.is_cancelled() && !c2.cancel.is_cancelled());
+    // c2's consumer exists before anything is cancelled
     let use2 = tmp.path().join("use2");
     a.materialize(&c2, &use2).unwrap();
+    let use2_before = tree_digest(&use2);
+
+    // a process of c1 is writing in use1 (a copy of A) ...
+    let (_lab_tmp, _lab_dir, fp) = lab(
+        "  w:\n    runs-on: x\n    steps:\n      - run: while :; do echo x >> writer.log; sleep 0.05; done\n",
+    );
+    let ws = Workspace {
+        root: use1.clone(),
+        repo_root: use1.clone(),
+        run_dir: tmp.path().join("runs/use1"),
+        tools: tmp.path().join("use1.tools"),
+        lock_file: tmp.path().join("use1.lock"),
+    };
+    std::fs::create_dir_all(&ws.run_dir).unwrap();
+    let opts = Opts {
+        parallel: 1,
+        canirun: None,
+        portool: None,
+        containers: 1,
+        job_timeout_min: 5.0,
+        keep: true,
+        trash: tmp.path().join("trash"),
+    };
+    let log = use1.join("writer.log");
+    let result = std::thread::scope(|scope| {
+        let h = scope.spawn(|| {
+            local_ci::execute_task(&c1, &fp, &id("w"), &TaskInputs::default(), None, &ws, opts)
+        });
+        let t0 = std::time::Instant::now();
+        while !log.is_file() && t0.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(log.is_file(), "the writer never started");
+        // ... c1 is cancelled while A+B is built and published
+        c1.cancel.cancel();
+        let built_ab = tmp.path().join("built-ab");
+        std::fs::create_dir_all(built_ab.join("node_modules/a")).unwrap();
+        std::fs::create_dir_all(built_ab.join("node_modules/b")).unwrap();
+        std::fs::write(built_ab.join("node_modules/a/index.js"), "a").unwrap();
+        std::fs::write(built_ab.join("node_modules/b/index.js"), "b").unwrap();
+        let rec_ab = PreparedReceipt::empty(kab.digest(), "src");
+        let ab = store.publish(&c2, &kab, &rec_ab, &built_ab).unwrap();
+        (h.join().unwrap(), ab)
+    });
+    let (task, ab) = result;
+    let task = task.unwrap();
+    assert!(
+        !matches!(task.jobs[0].outcome, Outcome::Pass),
+        "{:?}",
+        task.jobs[0].outcome
+    );
+    // the writer is gone: the file does not grow any more
+    let size = std::fs::metadata(&log).unwrap().len();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), size);
+
+    // A did not change, A+B is another tree, and c2's copy is intact
+    assert_eq!(tree_digest(&a.tree()), before);
+    assert_ne!(tree_digest(&ab.tree()), before);
+    assert_eq!(tree_digest(&use2), use2_before);
+    assert!(c1.cancel.is_cancelled() && !c2.cancel.is_cancelled());
     assert_eq!(
         std::fs::read_to_string(use2.join("node_modules/a/index.js")).unwrap(),
         "a"
     );
-    assert_eq!(tree_digest(&a.tree()), before);
     assert!(
         a.materialize(&c2, &use2).is_err(),
         "an existing path is not overwritten"

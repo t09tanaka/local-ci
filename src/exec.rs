@@ -6,7 +6,9 @@ use crate::expr::{self, Ctx, Status};
 use crate::frozen::FrozenPlan;
 use crate::matrix;
 use crate::plan::{self, Plan, Unit};
-use crate::setup::{self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe};
+use crate::setup::{
+    self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe, TemplateContext,
+};
 use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, TaskResult};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
@@ -225,8 +227,10 @@ pub struct Runner<'a> {
     pub opts: Opts,
     pub base_path: String,
     /// The keys of the steps that count as setup, from the plan alone.
-    hoisted: BTreeSet<plan::StepKey>,
-    receipts: HashMap<String, PreparedReceipt>,
+    hoisted: plan::Hoist,
+    /// What each task was told is prepared, and the context its template keys
+    /// are made under.
+    receipts: Option<(HashMap<String, PreparedReceipt>, TemplateContext)>,
     seq: AtomicUsize,
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
@@ -535,7 +539,7 @@ dir=$(pwd -P)
 ws=$(cd "${GITHUB_WORKSPACE:-/}" 2>/dev/null && pwd -P)
 sum=$(cksum package-lock.json 2>/dev/null | cut -d' ' -f1)
 # relative to the workspace, so a unit's copy of the worktree keeps setup's marks
-key=$(printf '%s' "${dir#"$ws"}" | cksum | cut -d' ' -f1)
+key=$(printf '%s' "${dir#"$ws"}$LOCAL_CI_INSTALL_SCOPE" | cksum | cut -d' ' -f1)
 marks="$LOCAL_CI_MARKS"
 mkdir -p "$marks"
 until mkdir "$marks/$key.lock" 2>/dev/null; do sleep 1; done
@@ -766,9 +770,9 @@ impl<'a> Runner<'a> {
         Runner {
             ctx,
             fp,
-            hoisted: plan::hoisted_keys(&plan),
+            hoisted: plan::hoist(&plan),
             plan,
-            receipts: HashMap::new(),
+            receipts: None,
             repo_root: ws.repo_root.clone(),
             wt: ws.root.clone(),
             run_dir: ws.run_dir.clone(),
@@ -972,6 +976,7 @@ impl<'a> Runner<'a> {
             Some("python") => vec!["python3".into(), f],
             Some(custom) if custom.contains("{0}") => shlex::split(&custom.replace("{0}", &f))
                 .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
+            // keep in step with `plan::shell_supported`
             Some(other) => bail!("unsupported shell `{other}`"),
         };
         if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
@@ -1166,8 +1171,13 @@ impl<'a> Runner<'a> {
 
     /// What each task of the plan was told is prepared, by task id. Set before
     /// [`Runner::run_units`]; a task without an entry prepares everything itself.
-    pub fn set_receipts(&mut self, receipts: HashMap<String, PreparedReceipt>) {
-        self.receipts = receipts;
+    /// `tctx` is the context the receipts' template keys were made under.
+    pub fn set_receipts(
+        &mut self,
+        receipts: HashMap<String, PreparedReceipt>,
+        tctx: TemplateContext,
+    ) {
+        self.receipts = Some((receipts, tctx));
     }
 
     /// Do the steps of `recipe` in the workspace, in order, and stop at the first
@@ -1194,6 +1204,22 @@ impl<'a> Runner<'a> {
                 steps: vec![],
             };
         }
+        let workspace = match setup::ensure_workspace_id(&self.wt) {
+            Ok(id) => id,
+            Err(e) => {
+                return PreparedSetup {
+                    receipt: PreparedReceipt::empty(key, &self.fp.source.sha),
+                    steps: vec![StepResult {
+                        label: "setup".into(),
+                        outcome: Outcome::Error(format!("cannot record the workspace id: {e:#}")),
+                        exit: None,
+                        secs: 0.0,
+                        log: None,
+                        note: None,
+                    }],
+                };
+            }
+        };
         let covered = setup::covered_by(recipe);
         let dirs: BTreeSet<String> = recipe.steps.iter().map(|s| s.dir.clone()).collect();
         let before = setup::top_level_entries(&self.wt, &dirs);
@@ -1297,6 +1323,7 @@ impl<'a> Runner<'a> {
             receipt: PreparedReceipt {
                 template_key: key.into(),
                 source: self.fp.source.sha.clone(),
+                workspace,
                 steps: prepared,
                 artifacts,
             },
@@ -1533,7 +1560,16 @@ impl<'a> Runner<'a> {
             if task.variant.as_ref().is_some_and(|v| v.index > 0) {
                 continue;
             }
-            match self.run_task(ws, task, &inputs, self.receipts.get(&task.id), locked, true) {
+            match self.run_task(
+                ws,
+                task,
+                &inputs,
+                self.receipts
+                    .as_ref()
+                    .and_then(|(m, c)| m.get(&task.id).map(|r| (r, c))),
+                locked,
+                true,
+            ) {
                 Ok(r) => {
                     for o in r.outcomes {
                         inputs.needs.insert(o.job.clone(), o);
@@ -1582,7 +1618,7 @@ impl<'a> Runner<'a> {
         ws: &Path,
         task: &ExecutionTask,
         inputs: &TaskInputs,
-        prepared: Option<&PreparedReceipt>,
+        prepared: Option<(&PreparedReceipt, &TemplateContext)>,
         locked: bool,
         whole_matrix: bool,
     ) -> Result<TaskResult> {
@@ -1611,9 +1647,24 @@ impl<'a> Runner<'a> {
             (Some(v), false) => Some(v.index),
             _ => None,
         };
+        // A receipt is believed only for this commit, this workspace and the
+        // template key this task's recipe has here; otherwise the task does all
+        // its setup itself and says so.
+        let mut receipt_ignored = None;
         let places = match prepared {
-            Some(r) => setup::derive_in(&self.plan, &self.hoisted, task)?
-                .prepared_places(r, &self.fp.source.sha),
+            Some((r, tctx)) => match setup::derive_in(&self.plan, &self.hoisted, task)?
+                .prepared_places(
+                    r,
+                    &self.fp.source.sha,
+                    setup::workspace_id(ws).as_deref(),
+                    tctx,
+                ) {
+                Ok(p) => p,
+                Err(why) => {
+                    receipt_ignored = Some(why);
+                    HashMap::new()
+                }
+            },
             None => HashMap::new(),
         };
         let none = HashSet::new();
@@ -1655,6 +1706,7 @@ impl<'a> Runner<'a> {
             task: task.id.clone(),
             jobs,
             outcomes,
+            receipt_ignored,
         })
     }
 
@@ -2169,6 +2221,15 @@ impl<'a> Runner<'a> {
             let ctx = Ctx::new(&scm, status);
             let script = expr::interpolate(run, &ctx);
             let mut env_now = step_env.clone();
+            // An install that another job runs here with another shell or env
+            // is this job's own: the npm shim must not take another job's mark
+            // of it for its own.
+            if plan::step_key(w, job, s).is_some_and(|k| self.hoisted.conflicting.contains(&k)) {
+                env_now.insert(
+                    "LOCAL_CI_INSTALL_SCOPE".into(),
+                    Value::String(job.id.clone()),
+                );
+            }
             let env_res = Self::eval_env(&s.env, &scm, &mut env_now, &maps);
             let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
             let (script, mut env_now) = match (script, env_res) {
@@ -2757,6 +2818,7 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests build their own commands
 mod tests {
     use super::*;
     use std::process::Command;

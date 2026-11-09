@@ -306,11 +306,17 @@ fn print_plan(r: &Repo, p: &plan::Plan, fp: &local_ci::FrozenPlan) {
             ""
         }
     );
-    let recipes: Vec<local_ci::setup::SetupRecipe> = fp
-        .tasks
-        .iter()
-        .filter_map(|t| local_ci::setup::derive_setup_recipe(fp, &t.id).ok())
-        .collect();
+    let mut recipes: Vec<local_ci::setup::SetupRecipe> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for t in &fp.tasks {
+        match local_ci::setup::derive_setup_recipe(fp, &t.id) {
+            Ok(r) => recipes.push(r),
+            Err(e) => failed.push((t.id.clone(), format!("{e:#}"))),
+        }
+    }
+    for (task, why) in &failed {
+        println!("setup of {task} could not be worked out: {why}");
+    }
     let all = local_ci::setup::SetupRecipe::union(&recipes.iter().collect::<Vec<_>>());
     let covered = local_ci::setup::covered_by(&all);
     if !all.steps.is_empty() {

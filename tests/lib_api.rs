@@ -1,5 +1,7 @@
 //! The library entry points, called without the command-line adapter.
 
+#![allow(clippy::disallowed_methods)] // the tests build their own commands
+
 use local_ci::{ExecContext, Quiet, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;

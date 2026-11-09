@@ -17,11 +17,11 @@
 
 use crate::dag::ExecutionTask;
 use crate::frozen::{canonical_json, sha256_of, FrozenPlan};
-use crate::plan::{self, Plan, StayReason, StepKey};
+use crate::plan::{self, Hoist, Plan, StayReason, StepKey};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Bump when what a template holds, or how its key is made, changes.
@@ -158,22 +158,36 @@ impl SetupRecipe {
     }
 
     /// The places in the jobs of the task whose steps `receipt` says were
-    /// prepared, by job. Nothing is skipped for a receipt of another source.
+    /// prepared, by job, when `receipt` belongs to this task in this workspace:
+    /// it was made on `source`, for the workspace whose id is `workspace`, and
+    /// under the template key this recipe has now in `tctx`. Otherwise `Err`
+    /// says why it is not believed, and nothing is skipped.
     pub(crate) fn prepared_places(
         &self,
         receipt: &PreparedReceipt,
         source: &str,
-    ) -> HashMap<String, HashSet<usize>> {
+        workspace: Option<&str>,
+        tctx: &TemplateContext,
+    ) -> Result<HashMap<String, HashSet<usize>>, String> {
         let mut out: HashMap<String, HashSet<usize>> = HashMap::new();
+        if receipt.steps.is_empty() {
+            return Ok(out);
+        }
         if receipt.source != source {
-            return out;
+            return Err("it was made for another commit".into());
+        }
+        if workspace.is_none_or(|w| w != receipt.workspace) {
+            return Err("it was made for another workspace".into());
+        }
+        if receipt.template_key != self.template_key(tctx).digest() {
+            return Err("its template key is not the key of this task's recipe here".into());
         }
         for s in self.steps.iter().filter(|s| receipt.covers(&s.id)) {
             for a in &s.at {
                 out.entry(a.job.clone()).or_default().insert(a.index);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -204,6 +218,12 @@ pub struct SecretDigest {
 }
 
 /// What a template key holds besides the recipe.
+///
+/// [`TemplateContext::local`] is enough for a template used by the run that
+/// made it. Before a template is reused in a persistent scope, whoever stores it
+/// (canyourun) has to fill in what `local` cannot know: the `profile` (the
+/// versions of the tools the host carries) and the `secrets` that decide what
+/// setup produces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemplateContext {
     /// The source the recipe is run on (the commit).
@@ -220,6 +240,11 @@ pub struct TemplateContext {
 
 impl TemplateContext {
     /// This machine, for a run of `fp` with id `run_id`.
+    ///
+    /// The profile is the constant `"local"`: the versions of the tools on this
+    /// host are not in the key, and `secrets` is empty (a secret digest is only
+    /// what the caller puts in `secrets`). Both are fine for the run that made
+    /// the template; fill them in before reusing one in a persistent scope.
     pub fn local(fp: &FrozenPlan, run_id: &str) -> Self {
         TemplateContext {
             source_digest: fp.source.sha.clone(),
@@ -277,8 +302,10 @@ pub struct PreparedStep {
 /// A digest of something setup made, by path relative to the workspace.
 ///
 /// For now this is a digest of the names and sizes in the first two levels of
-/// each new top-level entry, not of the contents; whoever stores a template
-/// should compute the digest of the tree it stores.
+/// each new top-level entry, not of the contents, so it cannot tell two trees
+/// with the same names and sizes apart. The digest of the contents (a tree
+/// digest) comes with the result checks of a later stage; until then whoever
+/// stores a template should compute the digest of the tree it stores.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDigest {
     pub path: String,
@@ -292,6 +319,10 @@ pub struct PreparedReceipt {
     pub template_key: String,
     /// The commit it was prepared on.
     pub source: String,
+    /// The id of the workspace it was prepared in (see [`workspace_id`]). A
+    /// task believes the receipt only in the workspace that has this id.
+    #[serde(default)]
+    pub workspace: String,
     /// In the order they were prepared. A step that failed or was not reached
     /// is not here.
     pub steps: Vec<PreparedStep>,
@@ -304,6 +335,7 @@ impl PreparedReceipt {
         PreparedReceipt {
             template_key: template_key.into(),
             source: source.into(),
+            workspace: String::new(),
             steps: vec![],
             artifacts: vec![],
         }
@@ -318,52 +350,34 @@ impl PreparedReceipt {
         PreparedReceipt {
             template_key: key.digest().into(),
             source: self.source.clone(),
+            workspace: self.workspace.clone(),
             steps: self
                 .steps
                 .iter()
                 .filter(|s| recipe.steps.iter().any(|r| r.id == s.id))
                 .cloned()
                 .collect(),
-            artifacts: self.artifacts.clone(),
+            // what is made directly under a directory the recipe installs in
+            artifacts: self
+                .artifacts
+                .iter()
+                .filter(|a| {
+                    let parent = a.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    recipe.steps.iter().any(|r| r.dir == parent)
+                })
+                .cloned()
+                .collect(),
         }
     }
 }
 
-type EnvPairs = Vec<(String, String)>;
-
-fn effective_env(
-    w: &crate::workflow::Workflow,
-    j: &crate::workflow::Job,
-    s: &crate::workflow::Step,
-) -> (EnvPairs, EnvPairs) {
-    let mut all: BTreeMap<&str, &str> = BTreeMap::new();
-    for (k, v) in w.env.iter().chain(j.env.iter()).chain(s.env.iter()) {
-        all.insert(k, v);
-    }
-    let (mut env, mut open) = (vec![], vec![]);
-    for (k, v) in all {
-        if v.contains("${{") {
-            open.push((k.to_string(), v.to_string()));
-        } else {
-            env.push((k.to_string(), v.to_string()));
-        }
-    }
-    (env, open)
-}
-
-fn step_id(
-    dir: &str,
-    run: &str,
-    shell: &Option<String>,
-    env: &[(String, String)],
-    open: &[(String, String)],
-) -> String {
+fn step_id(k: &StepKey) -> String {
     sha256_of(&canonical_json(&json!({
-        "dir": dir,
-        "run": run,
-        "shell": shell.as_deref().unwrap_or("bash"),
-        "env": env,
-        "unresolved_env": open,
+        "dir": k.wd,
+        "run": k.run,
+        "shell": k.shell.as_deref().unwrap_or("bash"),
+        "env": k.env,
+        "unresolved_env": k.open_env,
     })))
 }
 
@@ -373,15 +387,11 @@ pub fn derive_setup_recipe(fp: &FrozenPlan, task_id: &str) -> Result<SetupRecipe
         .task(task_id)
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
     let plan = fp.to_plan();
-    derive_in(&plan, &plan::hoisted_keys(&plan), task)
+    derive_in(&plan, &plan::hoist(&plan), task)
 }
 
-/// [`derive_setup_recipe`] over a plan whose `hoisted` keys are known.
-pub(crate) fn derive_in(
-    plan: &Plan,
-    hoisted: &BTreeSet<StepKey>,
-    task: &ExecutionTask,
-) -> Result<SetupRecipe> {
+/// [`derive_setup_recipe`] over a plan whose `hoist` is known.
+pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Result<SetupRecipe> {
     let sel = plan
         .selected
         .iter()
@@ -415,18 +425,29 @@ pub(crate) fn derive_in(
             }
         }
         let prefix = plan::prefix_of(w, j);
+        let mut seen: HashSet<String> = HashSet::new();
+        // set when a step comes up a second time, which ends the prefix
+        let mut ended = false;
         for p in &prefix.steps {
-            if !hoisted.contains(&p.key) {
+            if !hoist.keys.contains(&p.key) {
+                if hoist.conflicting.contains(&p.key) {
+                    out.left_in_place.push(LeftInPlace {
+                        workflow: w.file.clone(),
+                        job: j.id.clone(),
+                        index: p.index,
+                        label: p.step.label(),
+                        reason: StayReason::ConflictingInstall,
+                    });
+                }
                 break;
             }
-            let shell = p
-                .step
-                .shell
-                .clone()
-                .or_else(|| j.shell.clone())
-                .or_else(|| w.shell.clone());
-            let (env, open) = effective_env(w, j, p.step);
-            let id = step_id(&p.key.wd, &p.key.run, &shell, &env, &open);
+            let id = step_id(&p.key);
+            // The same step again after others is not the same preparation: it
+            // runs where the job has it, so the job's prefix ends before it.
+            if !seen.insert(id.clone()) {
+                ended = true;
+                break;
+            }
             let at = StepRef {
                 workflow: w.file.clone(),
                 job: j.id.clone(),
@@ -438,9 +459,9 @@ pub(crate) fn derive_in(
                     id,
                     dir: p.key.wd.clone(),
                     run: p.key.run.clone(),
-                    shell,
-                    env,
-                    unresolved_env: open,
+                    shell: p.key.shell.clone(),
+                    env: p.key.env.clone(),
+                    unresolved_env: p.key.open_env.clone(),
                     label: p.step.label(),
                     workflow: w.file.clone(),
                     job: j.id.clone(),
@@ -448,11 +469,16 @@ pub(crate) fn derive_in(
                 }),
             }
         }
-        if let Some((index, reason)) = prefix.stopped_by {
+        if let (false, Some((index, reason))) = (ended, prefix.stopped_by) {
             let s = &j.steps[index];
             let run = s.run.as_deref().unwrap_or("");
             if plan::is_installer(run)
-                || matches!(reason, StayReason::EnvFileEffect | StayReason::AbsolutePath)
+                || matches!(
+                    reason,
+                    StayReason::EnvFileEffect
+                        | StayReason::AbsolutePath
+                        | StayReason::UnsupportedShell
+                )
             {
                 out.left_in_place.push(LeftInPlace {
                     workflow: w.file.clone(),
@@ -582,4 +608,41 @@ fn manifest(path: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
             manifest(&e.path(), &format!("{rel}/{name}"), depth + 1, out);
         }
     }
+}
+
+/// Where a workspace keeps its id, relative to its root.
+const WORKSPACE_ID: &str = ".local-ci/workspace-id";
+
+/// The id of the workspace at `root`, if it has one. [`crate::execute_setup`]
+/// gives a workspace its id the first time it prepares anything there; a copy
+/// of that workspace (a template materialized, a unit's copy) carries the file,
+/// and so the id, along with the installs it holds.
+pub fn workspace_id(root: &Path) -> Option<String> {
+    let id = std::fs::read_to_string(root.join(WORKSPACE_ID)).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The id of the workspace at `root`; made and written when it has none.
+pub(crate) fn ensure_workspace_id(root: &Path) -> Result<String> {
+    if let Some(id) = workspace_id(root) {
+        return Ok(id);
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id = sha256_of(&format!(
+        "{}:{nanos}:{}:{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        root.display()
+    ));
+    let file = root.join(WORKSPACE_ID);
+    if let Some(d) = file.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(&file, &id)?;
+    Ok(id)
 }

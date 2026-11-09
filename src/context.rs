@@ -130,6 +130,7 @@ impl ExecContext {
     /// A command that sees exactly this context's environment (not the
     /// process's).
     pub(crate) fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        #[allow(clippy::disallowed_methods)] // the one place; the environment is cleared next
         let mut c = Command::new(program);
         c.env_clear().envs(&self.env);
         c
@@ -179,5 +180,17 @@ impl ExecContext {
             .join(".cargo/bin")
             .join(name);
         p.is_file().then_some(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_command_sees_the_context_env_and_not_the_processs() {
+        let ctx = ExecContext::new([("ONLY".to_string(), "1".to_string())].into());
+        let out = ctx.command("/usr/bin/env").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ONLY=1\n");
     }
 }

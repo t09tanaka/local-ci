@@ -1,6 +1,8 @@
 //! The job graph, the tasks a plan is cut into, and running a task from the
 //! results of the ones before it.
 
+#![allow(clippy::disallowed_methods)] // the tests build their own commands
+
 use local_ci::dag::{GroupedReason, NodeKind};
 use local_ci::exec::Outcome;
 use local_ci::frozen::{DisabledSource, DisabledWorkflow};
@@ -894,28 +896,4 @@ fn a_fresh_attempt_is_not_cancelled_with_the_one_it_came_from() {
     assert!(a.cancel.is_cancelled());
     assert!(!b.cancel.is_cancelled());
     assert_eq!(a.env(), b.env());
-}
-
-#[test]
-fn the_commands_the_engine_starts_see_the_context_env_and_not_the_processs() {
-    // Every `Command::new` in the library is followed by `env_clear()`; the
-    // context's `command()` does it, so only context.rs may call it.
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for e in std::fs::read_dir(&src).unwrap() {
-        let p = e.unwrap().path();
-        let file = p.file_name().unwrap().to_string_lossy().into_owned();
-        if file == "main.rs" {
-            continue;
-        }
-        let text = std::fs::read_to_string(&p).unwrap();
-        let code = text.split("#[cfg(test)]").next().unwrap();
-        for (at, _) in code.match_indices("Command::new(") {
-            let near: String = code[at..].chars().take(400).collect();
-            assert!(
-                file == "context.rs" && near.contains("env_clear()"),
-                "{file}: {}",
-                &near[..80.min(near.len())]
-            );
-        }
-    }
 }

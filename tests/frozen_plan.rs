@@ -1,6 +1,8 @@
 //! Planning and executing apart: the frozen plan, its digest, and attempts that
 //! do not share state.
 
+#![allow(clippy::disallowed_methods)] // the tests build their own commands
+
 use local_ci::{ExecContext, FrozenPlan, Observer, Quiet, RunOptions, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;
