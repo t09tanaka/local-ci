@@ -9,6 +9,7 @@
 //! not run the unit again. Results are kept for a day: tests that depend on
 //! the date, and checks against advisory databases, change without the code.
 
+use crate::context::ExecContext;
 use crate::exec::{JobResult, Outcome, StepResult, UnitResult};
 use crate::filter::last_match;
 use crate::plan::Unit;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 
 pub const TTL_SECS: u64 = 24 * 3600;
@@ -41,6 +42,8 @@ const TOOLS: &[(&str, &[&str])] = &[
 
 /// What the fingerprints of one run share.
 pub struct Inputs {
+    /// Starts the version commands and git with the attempt's environment.
+    ctx: ExecContext,
     root: PathBuf,
     /// `(path, object)` of every file at the commit, in git's order.
     files: Vec<(String, String)>,
@@ -57,6 +60,7 @@ pub struct Inputs {
 
 impl Inputs {
     pub fn read(
+        ctx: &ExecContext,
         root: &Path,
         sha: &str,
         base: &str,
@@ -64,7 +68,7 @@ impl Inputs {
         workflow_dirs: &[String],
         no_cache: &[String],
     ) -> Result<Inputs> {
-        let listed = crate::git::git(root, &["ls-tree", "-r", "-z", "--full-tree", sha])?;
+        let listed = crate::git::git(ctx, root, &["ls-tree", "-r", "-z", "--full-tree", sha])?;
         let mut files = Vec::new();
         for entry in listed.split('\0').filter(|e| !e.is_empty()) {
             // `<mode> <type> <object>\t<path>`
@@ -78,7 +82,7 @@ impl Inputs {
         for d in workflow_dirs {
             always.push(format!("{}/", d.trim_end_matches('/')));
         }
-        let merge_base = crate::git::git(root, &["merge-base", base, sha]).ok();
+        let merge_base = crate::git::git(ctx, root, &["merge-base", base, sha]).ok();
         let exe = std::env::current_exe()
             .and_then(|p| p.metadata())
             .map(|m| {
@@ -92,6 +96,7 @@ impl Inputs {
             })
             .unwrap_or_default();
         Ok(Inputs {
+            ctx: ctx.fresh_attempt(),
             root: root.to_path_buf(),
             files,
             always,
@@ -163,7 +168,7 @@ impl Inputs {
                 m.push_str(&format!("{object} {path}\n"));
             }
         }
-        hash(&self.root, &m)
+        hash(&self.ctx, &self.root, &m)
     }
 
     fn excluded(&self, w: &Workflow, jobs: &[String]) -> bool {
@@ -177,7 +182,9 @@ impl Inputs {
     fn version(&self, cmd: &[&str]) -> String {
         let key = cmd.join(" ");
         self.remember(key, || {
-            let o = Command::new(cmd[0])
+            let o = self
+                .ctx
+                .command(cmd[0])
                 .args(&cmd[1..])
                 .stdin(Stdio::null())
                 .output()
@@ -194,8 +201,9 @@ impl Inputs {
     fn blob(&self, path: &str) -> Option<String> {
         let object = self.files.iter().find(|(p, _)| p == path)?.1.clone();
         let root = self.root.clone();
+        let ctx = self.ctx.fresh_attempt();
         self.remember(format!("blob {object}"), move || {
-            crate::git::git(&root, &["cat-file", "-p", &object]).ok()
+            crate::git::git(&ctx, &root, &["cat-file", "-p", &object]).ok()
         })
     }
 
@@ -222,8 +230,9 @@ fn names(text: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
-fn hash(root: &Path, text: &str) -> Option<String> {
-    let mut child = Command::new("git")
+fn hash(ctx: &ExecContext, root: &Path, text: &str) -> Option<String> {
+    let mut child = ctx
+        .command("git")
         .args(["hash-object", "--stdin"])
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -405,6 +414,15 @@ mod tests {
 
     fn inputs(files: &[(&str, &str)]) -> Inputs {
         let i = Inputs {
+            ctx: ExecContext::new(
+                [
+                    ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+                    ("HOME", "/tmp"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ),
             root: std::env::temp_dir(),
             files: files
                 .iter()

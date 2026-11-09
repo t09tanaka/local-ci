@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -990,14 +990,13 @@ impl<'a> Runner<'a> {
         }
         let out = OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
-        let mut cmd = Command::new(&argv[0]);
+        let mut cmd = self.ctx.command(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
             .process_group(0);
-        cmd.env_clear().envs(self.ctx.env());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1344,6 +1343,7 @@ impl<'a> Runner<'a> {
     /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
     fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
         crate::git::clone_worktree(
+            self.ctx,
             &self.repo_root,
             from,
             to,
@@ -1367,7 +1367,7 @@ impl<'a> Runner<'a> {
     fn remove_copy(&self, ws: &Path) {
         if !self.opts.keep {
             self.release_ports(ws);
-            crate::git::remove_worktree(&self.repo_root, ws, &self.opts.trash);
+            crate::git::remove_worktree(self.ctx, &self.repo_root, ws, &self.opts.trash);
         }
     }
 
@@ -1432,7 +1432,7 @@ impl<'a> Runner<'a> {
         if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
             && ws.join(".portool.toml").is_file()
         {
-            crate::portool::release(bin, ws);
+            crate::portool::release(self.ctx, bin, ws);
         }
     }
 
@@ -1874,7 +1874,7 @@ impl<'a> Runner<'a> {
             {
                 // before the sync: it may take a block and still fail
                 self.synced.lock().unwrap().insert(ws.to_path_buf());
-                match crate::portool::sync(bin, ws) {
+                match crate::portool::sync(self.ctx, bin, ws) {
                     Ok(v) => v,
                     Err(e) => {
                         self.stop_services(&names);
@@ -2189,7 +2189,7 @@ impl<'a> Runner<'a> {
             );
             let pkg = fs::read_to_string(ws.join(&wd).join("package.json")).ok();
             if writes_node_modules(&plan::with_scripts(&script, pkg.as_deref())) {
-                if let Err(e) = crate::git::own_node_modules(ws) {
+                if let Err(e) = crate::git::own_node_modules(self.ctx, ws) {
                     let e = format!("cannot copy node_modules: {e:#}");
                     push(&mut steps, Outcome::Error(e.clone()), None, None, None);
                     errored.get_or_insert(format!("{label}: {e}"));
@@ -2657,6 +2657,7 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn job_with_secs(secs: f64) -> JobResult {
         JobResult {

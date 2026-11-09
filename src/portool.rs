@@ -2,17 +2,19 @@
 //! job whose scripts fall back to a fixed port (`TEST_PORT ?? 4000`) gets one
 //! no other worktree uses.
 
+use crate::context::ExecContext;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Allocate (or keep) the port block of the worktree at `ws` and return what
 /// `.env.portool` says (`APP_PORT=…`, `TEST_PORT=…`).
-pub fn sync(bin: &Path, ws: &Path) -> Result<Vec<(String, String)>> {
+pub fn sync(ctx: &ExecContext, bin: &Path, ws: &Path) -> Result<Vec<(String, String)>> {
     // a copy carries the `.env.portool` of the worktree it was made from
     let file = ws.join(".env.portool");
     let _ = std::fs::remove_file(&file);
-    let out = Command::new(bin)
+    let out = ctx
+        .command(bin)
         .args(["sync", "--quiet"])
         .current_dir(ws)
         .stdin(Stdio::null())
@@ -38,8 +40,9 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
 }
 
 /// Give the block back. Run it while the worktree still exists.
-pub fn release(bin: &Path, ws: &Path) {
-    let _ = Command::new(bin)
+pub fn release(ctx: &ExecContext, bin: &Path, ws: &Path) {
+    let _ = ctx
+        .command(bin)
         .arg("release")
         .current_dir(ws)
         .stdin(Stdio::null())

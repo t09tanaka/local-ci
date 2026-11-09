@@ -84,16 +84,20 @@ pub fn parse(text: &str) -> Result<Config> {
 }
 
 /// `.local-ci.toml` at `sha`, or the defaults when the commit has none.
-pub fn at(dir: &Path, sha: &str) -> Result<Config> {
+pub fn at(ctx: &crate::context::ExecContext, dir: &Path, sha: &str) -> Result<Config> {
     // `<mode> <type> <object>\t<path>`, or nothing when the commit has no such path
-    let listed = crate::git::git(dir, &["ls-tree", sha, "--", FILE])?;
+    let listed = crate::git::git(ctx, dir, &["ls-tree", sha, "--", FILE])?;
     if listed.trim().is_empty() {
         return Ok(Config::default());
     }
     if !listed.starts_with("100644 blob ") && !listed.starts_with("100755 blob ") {
         bail!("{FILE}: not a regular file at {}", &sha[..sha.len().min(7)]);
     }
-    parse(&crate::git::git(dir, &["show", &format!("{sha}:{FILE}")])?)
+    parse(&crate::git::git(
+        ctx,
+        dir,
+        &["show", &format!("{sha}:{FILE}")],
+    )?)
 }
 
 #[cfg(test)]

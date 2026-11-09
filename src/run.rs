@@ -110,21 +110,22 @@ pub fn resolve_with(
     disabled_list: Option<Vec<DisabledWorkflow>>,
     obs: &mut dyn Observer,
 ) -> Result<(Repo, plan::Plan)> {
-    let root = git::toplevel(&t.dir)?;
-    let sha = git::rev(&root, &t.sha)?;
+    let root = git::toplevel(ctx, &t.dir)?;
+    let sha = git::rev(ctx, &root, &t.sha)?;
     let base = match &t.base {
         Some(b) => b.clone(),
-        None => git::default_base(&root)?,
+        None => git::default_base(ctx, &root)?,
     };
-    let changed = git::changed_files(&root, &base, &sha)?;
+    let changed = git::changed_files(ctx, &root, &base, &sha)?;
     let head = if t.sha == "HEAD" {
-        git::current_branch(&root)
+        git::current_branch(ctx, &root)
     } else {
         None
     };
-    let config = config::at(&root, &sha)?;
+    let config = config::at(ctx, &root, &sha)?;
     let mut wfs = Vec::new();
     for (file, text) in git::workflows_at(
+        ctx,
         &root,
         &sha,
         config.workflows_dirs.as_deref(),
@@ -136,7 +137,7 @@ pub fn resolve_with(
         }
     }
     let ev = filter::Event {
-        base: git::base_branch_name(&root, &base),
+        base: git::base_branch_name(ctx, &root, &base),
         head: head.clone(),
         changed: changed.clone(),
         all: t.all,
@@ -181,7 +182,7 @@ pub fn resolve_with(
     if !t.jobs.is_empty() {
         keep_jobs(&mut p, &t.jobs);
     }
-    let dirty = git::is_dirty(&root);
+    let dirty = git::is_dirty(ctx, &root);
     let mut workflow_dirs = config
         .workflows_dirs
         .clone()
@@ -209,11 +210,10 @@ pub fn resolve_with(
 /// Workflows that are not `active` on GitHub (`disabled_manually`, ...).
 /// `None` when gh or the network is not available.
 fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Option<Vec<DisabledWorkflow>> {
-    let slug = git::repo_slug(root)?;
+    let slug = git::repo_slug(ctx, root)?;
     let gh = ctx.find_tool("gh")?;
-    let child = std::process::Command::new(gh)
-        .env_clear()
-        .envs(ctx.env())
+    let child = ctx
+        .command(gh)
         .args([
             "api",
             &format!("repos/{slug}/actions/workflows?per_page=100"),
@@ -287,9 +287,10 @@ fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
 }
 
 /// One key per repository, shared by all of its worktrees.
-fn repo_key(root: &std::path::Path) -> String {
+fn repo_key(ctx: &ExecContext, root: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let common = git::git(
+        ctx,
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
@@ -321,11 +322,10 @@ pub fn post_status(
     state: &str,
     description: &str,
 ) -> Result<()> {
-    let slug = git::repo_slug(root).context("no origin remote")?;
+    let slug = git::repo_slug(ctx, root).context("no origin remote")?;
     let gh = ctx.find_tool("gh").context("gh is not installed")?;
-    let out = std::process::Command::new(gh)
-        .env_clear()
-        .envs(ctx.env())
+    let out = ctx
+        .command(gh)
         .args([
             "api",
             &format!("repos/{slug}/statuses/{sha}"),
@@ -389,12 +389,12 @@ pub fn build_frozen_plan_with(
     obs: &mut dyn Observer,
 ) -> Result<FrozenPlan> {
     let (repo, p) = resolve_with(ctx, t, disabled, obs)?;
-    freeze(&repo, p, t)
+    freeze(ctx, &repo, p, t)
 }
 
-fn freeze(repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
+fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
     FrozenPlan::new(PlanParts {
-        repository: git::repo_slug(&repo.root),
+        repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {
             sha: repo.sha.clone(),
             base: repo.base.clone(),
@@ -472,9 +472,9 @@ pub fn execute_plan(
 pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
     let t_start = std::time::Instant::now();
     let full = build_frozen_plan(ctx, &a.target, obs)?;
-    let root = git::toplevel(&a.target.dir)?;
+    let root = git::toplevel(ctx, &a.target.dir)?;
     let cache = a.cache_dir.clone();
-    let key = repo_key(&root);
+    let key = repo_key(ctx, &root);
     let runs = cache.join("runs").join(&key);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -489,6 +489,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         vec![]
     } else {
         match cache::Inputs::read(
+            ctx,
             &root,
             sha,
             &full.source.base,
@@ -536,7 +537,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));
     std::fs::create_dir_all(&run_dir)?;
     std::fs::create_dir_all(cache.join("locks"))?;
-    if git::is_dirty(&root) {
+    if git::is_dirty(ctx, &root) {
         obs.notice(&format!(
             "uncommitted changes are not tested; testing commit {}",
             &sha[..7]
@@ -550,7 +551,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         let wt = cache.join("wt").join(&name);
         let tools = cache.join("wt").join(format!("{name}.tools"));
         std::fs::create_dir_all(cache.join("wt"))?;
-        git::add_worktree(&root, &wt, sha)?;
+        git::add_worktree(ctx, &root, &wt, sha)?;
         obs.executing();
         exec::remove_orphan_containers(ctx);
         let canirun = if a.no_canirun {
@@ -592,7 +593,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
                 );
             }
         } else {
-            git::remove_worktree(&root, &wt, &cache.join("trash"));
+            git::remove_worktree(ctx, &root, &wt, &cache.join("trash"));
             let _ = std::fs::remove_dir_all(&tools);
         }
         let r = result?;
@@ -640,9 +641,12 @@ pub fn status(
     sha: &str,
     cache_dir: &std::path::Path,
 ) -> Result<(String, String)> {
-    let root = git::toplevel(dir)?;
-    let want = git::rev(&root, sha)?;
-    let last = cache_dir.join("runs").join(repo_key(&root)).join("last");
+    let root = git::toplevel(ctx, dir)?;
+    let want = git::rev(ctx, &root, sha)?;
+    let last = cache_dir
+        .join("runs")
+        .join(repo_key(ctx, &root))
+        .join("last");
     let run_dir =
         std::fs::read_to_string(&last).context("no local-ci run recorded for this repository")?;
     let saved: report::Saved = serde_json::from_str(&std::fs::read_to_string(

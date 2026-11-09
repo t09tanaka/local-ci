@@ -200,7 +200,7 @@ fn executing_a_built_plan_gives_what_run_gives() {
     let fp = local_ci::build_frozen_plan(&c, &target(&dir, "main"), &mut Quiet).unwrap();
     let cache = tmp.path().join("c2");
     let wt = cache.join("wt/manual");
-    local_ci::git::add_worktree(&dir, &wt, &fp.source.sha).unwrap();
+    local_ci::git::add_worktree(&c, &dir, &wt, &fp.source.sha).unwrap();
     let ws = local_ci::exec::Workspace {
         root: wt,
         repo_root: dir.clone(),

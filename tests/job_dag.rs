@@ -348,7 +348,7 @@ impl Lab {
         self.n += 1;
         let name = format!("t{}", self.n);
         let wt = self.cache.join("wt").join(&name);
-        local_ci::git::add_worktree(&self.dir, &wt, &self.fp.source.sha).unwrap();
+        local_ci::git::add_worktree(c, &self.dir, &wt, &self.fp.source.sha).unwrap();
         let ws = local_ci::exec::Workspace {
             root: wt.clone(),
             repo_root: self.dir.clone(),
@@ -367,7 +367,7 @@ impl Lab {
             trash: self.cache.join("trash"),
         };
         let r = local_ci::execute_task(c, &self.fp, task, inputs, &ws, opts);
-        local_ci::git::remove_worktree(&self.dir, &wt, &self.cache.join("trash"));
+        local_ci::git::remove_worktree(c, &self.dir, &wt, &self.cache.join("trash"));
         r
     }
 
@@ -898,18 +898,21 @@ fn a_fresh_attempt_is_not_cancelled_with_the_one_it_came_from() {
 
 #[test]
 fn the_commands_the_engine_starts_see_the_context_env_and_not_the_processs() {
-    // Every `Command::new` in these files is followed by `env_clear()` (the
-    // context's `command()` does it for the rest). git.rs, cache.rs and
-    // portool.rs still start git, cp and portool with the process's
-    // environment; they are not covered yet.
+    // Every `Command::new` in the library is followed by `env_clear()`; the
+    // context's `command()` does it, so only context.rs may call it.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in ["exec.rs", "run.rs", "context.rs", "task.rs"] {
-        let text = std::fs::read_to_string(src.join(file)).unwrap();
+    for e in std::fs::read_dir(&src).unwrap() {
+        let p = e.unwrap().path();
+        let file = p.file_name().unwrap().to_string_lossy().into_owned();
+        if file == "main.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
         let code = text.split("#[cfg(test)]").next().unwrap();
         for (at, _) in code.match_indices("Command::new(") {
             let near: String = code[at..].chars().take(400).collect();
             assert!(
-                near.contains("env_clear()"),
+                file == "context.rs" && near.contains("env_clear()"),
                 "{file}: {}",
                 &near[..80.min(near.len())]
             );
