@@ -11,6 +11,14 @@ keywords = ["ci", "github-actions", "workflow", "local", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
 include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
+[lib]
+name = "local_ci"
+path = "src/lib.rs"
+
+[[bin]]
+name = "local-ci"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
