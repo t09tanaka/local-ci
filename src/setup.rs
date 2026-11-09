@@ -18,11 +18,11 @@
 use crate::dag::ExecutionTask;
 use crate::frozen::{canonical_json, sha256_of, FrozenPlan};
 use crate::plan::{self, Hoist, Plan, StayReason, StepKey};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bump when what a template holds, or how its key is made, changes.
 pub const CACHE_SCHEMA: u32 = 1;
@@ -610,39 +610,94 @@ fn manifest(path: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-/// Where a workspace keeps its id, relative to its root.
-const WORKSPACE_ID: &str = ".local-ci/workspace-id";
+/// The file in a workspace's git dir that holds its id.
+const WORKSPACE_ID: &str = "local-ci-workspace-id";
 
-/// The id of the workspace at `root`, if it has one. [`crate::execute_setup`]
-/// gives a workspace its id the first time it prepares anything there; a copy
-/// of that workspace (a template materialized, a unit's copy) carries the file,
-/// and so the id, along with the installs it holds.
-pub fn workspace_id(root: &Path) -> Option<String> {
-    let id = std::fs::read_to_string(root.join(WORKSPACE_ID)).ok()?;
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_string())
+/// The git dir of the workspace at `root`: `.git` itself, or the directory a
+/// linked worktree's `.git` file points to (`<repo>/.git/worktrees/<name>`).
+/// It is outside the working tree, so no step, `git status` or tool that walks
+/// the tree can see what is kept there, and each worktree has its own.
+fn git_dir_of(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let dir = Path::new(text.trim().strip_prefix("gitdir:")?.trim());
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        root.join(dir)
+    };
+    dir.is_dir().then_some(dir)
 }
 
-/// The id of the workspace at `root`; made and written when it has none.
+/// Where the workspace at `root` stands, as `(file that keeps its id, the root
+/// it is recorded for)`. The recorded root is what keeps a copy from being
+/// taken for the original: a copied tree whose `.git` still points at the
+/// same git dir, or a copied `.git` directory, carries the file but sits at
+/// another path, and so has no id of its own until it is prepared itself.
+fn id_place(root: &Path) -> Option<(PathBuf, String)> {
+    let canon = std::fs::canonicalize(root).ok()?;
+    Some((
+        git_dir_of(root)?.join(WORKSPACE_ID),
+        canon.to_string_lossy().into_owned(),
+    ))
+}
+
+/// The id of the workspace at `root`, if it has one.
+///
+/// A workspace is a git worktree, and its id lives in its own git dir, never in
+/// the working tree: an untracked file there would show up in `git status`,
+/// `git diff`, formatters and packaging, which CI never sees. The id is
+/// recorded together with the path of the workspace and is believed only at
+/// that path, so a copy of the workspace (a materialized template, a unit's
+/// copy) is another workspace, not the original.
+///
+/// A directory that is not a git worktree has nothing to keep an id in. Its id
+/// is derived instead, from its path and (on unix) its device and inode, and
+/// nothing is written; a copy has another inode and so another id.
+pub fn workspace_id(root: &Path) -> Option<String> {
+    let Some((file, recorded)) = id_place(root) else {
+        return derived_id(root);
+    };
+    let text = std::fs::read_to_string(file).ok()?;
+    let (id, at) = text.split_once('\n')?;
+    (at.trim_end() == recorded && !id.is_empty()).then(|| id.to_string())
+}
+
+fn derived_id(root: &Path) -> Option<String> {
+    let canon = std::fs::canonicalize(root).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&canon).ok()?;
+        format!("{}:{}", md.dev(), md.ino())
+    };
+    #[cfg(not(unix))]
+    let ino = String::new();
+    Some(sha256_of(&format!("dir:{}:{ino}", canon.display())))
+}
+
+/// The id of the workspace at `root`; made and written (into its git dir)
+/// when it has none.
 pub(crate) fn ensure_workspace_id(root: &Path) -> Result<String> {
     if let Some(id) = workspace_id(root) {
         return Ok(id);
     }
+    let Some((file, recorded)) = id_place(root) else {
+        return derived_id(root).context("cannot derive an id for the workspace");
+    };
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let id = sha256_of(&format!(
-        "{}:{nanos}:{}:{}",
+        "{}:{nanos}:{}:{recorded}",
         std::process::id(),
         N.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-        root.display()
     ));
-    let file = root.join(WORKSPACE_ID);
-    if let Some(d) = file.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(&file, &id)?;
+    std::fs::write(&file, format!("{id}\n{recorded}"))?;
     Ok(id)
 }

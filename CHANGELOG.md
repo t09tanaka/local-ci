@@ -43,7 +43,7 @@
   reused, and `TemplateStore` keeps finished templates read-only and hands out
   copies. git, cp, portool and the version probes now start with the context's
   environment too. A receipt is believed only in the workspace it was made in
-  (`execute_setup` puts an id in `.local-ci/workspace-id`; a copy carries it),
+  (`execute_setup` keeps an id in the workspace's own git dir, outside the working tree, recorded with the workspace's path; a copy is another workspace and has no id until it is prepared itself),
   for the same commit and under the template key the task's recipe has with
   the `TemplateContext` given to `execute_task`; otherwise the task does its
   setup itself and `TaskResult::receipt_ignored` says why. A local run changes

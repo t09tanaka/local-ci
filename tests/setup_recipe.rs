@@ -279,6 +279,46 @@ fn a_job_that_stays_in_place_still_runs_the_step_itself() {
     assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
 }
 
+// ---- the workspace id stays out of the working tree ----
+
+#[test]
+fn the_workspace_id_is_not_a_file_in_the_working_tree_and_a_copy_does_not_inherit_it() {
+    let (tmp, dir, fp) = lab(TWO_JOBS);
+    let place = Place::new(&tmp, &dir, &fp);
+    let recipe_a = derive_setup_recipe(&fp, &id("a")).unwrap();
+    let ws = place.workspace("rep");
+    let done = place.setup(&ws, &recipe_a);
+    assert!(done.ok());
+    let id = local_ci::setup::workspace_id(&ws.root).unwrap();
+    assert_eq!(done.receipt.workspace, id);
+
+    // nothing of the id is visible from the working tree (the install's own
+    // output is, and is the only thing there)
+    assert!(!ws.root.join(".local-ci").exists());
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(!status.contains("local-ci"), "{status}");
+    assert!(!status.contains("workspace-id"), "{status}");
+
+    // a plain copy of the tree (its .git still points at the same git dir) is
+    // not the same workspace
+    let copy = place.cache.join("wt").join("rep-copy");
+    let cp = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(&ws.root)
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(cp.success());
+    assert_eq!(local_ci::setup::workspace_id(&copy), None);
+    assert_eq!(local_ci::setup::workspace_id(&ws.root), Some(id));
+}
+
 // ---- A15 ----
 
 #[test]
