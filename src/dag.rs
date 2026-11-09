@@ -282,8 +282,6 @@ pub struct WorkspacePolicy {
     pub own_checkout: bool,
     /// The jobs of the task share that checkout.
     pub shared_by_jobs: bool,
-    /// The installs hoisted into the plan's setup have to be done in it.
-    pub needs_hoisted_setup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -441,7 +439,6 @@ pub(crate) fn derive_tasks(
     plan: &Plan,
     specs: &[WorkflowSpec],
     units: &[UnitSpec],
-    has_setup: bool,
 ) -> (Vec<ExecutionTask>, Vec<ShardGroup>) {
     let mut tasks: Vec<ExecutionTask> = Vec::new();
     for (ui, u) in units.iter().enumerate() {
@@ -549,7 +546,6 @@ pub(crate) fn derive_tasks(
                 workspace: WorkspacePolicy {
                     own_checkout: true,
                     shared_by_jobs: g.len() > 1,
-                    needs_hoisted_setup: has_setup,
                 },
                 services: specs_of
                     .iter()

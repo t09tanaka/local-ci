@@ -9,14 +9,14 @@
 
 use crate::dag::{self, ExecutionTask, JobGraph, ShardGroup};
 use crate::plan::Plan;
-use crate::wire::{JobSpec, SetupSpec, UnitSpec, WorkflowSpec};
+use crate::wire::{JobSpec, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bumped when the shape of a [`FrozenPlan`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// What the plan was made from: a commit and the ref it was compared with.
 /// (Snapshots of uncommitted work are added later.)
@@ -130,7 +130,6 @@ pub struct FrozenPlan {
     pub disabled: DisabledRecord,
     /// How a local run groups, schedules and reports jobs.
     pub units: Vec<UnitSpec>,
-    pub setup: Vec<SetupSpec>,
     /// The jobs and what they wait for.
     pub graph: JobGraph,
     /// What can be placed on a host, in an order each task can run after the
@@ -185,7 +184,6 @@ fn drop_workflows(plan: &mut Plan, broken: &[(usize, String)]) {
         }
         None => false,
     });
-    crate::plan::fill_setup(plan);
 }
 
 /// `value` as compact JSON with the keys of every object sorted.
@@ -208,7 +206,7 @@ pub fn canonical_json(value: &Value) -> String {
     sorted(value).to_string()
 }
 
-fn sha256_of(text: &str) -> String {
+pub(crate) fn sha256_of(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -241,14 +239,8 @@ impl FrozenPlan {
             drop_workflows(&mut parts.plan, &broken);
             (workflows, units) = specs(&parts.plan);
         }
-        let setup: Vec<SetupSpec> = parts.plan.setup.iter().map(SetupSpec::from_setup).collect();
         let graph = dag::build_graph(&workflows, &units)?;
-        let (tasks, shard_groups) = dag::derive_tasks(
-            &parts.plan,
-            &workflows,
-            &units,
-            setup.iter().any(|s| s.execute),
-        );
+        let (tasks, shard_groups) = dag::derive_tasks(&parts.plan, &workflows, &units);
         let mut fp = FrozenPlan {
             schema_version: SCHEMA_VERSION,
             digest: String::new(),
@@ -268,7 +260,6 @@ impl FrozenPlan {
                 .collect(),
             disabled: parts.disabled,
             units,
-            setup,
             graph,
             tasks,
             shard_groups,
@@ -336,11 +327,10 @@ impl FrozenPlan {
                 .map(|s| (s.workflow.clone(), s.reason.clone()))
                 .collect(),
             units: self.units.iter().map(UnitSpec::to_unit).collect(),
-            setup: self.setup.iter().map(SetupSpec::to_setup).collect(),
         }
     }
 
-    /// This plan with `plan` as its workflows, units and setup (for running a
+    /// This plan with `plan` as its workflows and units (for running a
     /// part of it), sealed again under a new digest.
     pub fn with_plan(&self, plan: Plan) -> Result<Self> {
         FrozenPlan::new(PlanParts {

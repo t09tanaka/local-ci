@@ -1,4 +1,5 @@
-//! Turn the triggered workflows into execution units and a shared setup list.
+//! Turn the triggered workflows into execution units, and work out which
+//! leading installs of their jobs count as setup.
 //!
 //! A unit is a set of jobs that runs in order on one thread; units run in
 //! parallel. Jobs land in one unit when they are linked by `needs:`, or when
@@ -8,9 +9,10 @@
 //! another local-ci run of the same repository.
 //!
 //! Every job of a workflow starts with the same install steps (`npm ci` ...),
-//! because each CI job gets a fresh VM. Here they are hoisted into a setup list
-//! that runs once, before any unit; the jobs skip them, and each unit starts
-//! from a copy of the worktree as setup left it.
+//! because each CI job gets a fresh VM. Those leading steps are the setup of a
+//! task (see [`crate::setup`]): a local run does each of them once and the
+//! tasks skip what the setup did, and a task placed on its own host does its
+//! own.
 
 use crate::filter::{decide, Decision, Event};
 use crate::workflow::{Job, Step, Workflow};
@@ -40,23 +42,11 @@ pub struct StepKey {
     pub env: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SetupStep {
-    pub key: StepKey,
-    pub label: String,
-    pub shell: Option<String>,
-    pub wf: usize,
-    pub job: String,
-    /// False when an equivalent install in the same directory already ran.
-    pub execute: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub selected: Vec<Selected>,
     pub skipped: Vec<(String, String)>,
     pub units: Vec<Unit>,
-    pub setup: Vec<SetupStep>,
 }
 
 impl Plan {
@@ -67,9 +57,6 @@ impl Plan {
             .iter()
             .find(|j| j.id == id)
             .expect("job in plan")
-    }
-    pub fn is_setup(&self, k: &StepKey) -> bool {
-        self.setup.iter().any(|s| &s.key == k)
     }
 }
 
@@ -217,7 +204,7 @@ pub fn is_installer(run: &str) -> bool {
 }
 
 /// `npm ci --no-audit` and `npm ci` install the same thing; run only the first one per directory.
-fn install_family(run: &str) -> Option<String> {
+pub(crate) fn install_family(run: &str) -> Option<String> {
     if !is_installer(run) {
         return None;
     }
@@ -265,33 +252,128 @@ pub(crate) fn writes(w: &Workflow, j: &Job) -> BTreeSet<String> {
     out
 }
 
-fn hoistable(j: &Job, s: &Step) -> bool {
-    let Some(run) = &s.run else { return false };
-    if run.contains("${{") || s.env.iter().any(|(_, v)| v.contains("${{")) || s.cond.is_some() {
-        return false;
-    }
-    if !j.services.is_empty() {
-        // anything but an install may need the job's database
-        return is_installer(run) && !mentions_service_port(j, run);
-    }
-    true
+/// Why a step that looks like preparation stays where it is in its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StayReason {
+    /// Its script or env holds an expression (`${{ ... }}`).
+    Expression,
+    /// The env of its job or workflow depends on `needs`, `matrix` or `steps`.
+    RuntimeEnv,
+    /// It has an `if:`.
+    Conditional,
+    /// It may need the job's service containers.
+    ServiceDependent,
+    /// It writes `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT` or `GITHUB_STATE`,
+    /// which cannot be captured and replayed.
+    EnvFileEffect,
+    /// It makes an environment tied to an absolute path (a Python venv).
+    AbsolutePath,
 }
 
-/// The leading steps of a job that could be setup: plumbing `uses:` are passed over,
-/// the first step that is neither plumbing nor hoistable ends it.
-fn prefix<'a>(w: &Workflow, j: &'a Job) -> Vec<(StepKey, &'a Step)> {
-    let mut out = Vec::new();
-    for s in &j.steps {
+impl StayReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            StayReason::Expression => "uses an expression evaluated at run time",
+            StayReason::RuntimeEnv => "its env depends on needs, matrix or step outputs",
+            StayReason::Conditional => "has an `if:`",
+            StayReason::ServiceDependent => "may need the job's services",
+            StayReason::EnvFileEffect => "writes GITHUB_ENV, GITHUB_PATH or a step output",
+            StayReason::AbsolutePath => "builds an environment tied to an absolute path",
+        }
+    }
+}
+
+fn env_file_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"GITHUB_(ENV|PATH|OUTPUT|STATE)\b").unwrap())
+}
+
+fn absolute_env_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"\b(venv|virtualenv|pipenv|conda)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\b",
+        )
+        .unwrap()
+    })
+}
+
+fn runtime_expr(v: &str) -> bool {
+    v.contains("${{")
+        && ["needs.", "matrix.", "steps.", "strategy."]
+            .iter()
+            .any(|p| v.contains(p))
+}
+
+/// What keeps a `run:` step from being setup, if anything.
+pub(crate) fn stay_reason(w: &Workflow, j: &Job, s: &Step) -> Option<StayReason> {
+    let run = s.run.as_deref()?;
+    if run.contains("${{") || s.env.iter().any(|(_, v)| v.contains("${{")) {
+        return Some(StayReason::Expression);
+    }
+    if w.env
+        .iter()
+        .chain(j.env.iter())
+        .any(|(_, v)| runtime_expr(v))
+    {
+        return Some(StayReason::RuntimeEnv);
+    }
+    if s.cond.is_some() {
+        return Some(StayReason::Conditional);
+    }
+    if env_file_re().is_match(run) {
+        return Some(StayReason::EnvFileEffect);
+    }
+    if absolute_env_re().is_match(run) {
+        return Some(StayReason::AbsolutePath);
+    }
+    if !j.services.is_empty() && (!is_installer(run) || mentions_service_port(j, run)) {
+        // anything but an install may need the job's database
+        return Some(StayReason::ServiceDependent);
+    }
+    None
+}
+
+/// A leading step of a job that could be setup.
+pub(crate) struct PrefixStep<'a> {
+    /// Its place in the steps of the job.
+    pub index: usize,
+    pub key: StepKey,
+    pub step: &'a Step,
+}
+
+/// The leading steps of a job that could be setup, and the step that ended
+/// them with the reason, when there is one. Plumbing `uses:` are passed over;
+/// the first step that is neither plumbing nor possible setup ends it.
+pub(crate) struct Prefix<'a> {
+    pub steps: Vec<PrefixStep<'a>>,
+    pub stopped_by: Option<(usize, StayReason)>,
+}
+
+pub(crate) fn prefix_of<'a>(w: &Workflow, j: &'a Job) -> Prefix<'a> {
+    let mut out = Prefix {
+        steps: Vec::new(),
+        stopped_by: None,
+    };
+    for (index, s) in j.steps.iter().enumerate() {
         if let Some(u) = &s.uses {
             if is_plumbing(u) {
                 continue;
             }
             break;
         }
-        if !hoistable(j, s) {
+        if s.run.is_none() {
             break;
         }
-        out.push((step_key(w, j, s).unwrap(), s));
+        if let Some(r) = stay_reason(w, j, s) {
+            out.stopped_by = Some((index, r));
+            break;
+        }
+        out.steps.push(PrefixStep {
+            index,
+            key: step_key(w, j, s).unwrap(),
+            step: s,
+        });
     }
     out
 }
@@ -323,9 +405,6 @@ fn topo(jobs: &[&Job]) -> Vec<String> {
     }
     done
 }
-
-/// A job's workflow index, the job, and its hoistable leading steps.
-type JobPrefix<'a> = (usize, &'a Job, Vec<(StepKey, &'a Step)>);
 
 pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
     let mut plan = Plan::default();
@@ -398,17 +477,15 @@ pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
         }
     }
 
-    fill_setup(&mut plan);
     plan
 }
 
-/// Setup: steps from the common head of the jobs that are installs, or that
-/// several jobs repeat word for word, as long as everything before them in
-/// each of those jobs is also hoisted. Worked out again when units are taken
-/// out of the plan (their results are reused).
-pub fn fill_setup(plan: &mut Plan) {
-    plan.setup.clear();
-    let mut prefixes: Vec<JobPrefix> = Vec::new();
+/// The steps that count as setup: from the common head of the jobs, those
+/// that are installs, or that several jobs repeat word for word, as long as
+/// everything before them in each of those jobs is also setup. Worked out from
+/// the plan alone, so it is the same wherever it is asked.
+pub(crate) fn hoisted_keys(plan: &Plan) -> BTreeSet<StepKey> {
+    let mut prefixes: Vec<Vec<StepKey>> = Vec::new();
     for u in &plan.units {
         let w = &plan.selected[u.wf].wf;
         for id in &u.jobs {
@@ -416,26 +493,26 @@ pub fn fill_setup(plan: &mut Plan) {
             if j.container || j.reusable.is_some() {
                 continue;
             }
-            prefixes.push((u.wf, j, prefix(w, j)));
+            prefixes.push(prefix_of(w, j).steps.into_iter().map(|p| p.key).collect());
         }
     }
-    let mut count: HashMap<StepKey, usize> = HashMap::new();
-    for (_, _, p) in &prefixes {
-        let uniq: BTreeSet<&StepKey> = p.iter().map(|(k, _)| k).collect();
+    let mut count: HashMap<&StepKey, usize> = HashMap::new();
+    for p in &prefixes {
+        let uniq: BTreeSet<&StepKey> = p.iter().collect();
         for k in uniq {
-            *count.entry(k.clone()).or_default() += 1;
+            *count.entry(k).or_default() += 1;
         }
     }
     let mut hoisted: BTreeSet<StepKey> = count
         .iter()
         .filter(|(k, c)| **c >= 2 || is_installer(&k.run))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| (*k).clone())
         .collect();
     loop {
         let mut drop = BTreeSet::new();
-        for (_, _, p) in &prefixes {
+        for p in &prefixes {
             let mut clean = true;
-            for (k, _) in p {
+            for k in p {
                 if !hoisted.contains(k) {
                     clean = false;
                 } else if !clean {
@@ -450,25 +527,7 @@ pub fn fill_setup(plan: &mut Plan) {
             hoisted.remove(&k);
         }
     }
-    for (wf, j, p) in &prefixes {
-        for (k, s) in p {
-            if hoisted.contains(k) && !plan.setup.iter().any(|x| &x.key == k) {
-                let fam = install_family(&k.run);
-                let execute = fam.is_none()
-                    || !plan.setup.iter().any(|x| {
-                        x.execute && x.key.wd == k.wd && install_family(&x.key.run) == fam
-                    });
-                plan.setup.push(SetupStep {
-                    key: k.clone(),
-                    label: s.label(),
-                    shell: s.shell.clone(),
-                    wf: *wf,
-                    job: j.id.clone(),
-                    execute,
-                });
-            }
-        }
-    }
+    hoisted
 }
 
 #[cfg(test)]
@@ -543,9 +602,10 @@ jobs:
                 (vec!["int".to_string()], true),
             ]
         );
-        let setup: Vec<&str> = p.setup.iter().map(|s| s.key.run.as_str()).collect();
-        assert_eq!(setup, vec!["npm ci", "npx prisma generate"]);
-        assert!(p.setup.iter().all(|s| s.key.wd == "app"));
+        let setup = hoisted_keys(&p);
+        let runs: Vec<&str> = setup.iter().map(|k| k.run.as_str()).collect();
+        assert_eq!(runs, vec!["npm ci", "npx prisma generate"]);
+        assert!(setup.iter().all(|k| k.wd == "app"));
     }
 
     #[test]
@@ -584,7 +644,7 @@ jobs:
 "#;
         let p = build(vec![parse("x.yml", wf).unwrap()], &ev(), &[]);
         // `npm run migrate` repeats, but in `a` it follows a step that is not hoisted
-        assert!(p.setup.is_empty());
+        assert!(hoisted_keys(&p).is_empty());
     }
 
     #[test]

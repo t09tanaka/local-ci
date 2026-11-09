@@ -17,7 +17,7 @@
   recorded. `execute_task` runs one task from the results and outputs of the
   jobs it needs (`TaskInputs`) and returns a `TaskResult`; a matrix job's
   outputs are merged in matrix order, not in the order the variants finish.
-  The plan carries its own wire types (`wire`, schema version 2) instead of the
+  The plan carries its own wire types (`wire`) instead of the
   engine's, and records the disabled-workflow list it was made with;
   `build_frozen_plan_with` takes that list so planning needs no network.
   `ExecContext` is no longer `Clone` (`fresh_attempt` makes a second one), and
@@ -29,6 +29,23 @@
   `cancelled` for the jobs that need it (`cancelled()`, `needs.<id>.result`),
   and a matrix is `failure` if any entry failed, else `cancelled` if any was.
   No other change to the command line.
+- Library: setup is per task. `derive_setup_recipe` gives each task the install
+  steps it starts with, in order, with their directory, resolved shell (step,
+  job, workflow) and combined env, the toolchain versions its jobs ask for, and
+  the preparation that stays in its job with the reason (`setup` module). The
+  plan no longer records an `execute` flag or an owning job for hoisted
+  installs (wire schema version 3). `execute_setup` does a recipe and returns a
+  `PreparedReceipt`; `execute_task` takes an optional receipt, skips the steps
+  it names and runs every other one itself, so a task placed away from the
+  host that did the installs misses nothing. A `TemplateKey` (source, steps,
+  directory, shell, env, toolchain, OS, arch, profile, cache schema, run or
+  persistent scope, freshness, secret digests) says when prepared work may be
+  reused, and `TemplateStore` keeps finished templates read-only and hands out
+  copies. git, cp, portool and the version probes now start with the context's
+  environment too. A local run is unchanged except that setup goes through
+  canirun when it is installed, a step that writes `GITHUB_ENV`/`GITHUB_PATH`
+  or builds a Python venv (`pip install` included) is no longer hoisted, and
+  setup uses the step's resolved shell instead of the step's own only.
 
 ## 0.7.0
 

@@ -15,7 +15,7 @@ use crate::frozen::{
     DisabledRecord, DisabledSource, DisabledWorkflow, Filters, FrozenConfig, FrozenPlan, PlanParts,
     SourceRef,
 };
-use crate::{cache, config, exec, filter, git, plan, report, workflow};
+use crate::{cache, config, exec, filter, git, plan, report, setup, workflow};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
@@ -281,9 +281,6 @@ fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
         u.jobs.retain(|j| keep.contains(j));
     }
     p.units.retain(|u| !u.jobs.is_empty());
-    // worked out again rather than filtered: an install kept from a job left
-    // out may be the one that runs, its twin in a kept job marked not to
-    plan::fill_setup(p);
 }
 
 /// One key per repository, shared by all of its worktrees.
@@ -392,7 +389,9 @@ pub fn build_frozen_plan_with(
     freeze(ctx, &repo, p, t)
 }
 
-fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
+/// Fix an already resolved plan (what [`build_frozen_plan`] does after
+/// [`resolve`]).
+pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
     FrozenPlan::new(PlanParts {
         repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {
@@ -442,11 +441,35 @@ pub fn execute_plan(
         ));
     }
     let keep = opts.keep;
-    let runner = exec::Runner::new(ctx, fp, ws, opts);
+    let mut runner = exec::Runner::new(ctx, fp, ws, opts);
     let result = (|| -> Result<_> {
         runner.prepare_tools()?;
-        let setup = runner.run_setup();
-        let ok = setup.iter().all(|s| s.outcome == exec::Outcome::Pass);
+        // Each task has a recipe of its own. This run does them in the one
+        // workspace, each step once, and tells every task which of its steps
+        // that covered; a template key shared by several tasks is prepared
+        // (and receipted) once.
+        let recipes = runner.task_recipes()?;
+        let run_id = ws
+            .run_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tctx = setup::TemplateContext::local(fp, &run_id);
+        let all = setup::SetupRecipe::union(&recipes.iter().map(|(_, r)| r).collect::<Vec<_>>());
+        let done = runner.run_recipe(&all, all.template_key(&tctx).digest());
+        let ok = done.ok();
+        let mut by_key: std::collections::HashMap<String, setup::PreparedReceipt> =
+            Default::default();
+        let mut receipts = std::collections::HashMap::new();
+        for (task, recipe) in &recipes {
+            let key = recipe.template_key(&tctx);
+            let r = by_key
+                .entry(key.digest().to_string())
+                .or_insert_with(|| done.receipt.restricted_to(recipe, &key));
+            receipts.insert(task.clone(), r.clone());
+        }
+        runner.set_receipts(receipts);
+        let setup = done.steps;
         let units = if ok && !ctx.cancel.is_cancelled() {
             runner.run_units()
         } else {
@@ -529,9 +552,6 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         }
     }
     p.units = to_run;
-    if !reused.is_empty() {
-        plan::fill_setup(&mut p);
-    }
     // what is left to run, fixed again
     let fp = full.with_plan(p)?;
     let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));

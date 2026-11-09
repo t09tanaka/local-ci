@@ -6,13 +6,14 @@ use crate::expr::{self, Ctx, Status};
 use crate::frozen::FrozenPlan;
 use crate::matrix;
 use crate::plan::{self, Plan, Unit};
+use crate::setup::{self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe};
 use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, TaskResult};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
@@ -223,6 +224,9 @@ pub struct Runner<'a> {
     pub slug: String,
     pub opts: Opts,
     pub base_path: String,
+    /// The keys of the steps that count as setup, from the plan alone.
+    hoisted: BTreeSet<plan::StepKey>,
+    receipts: HashMap<String, PreparedReceipt>,
     seq: AtomicUsize,
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
@@ -758,10 +762,13 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 impl<'a> Runner<'a> {
     pub fn new(ctx: &'a ExecContext, fp: &'a FrozenPlan, ws: &Workspace, opts: Opts) -> Self {
         let base_path = ctx.var("PATH").unwrap_or_default().to_string();
+        let plan = fp.to_plan();
         Runner {
             ctx,
             fp,
-            plan: fp.to_plan(),
+            hoisted: plan::hoisted_keys(&plan),
+            plan,
+            receipts: HashMap::new(),
             repo_root: ws.repo_root.clone(),
             wt: ws.root.clone(),
             run_dir: ws.run_dir.clone(),
@@ -1157,46 +1164,100 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    pub fn run_setup(&self) -> Vec<StepResult> {
+    /// What each task of the plan was told is prepared, by task id. Set before
+    /// [`Runner::run_units`]; a task without an entry prepares everything itself.
+    pub fn set_receipts(&mut self, receipts: HashMap<String, PreparedReceipt>) {
+        self.receipts = receipts;
+    }
+
+    /// Do the steps of `recipe` in the workspace, in order, and stop at the first
+    /// that does not pass. `key` is the digest of the template key the receipt
+    /// is for.
+    /// The recipe of each task of the plan, in the plan's order.
+    pub fn task_recipes(&self) -> Result<Vec<(String, SetupRecipe)>> {
+        self.fp
+            .tasks
+            .iter()
+            .map(|t| {
+                Ok((
+                    t.id.clone(),
+                    setup::derive_in(&self.plan, &self.hoisted, t)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> PreparedSetup {
+        if recipe.steps.is_empty() {
+            return PreparedSetup {
+                receipt: PreparedReceipt::empty(key, &self.fp.source.sha),
+                steps: vec![],
+            };
+        }
+        let covered = setup::covered_by(recipe);
+        let dirs: BTreeSet<String> = recipe.steps.iter().map(|s| s.dir.clone()).collect();
+        let before = setup::top_level_entries(&self.wt, &dirs);
         let mut out = Vec::new();
-        for (i, s) in self.plan.setup.iter().enumerate() {
-            if !s.execute {
-                continue;
-            }
-            let sel = &self.plan.selected[s.wf];
-            let job = self.plan.job(s.wf, &s.job);
-            let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &job.id);
-            let mut env = self.base_env(&gh, &[]);
-            for (k, v) in sel
-                .wf
-                .env
-                .iter()
-                .chain(job.env.iter())
-                .chain(s.key.env.iter())
-            {
-                if !v.contains("${{") {
-                    env.push((k.clone(), v.clone()));
+        let mut prepared: Vec<PreparedStep> = Vec::new();
+        for (i, s) in recipe.steps.iter().enumerate() {
+            if let Some(by) = covered.get(&s.id) {
+                if prepared.iter().any(|p| &p.id == by) {
+                    prepared.push(PreparedStep {
+                        id: s.id.clone(),
+                        how: PreparedHow::SameAs { step: by.clone() },
+                    });
+                    continue;
                 }
             }
-            let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.key.wd, s.label));
+            let label = format!(
+                "{}$ {}",
+                if s.dir.is_empty() { "." } else { &s.dir },
+                s.label
+            );
+            let found = self
+                .plan
+                .selected
+                .iter()
+                .position(|x| x.wf.file == s.workflow)
+                .filter(|wi| {
+                    self.plan.selected[*wi]
+                        .wf
+                        .jobs
+                        .iter()
+                        .any(|j| j.id == s.job)
+                });
+            let Some(wi) = found else {
+                out.push(StepResult {
+                    label,
+                    outcome: Outcome::Error(format!(
+                        "the plan has no job {} in {}",
+                        s.job, s.workflow
+                    )),
+                    exit: None,
+                    secs: 0.0,
+                    log: None,
+                    note: None,
+                });
+                break;
+            };
+            let sel = &self.plan.selected[wi];
+            let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &s.job);
+            let mut env = self.base_env(&gh, &[]);
+            env.extend(s.env.iter().cloned());
+            let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.dir, s.label));
             let t0 = Instant::now();
-            let cwd = self.wt.join(&s.key.wd);
+            let cwd = self.wt.join(&s.dir);
             let res = self
                 .shell(
                     &cwd,
-                    &s.key.run,
+                    &s.run,
                     s.shell.as_deref(),
                     &env,
                     Some(Duration::from_secs(1800)),
                     &log,
-                    None,
+                    Some(format!("local-ci setup {label}")),
                 )
                 .map(|(exit, _)| exit);
-            let label = format!(
-                "{}$ {}",
-                if s.key.wd.is_empty() { "." } else { &s.key.wd },
-                s.label
-            );
             let (outcome, exit) = match res {
                 Ok(Exit::Code(0)) => (Outcome::Pass, Some(0)),
                 Ok(Exit::Code(c)) => (Outcome::Fail, Some(c)),
@@ -1205,6 +1266,12 @@ impl<'a> Runner<'a> {
                 Err(e) => (Outcome::Error(format!("{e:#}")), None),
             };
             let stop = outcome != Outcome::Pass;
+            if !stop {
+                prepared.push(PreparedStep {
+                    id: s.id.clone(),
+                    how: PreparedHow::Ran,
+                });
+            }
             out.push(StepResult {
                 label,
                 outcome,
@@ -1217,7 +1284,24 @@ impl<'a> Runner<'a> {
                 break;
             }
         }
-        out
+        let artifacts = if out.iter().all(|r| r.outcome == Outcome::Pass) {
+            setup::artifact_digests(
+                &self.wt,
+                &before,
+                &setup::top_level_entries(&self.wt, &dirs),
+            )
+        } else {
+            vec![]
+        };
+        PreparedSetup {
+            receipt: PreparedReceipt {
+                template_key: key.into(),
+                source: self.fp.source.sha.clone(),
+                steps: prepared,
+                artifacts,
+            },
+            steps: out,
+        }
     }
 
     pub fn run_units(&self) -> Vec<UnitResult> {
@@ -1449,7 +1533,7 @@ impl<'a> Runner<'a> {
             if task.variant.as_ref().is_some_and(|v| v.index > 0) {
                 continue;
             }
-            match self.run_task(ws, task, &inputs, locked, true) {
+            match self.run_task(ws, task, &inputs, self.receipts.get(&task.id), locked, true) {
                 Ok(r) => {
                     for o in r.outcomes {
                         inputs.needs.insert(o.job.clone(), o);
@@ -1498,6 +1582,7 @@ impl<'a> Runner<'a> {
         ws: &Path,
         task: &ExecutionTask,
         inputs: &TaskInputs,
+        prepared: Option<&PreparedReceipt>,
         locked: bool,
         whole_matrix: bool,
     ) -> Result<TaskResult> {
@@ -1526,12 +1611,27 @@ impl<'a> Runner<'a> {
             (Some(v), false) => Some(v.index),
             _ => None,
         };
+        let places = match prepared {
+            Some(r) => setup::derive_in(&self.plan, &self.hoisted, task)?
+                .prepared_places(r, &self.fp.source.sha),
+            None => HashMap::new(),
+        };
+        let none = HashSet::new();
         let mut needs_ctx = inputs.context();
         let mut jobs = Vec::new();
         let mut outcomes = Vec::new();
         for id in &task.jobs {
             let job = self.plan.job(wi, id);
-            let results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked, only);
+            let results = self.run_job(
+                ws,
+                w,
+                &sel.event,
+                job,
+                &needs_ctx,
+                places.get(id).unwrap_or(&none),
+                locked,
+                only,
+            );
             let parts: Vec<JobOutcome> = results
                 .iter()
                 .enumerate()
@@ -1567,6 +1667,8 @@ impl<'a> Runner<'a> {
         event: &str,
         job: &Job,
         needs: &Map<String, Value>,
+        // steps (by index) the task's setup already did
+        prepared: &HashSet<usize>,
         // the unit holds the per-repository lock
         locked: bool,
         // run only this entry of the matrix
@@ -1740,7 +1842,7 @@ impl<'a> Runner<'a> {
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
             }
-            let mut r = self.run_combo(ws, w, job, cm, display, stop);
+            let mut r = self.run_combo(ws, w, job, prepared, cm, display, stop);
             drop(slot);
             drop(lock);
             let secs = r.0.secs;
@@ -1816,11 +1918,13 @@ impl<'a> Runner<'a> {
         Ok(secrets)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_combo(
         &self,
         ws: &Path,
         w: &Workflow,
         job: &Job,
+        prepared: &HashSet<usize>,
         mut cm: Map<String, Value>,
         display: String,
         // set when another entry of a fail-fast matrix failed
@@ -2034,12 +2138,10 @@ impl<'a> Runner<'a> {
                 );
                 continue;
             };
-            if let Some(k) = plan::step_key(w, job, s) {
-                if self.plan.is_setup(&k) {
-                    push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
-                    record(&mut steps_ctx, &s.id, "success", "success", Map::new());
-                    continue;
-                }
+            if prepared.contains(&n) {
+                push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
+                record(&mut steps_ctx, &s.id, "success", "success", Map::new());
+                continue;
             }
             if remote_effect(run) {
                 push(

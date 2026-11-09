@@ -287,7 +287,7 @@ fn matrix_size(m: &serde_yaml::Value) -> usize {
     }
 }
 
-fn print_plan(r: &Repo, p: &plan::Plan) {
+fn print_plan(r: &Repo, p: &plan::Plan, fp: &local_ci::FrozenPlan) {
     let dir = r.default_workflows_dir.as_str();
     println!(
         "local-ci plan  {} vs {} ({} file{} changed, {}){}",
@@ -306,20 +306,35 @@ fn print_plan(r: &Repo, p: &plan::Plan) {
             ""
         }
     );
-    if !p.setup.is_empty() {
-        let s: Vec<String> = p
-            .setup
+    let recipes: Vec<local_ci::setup::SetupRecipe> = fp
+        .tasks
+        .iter()
+        .filter_map(|t| local_ci::setup::derive_setup_recipe(fp, &t.id).ok())
+        .collect();
+    let all = local_ci::setup::SetupRecipe::union(&recipes.iter().collect::<Vec<_>>());
+    let covered = local_ci::setup::covered_by(&all);
+    if !all.steps.is_empty() {
+        let s: Vec<String> = all
+            .steps
             .iter()
-            .filter(|s| s.execute)
+            .filter(|s| !covered.contains_key(&s.id))
             .map(|s| {
                 format!(
                     "{}$ {}",
-                    if s.key.wd.is_empty() { "." } else { &s.key.wd },
+                    if s.dir.is_empty() { "." } else { &s.dir },
                     s.label
                 )
             })
             .collect();
         println!("setup (once): {}", s.join(" | "));
+    }
+    for l in &all.left_in_place {
+        println!(
+            "setup stays in {}: {} ({})",
+            l.job,
+            l.label,
+            l.reason.describe()
+        );
     }
     for (i, u) in p.units.iter().enumerate() {
         let w = &p.selected[u.wf].wf;
@@ -353,21 +368,18 @@ fn main() {
     let cli = Cli::parse();
     let ctx = context();
     let res = match cli.cmd {
-        Cmd::Plan { target } => target
-            .into_target()
-            .and_then(|t| {
-                local_ci::resolve(
-                    &ctx,
-                    &t,
-                    &mut Stderr {
-                        cancel: ctx.cancel.clone(),
-                    },
-                )
-            })
-            .map(|(r, p)| {
-                print_plan(&r, &p);
-                0
-            }),
+        Cmd::Plan { target } => target.into_target().and_then(|t| {
+            let (r, p) = local_ci::resolve(
+                &ctx,
+                &t,
+                &mut Stderr {
+                    cancel: ctx.cancel.clone(),
+                },
+            )?;
+            let fp = local_ci::freeze(&ctx, &r, p.clone(), &t)?;
+            print_plan(&r, &p, &fp);
+            Ok(0)
+        }),
         Cmd::Run(a) => run(&ctx, a),
         Cmd::Status { dir, sha } => status(&ctx, dir, &sha),
     };

@@ -12,7 +12,7 @@
 //! strings (see [`MatrixValue::from_yaml`]) so a workflow with a number or
 //! `null` as a mapping key still gives a plan.
 
-use crate::plan::{Selected, SetupStep, StepKey, Unit};
+use crate::plan::{Selected, Unit};
 use crate::workflow::{Job, Service, Step, Trigger, Workflow};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as Y;
@@ -214,19 +214,6 @@ pub struct UnitSpec {
     pub exclusive: bool,
 }
 
-/// An install that runs once before the units (replaced by setup recipes later).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SetupSpec {
-    pub dir: String,
-    pub run: String,
-    pub env: Vec<(String, String)>,
-    pub label: String,
-    pub shell: Option<String>,
-    pub workflow: usize,
-    pub job: String,
-    pub execute: bool,
-}
-
 impl ServiceSpec {
     pub fn from_service(s: &Service) -> Self {
         ServiceSpec {
@@ -405,35 +392,6 @@ impl UnitSpec {
             wf: self.workflow,
             jobs: self.jobs.clone(),
             exclusive: self.exclusive,
-        }
-    }
-}
-
-impl SetupSpec {
-    pub fn from_setup(s: &SetupStep) -> Self {
-        SetupSpec {
-            dir: s.key.wd.clone(),
-            run: s.key.run.clone(),
-            env: s.key.env.clone(),
-            label: s.label.clone(),
-            shell: s.shell.clone(),
-            workflow: s.wf,
-            job: s.job.clone(),
-            execute: s.execute,
-        }
-    }
-    pub fn to_setup(&self) -> SetupStep {
-        SetupStep {
-            key: StepKey {
-                wd: self.dir.clone(),
-                run: self.run.clone(),
-                env: self.env.clone(),
-            },
-            label: self.label.clone(),
-            shell: self.shell.clone(),
-            wf: self.workflow,
-            job: self.job.clone(),
-            execute: self.execute,
         }
     }
 }

@@ -154,9 +154,14 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    files are harmless. The worktree is removed afterwards.
 2. **Setup, once.** In CI every job runs `npm ci` on a fresh VM. Locally that
    would install the same dependencies once per job. Install steps
-   (`npm ci`, `pip install`, `flutter pub get`, `npx prisma generate`, ...)
+   (`npm ci`, `flutter pub get`, `npx prisma generate`, ...)
    and steps that several jobs repeat word for word at their start are run
-   once, before any job, and skipped in the jobs. Installs that happen later
+   once, before any job, and skipped in the jobs. A step whose result cannot be
+   carried to another job stays in its job: one that holds an expression,
+   an `if:` or `needs`/`matrix`-dependent env, one that needs the job's
+   services, one that writes `GITHUB_ENV`/`GITHUB_PATH`/step outputs, and
+   Python venv / `pip install` steps (the venv lives at an absolute path).
+   `local-ci plan` lists them with the reason. Installs that happen later
    anyway (a matrix job, a script that calls `npm ci`) go through an `npm`
    wrapper on `PATH`: a directory is installed once per run and lockfile, and
    later `npm ci` / `npm install` there are no-ops.
@@ -248,7 +253,7 @@ into a prefix of the run, so neither changes your machine.
 ## Working with other tools
 
 - **[canirun](https://github.com/t09tanaka/canirun)**: when it is installed,
-  every `run:` step outside setup is wrapped in `canirun exec`, so heavy steps
+  every `run:` step, setup included, is wrapped in `canirun exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
 - **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
   `.portool.toml`, each exclusive job without `services:` asks portool for a

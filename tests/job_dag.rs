@@ -366,7 +366,7 @@ impl Lab {
             keep: false,
             trash: self.cache.join("trash"),
         };
-        let r = local_ci::execute_task(c, &self.fp, task, inputs, &ws, opts);
+        let r = local_ci::execute_task(c, &self.fp, task, inputs, None, &ws, opts);
         local_ci::git::remove_worktree(c, &self.dir, &wt, &self.cache.join("trash"));
         r
     }

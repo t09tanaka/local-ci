@@ -10,6 +10,7 @@ use crate::context::ExecContext;
 use crate::dag::{JobNode, NodeKind};
 use crate::exec::{JobResult, Opts, Outcome, Runner, Workspace};
 use crate::frozen::FrozenPlan;
+use crate::setup::{PreparedReceipt, PreparedSetup, SetupRecipe, TemplateKey};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -187,18 +188,21 @@ pub fn aggregate_matrix(group: &JobNode, variants: &[JobOutcome]) -> Result<JobO
     Ok(combine(&group.job, variants.to_vec()))
 }
 
-/// Run the installs the plan hoisted, in `ws`. A task assumes they are done in
-/// the workspace it is given (see [`crate::dag::WorkspacePolicy`]); this is how
-/// they get done. Returns whether all passed.
+/// Do `recipe`, the setup of a task, in `ws` and return what was prepared.
+/// `key` is the template key the result is for. Steps that were run are in
+/// `steps` as a run reports them; the receipt names only those that passed (or
+/// that an equal install in the same workspace had already done).
 pub fn execute_setup(
     ctx: &ExecContext,
     fp: &FrozenPlan,
+    recipe: &SetupRecipe,
+    key: &TemplateKey,
     ws: &Workspace,
     opts: Opts,
-) -> Result<Vec<crate::exec::StepResult>> {
+) -> Result<PreparedSetup> {
     let runner = Runner::new(ctx, fp, ws, opts);
     runner.prepare_tools()?;
-    let r = runner.run_setup();
+    let r = runner.run_recipe(recipe, key.digest());
     ctx.cancel.remove_containers(ctx);
     Ok(r)
 }
@@ -207,8 +211,11 @@ pub fn execute_setup(
 /// it needs, and return what it produced. Jobs it does not hold are not
 /// started, and `-j`/units are not looked at again.
 ///
-/// The workspace is a checkout of the planned commit with the plan's hoisted
-/// setup done (see [`execute_setup`]); it is left for the caller to remove.
+/// The workspace is a checkout of the planned commit. `prepared` says which
+/// install steps of the task were done in it already (see [`execute_setup`]);
+/// those are skipped and every other one is run by the task. With `None` the
+/// task prepares everything itself. The workspace is left for the caller to
+/// remove.
 /// Containers the task started are gone when this returns.
 ///
 /// Conditions (`needs.*.result`, `success()`, `failure()`, `always()`,
@@ -219,6 +226,7 @@ pub fn execute_task(
     fp: &FrozenPlan,
     task_id: &str,
     inputs: &TaskInputs,
+    prepared: Option<&PreparedReceipt>,
     ws: &Workspace,
     opts: Opts,
 ) -> Result<TaskResult> {
@@ -234,7 +242,7 @@ pub fn execute_task(
         } else {
             None
         };
-        let r = runner.run_task(&ws.root, task, inputs, lock.is_some(), false);
+        let r = runner.run_task(&ws.root, task, inputs, prepared, lock.is_some(), false);
         drop(lock);
         r
     })();
