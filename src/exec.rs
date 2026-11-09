@@ -22,7 +22,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Remove the service containers of `local-ci` runs that are gone: a run
@@ -977,13 +977,26 @@ impl<'a> Runner<'a> {
         let turn = self.tools.join(format!("scripts/step-{n}.turn"));
         let queued = self.opts.canirun.is_some() && key.is_some();
         let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
+        let sh_family = matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
+        // bash and sh read a script that is not a file one byte at a time, so
+        // the lines they have not run yet are still in the pipe, and fd 3 is
+        // inherited by everything the script starts. They read the script
+        // through a descriptor of their own, so the first act of a script
+        // that holds the token is to close fd 3, on the line it starts on.
+        // (Python parses the whole script before it runs a line of it, so
+        // nothing is left in the pipe by then.)
+        let close = if piped && sh_family {
+            format!("exec {PIPE_FD}<&-; ")
+        } else {
+            String::new()
+        };
         let body = if marked {
             let mark = shlex::try_quote(&turn.to_string_lossy())
                 .map(|q| format!(": > {q} 2>/dev/null || true; "))
                 .unwrap_or_default();
-            format!("{mark}{script}")
+            format!("{close}{mark}{script}")
         } else {
-            script.to_string()
+            format!("{close}{script}")
         };
         // A script that holds the token never reaches a file: the shell reads
         // it from file descriptor 3, the read end of a pipe (so the argument
@@ -1006,6 +1019,12 @@ impl<'a> Runner<'a> {
             ],
             Some("sh") => vec!["sh".into(), "-e".into(), f],
             Some("python") => vec!["python3".into(), f],
+            // A shell of our own may open the script twice (`shellcheck {0} &&
+            // bash {0}` reads nothing the second time and exits 0), and cannot
+            // be told to close fd 3: a script that holds the token is not run.
+            Some(custom) if custom.contains("{0}") && piped => bail!(
+                "the step's script holds the GitHub token, which is handed over a pipe that `shell: {custom}` cannot read; use bash, sh or python for a step that uses github.token"
+            ),
             Some(custom) if custom.contains("{0}") => shlex::split(&custom.replace("{0}", &f))
                 .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
             // keep in step with `plan::shell_supported`
@@ -1045,7 +1064,7 @@ impl<'a> Runner<'a> {
             cmd.env(k, v);
         }
         let pipe = if piped {
-            let (r, w) = std::io::pipe()?;
+            let (r, w) = script_pipe(&self.tools.join(format!("scripts/step-{n}.fifo")))?;
             let rfd = std::os::fd::AsRawFd::as_raw_fd(&r);
             // SAFETY: only dup2 and fcntl, which are async-signal-safe, run
             // between fork and exec. dup2 clears close-on-exec on the copy.
@@ -1069,16 +1088,20 @@ impl<'a> Runner<'a> {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
-        if let Some((r, mut w)) = pipe {
+        let writer_stop = Arc::new(AtomicBool::new(false));
+        let mut writer = None;
+        if let Some((r, w)) = pipe {
             // the child has its own copy
             drop(r);
             // A thread writes, so that a script larger than the pipe does not
-            // block here. It is not waited for: it ends when the shell closes
-            // the pipe or has read it all.
+            // block here. It ends when the shell has read it all, when every
+            // reader is gone, or when the step is over (`writer_stop`), even
+            // if something that outlived the step still holds the read end.
             let body = body.clone();
-            std::thread::spawn(move || {
-                let _ = std::io::Write::write_all(&mut w, body.as_bytes());
-            });
+            let stop = writer_stop.clone();
+            writer = Some(std::thread::spawn(move || {
+                write_until_stopped(w, body.as_bytes(), &stop)
+            }));
         }
         let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
@@ -1132,6 +1155,11 @@ impl<'a> Runner<'a> {
             std::thread::sleep(Duration::from_millis(200));
         };
         self.ctx.cancel.untrack_pgid(pid);
+        // the step is over: nothing is owed to a reader that is still around
+        writer_stop.store(true, Ordering::SeqCst);
+        if let Some(h) = writer {
+            let _ = h.join();
+        }
         if !piped {
             let _ = fs::remove_file(&file);
         }
@@ -2347,20 +2375,28 @@ impl<'a> Runner<'a> {
                     continue;
                 }
                 Err(e) => {
+                    let e = self.hide_token(format!("{e:#}"));
                     push(
                         &mut steps,
-                        Outcome::Error(format!("if: {e:#}")),
+                        Outcome::Error(format!("if: {e}")),
                         None,
                         None,
                         None,
                     );
-                    errored.get_or_insert(format!("{label}: if: {e:#}"));
+                    errored.get_or_insert(format!("{label}: if: {e}"));
                     continue;
                 }
             }
 
             if let Some(uses) = &s.uses {
                 let (outcome, note) = self.check_action(uses, s, &scm);
+                // what a `with:` value expanded to comes to result.json
+                let outcome = match outcome {
+                    Outcome::Error(e) => Outcome::Error(self.hide_token(e)),
+                    Outcome::Skip(e) => Outcome::Skip(self.hide_token(e)),
+                    o => o,
+                };
+                let note = note.map(|n| self.hide_token(n));
                 if let Outcome::Error(e) = &outcome {
                     errored.get_or_insert(format!("{label}: {e}"));
                 }
@@ -2432,14 +2468,9 @@ impl<'a> Runner<'a> {
             let (script, mut env_now) = match (script, env_res) {
                 (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
-                    push(
-                        &mut steps,
-                        Outcome::Error(format!("{e:#}")),
-                        None,
-                        None,
-                        None,
-                    );
-                    errored.get_or_insert(format!("{label}: {e:#}"));
+                    let e = self.hide_token(format!("{e:#}"));
+                    push(&mut steps, Outcome::Error(e.clone()), None, None, None);
+                    errored.get_or_insert(format!("{label}: {e}"));
                     continue;
                 }
             };
@@ -2484,8 +2515,21 @@ impl<'a> Runner<'a> {
             // A script or env that holds the token is run with the script
             // handed over a pipe, never written to a file.
             let token = self.ctx.github_token_if_fetched().filter(|t| !t.is_empty());
+            // (A custom shell cannot be given a pipe, see `shell_once`; it is
+            // handed a file, so only a script that holds the token is refused,
+            // not one that gets the token through its environment.)
+            let step_shell = s
+                .shell
+                .as_deref()
+                .or(job.shell.as_deref())
+                .or(w.shell.as_deref());
+            let custom_shell = !matches!(
+                step_shell.map(str::trim),
+                None | Some("bash") | Some("sh") | Some("python")
+            );
             let piped = token.is_some_and(|t| {
-                script.contains(t) || env_now.values().any(|v| expr::to_string(v).contains(t))
+                script.contains(t)
+                    || (!custom_shell && env_now.values().any(|v| expr::to_string(v).contains(t)))
             });
             if secrets {
                 push(
@@ -2575,10 +2619,7 @@ impl<'a> Runner<'a> {
                 .shell(
                     &ws.join(&wd),
                     &script,
-                    s.shell
-                        .as_deref()
-                        .or(job.shell.as_deref())
-                        .or(w.shell.as_deref()),
+                    step_shell,
                     &env,
                     Some(timeout),
                     &log,
@@ -3027,6 +3068,79 @@ impl<'a> Runner<'a> {
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
 /// Write a file only its owner can read: step scripts may hold values that
 /// must not be shared.
+/// A pipe for a script that holds the token, made so that neither end is ever
+/// open without close-on-exec: `pipe()` and the `fcntl` that sets the flag are
+/// two calls on macOS (`std::io::pipe` makes them so), and a command started
+/// by another thread in between would inherit the write end (or the read end,
+/// with the rest of the script). A FIFO is opened with `O_CLOEXEC` in the call
+/// itself, on both systems, and its name is removed as soon as both ends are
+/// open. The write end is non-blocking (see `write_until_stopped`).
+fn script_pipe(path: &Path) -> Result<(File, File)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let _ = fs::remove_file(path);
+    // SAFETY: plain libc calls on a NUL-terminated path; the descriptors are
+    // handed to `File`, which owns them from then on.
+    unsafe {
+        if libc::mkfifo(c.as_ptr(), 0o600) < 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot make the script pipe");
+        }
+        let r = libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+        let r_err = std::io::Error::last_os_error();
+        let w = if r >= 0 {
+            libc::open(
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        } else {
+            -1
+        };
+        let w_err = std::io::Error::last_os_error();
+        let _ = libc::unlink(c.as_ptr());
+        if r < 0 || w < 0 {
+            if r >= 0 {
+                libc::close(r);
+            }
+            if w >= 0 {
+                libc::close(w);
+            }
+            return Err(if r < 0 { r_err } else { w_err }).context("cannot open the script pipe");
+        }
+        // the shell reads with plain blocking reads
+        let fl = libc::fcntl(r, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(r, libc::F_SETFL, fl & !libc::O_NONBLOCK) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(r);
+            libc::close(w);
+            return Err(e).context("cannot set up the script pipe");
+        }
+        Ok((File::from_raw_fd(r), File::from_raw_fd(w)))
+    }
+}
+
+/// Write `data` to the non-blocking `w`, until it is all written, the other
+/// end is closed, or `stop` is set (the step is over). A reader that outlives
+/// its step (a background process that kept the descriptor) cannot keep this
+/// thread blocked in `write`.
+fn write_until_stopped(mut w: File, data: &[u8], stop: &AtomicBool) {
+    let mut rest = data;
+    while !rest.is_empty() && !stop.load(Ordering::SeqCst) {
+        match w.write(rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = OpenOptions::new()
@@ -3082,6 +3196,62 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn the_script_pipe_is_never_open_across_an_exec_and_leaves_no_name() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.fifo");
+        let (r, w) = script_pipe(&path).unwrap();
+        assert!(!path.exists());
+        for f in [&r, &w] {
+            let fl = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+            assert!(fl >= 0 && fl & libc::FD_CLOEXEC != 0, "{fl}");
+        }
+        // the read end blocks, the write end does not
+        let (rl, wl) = unsafe {
+            (
+                libc::fcntl(r.as_raw_fd(), libc::F_GETFL),
+                libc::fcntl(w.as_raw_fd(), libc::F_GETFL),
+            )
+        };
+        assert_eq!(rl & libc::O_NONBLOCK, 0);
+        assert_ne!(wl & libc::O_NONBLOCK, 0);
+        let mut r = r;
+        let stop = AtomicBool::new(false);
+        write_until_stopped(w, b"abc", &stop);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "abc");
+    }
+
+    #[test]
+    fn the_writer_ends_with_the_step_even_if_a_reader_outlives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, w) = script_pipe(&dir.path().join("p.fifo")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let big = vec![b'x'; 4 << 20];
+        let s2 = stop.clone();
+        let h = std::thread::spawn(move || write_until_stopped(w, &big, &s2));
+        // nobody reads: the pipe fills and the writer waits
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!h.is_finished());
+        stop.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        h.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2));
+        // `r` was held the whole time, as a background process would
+        drop(r);
+    }
+
+    #[test]
+    fn the_writer_ends_when_every_reader_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, w) = script_pipe(&dir.path().join("p.fifo")).unwrap();
+        drop(r);
+        let stop = AtomicBool::new(false);
+        write_until_stopped(w, &vec![b'x'; 1 << 20], &stop);
+    }
 
     fn job_with_secs(secs: f64) -> JobResult {
         JobResult {

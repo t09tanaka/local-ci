@@ -256,6 +256,12 @@ they end.
   when its version differs. Other actions are skipped and listed under
   `not covered`.
 
+A step whose script holds `github.token` is run with bash, sh or python (the
+default shell is bash); the script is handed over a pipe and never written to a
+file. With another shell (`shell: pwsh {0}`, `shellcheck {0} && bash {0}`) such
+a step is not run and the run is an `error`. The value is replaced by `***` in
+logs, labels and notes; a changed form of it (base64, say) is not hidden.
+
 Not covered: steps that read a secret other than `github.token` (which gets
 this machine's `gh auth token`, never written to a file of the run), steps that push,
 publish or deploy (`git push`, `gh release`, `npm publish`, `aws`, `kubectl`,

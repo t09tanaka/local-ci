@@ -165,9 +165,25 @@
   run: a step whose script or env holds it (also through a step output or
   `GITHUB_ENV`) is handed its script over a pipe, file descriptor 3, and the
   shell is started with `/dev/fd/3` (`bash --noprofile --norc -eo pipefail
-  /dev/fd/3`, `python3 /dev/fd/3`, a custom shell with `{0}` the same), so
-  neither a file nor the argument list shows it. canirun passes the descriptor
-  on to its child, so such a step is still queued by canirun. Other steps are
+  /dev/fd/3`, `python3 /dev/fd/3`), so neither a file nor the argument list
+  shows it. bash and sh read such a script one byte at a time, so the lines not
+  run yet stay in the pipe, and fd 3 is inherited by everything the script
+  starts: the script therefore begins with `exec 3<&-;` (on its first line, so
+  line numbers do not move), which the shell does not mind, as it reads the
+  script through a descriptor of its own; a child that reads fd 3 gets EBADF.
+  Python parses the whole script before it runs a line, so nothing is left in
+  the pipe. A custom shell (`shell: bash {0}`, `shellcheck {0} && bash {0}`) may
+  open the script twice and cannot be told to close fd 3, so a step of one
+  whose script holds the token is not run: it is an `error` that says to use
+  bash, sh or python (a custom shell is still run when only its `env` holds the
+  token). The pipe is a FIFO opened with `O_CLOEXEC`, whose name is removed
+  at once, not `pipe()` plus a later `fcntl` (two calls on macOS), so no command
+  started by another thread can inherit an end; its writer thread ends with the
+  step even if a process that outlived the step holds the read end. canirun
+  passes the descriptor on to its child, so such a step is still queued by
+  canirun. The notes and errors of `uses:` steps and of `if:` are
+  hidden the same way. A value changed into another form (base64, say) is not
+  hidden. Other steps are
   written to a file as before (mode 0600). The value is replaced by `***` in
   step logs and labels. A later step of the job gets a step output's real
   value (in memory only); a job output that holds the token is not passed on

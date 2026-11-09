@@ -810,17 +810,20 @@ fn tree_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 const TOKEN: &str = "ghs_faketoken123";
 
 /// The whole tree of a test's tempdir that is the run's: everything but the
-/// fake `gh` and the checkout under test, which name the value themselves.
+/// fake `gh` and the workflow files, which name the expression or the value
+/// themselves. The checkout under test (`lab/wt/<name>`) is searched: what a
+/// step wrote there is the run's.
 fn run_files(tmp: &tempfile::TempDir, worktree: &str) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     tree_files(tmp.path(), &mut files);
-    let wt = tmp.path().join("lab/wt").join(worktree);
+    let _ = worktree;
     files
         .into_iter()
         .filter(|f| {
             !f.starts_with(tmp.path().join("fakebin"))
-                && !f.starts_with(&wt)
                 && !f.starts_with(tmp.path().join("work"))
+                && !f.components().any(|c| c.as_os_str() == ".git")
+                && !f.to_string_lossy().contains(".github/workflows/")
         })
         .collect()
 }
@@ -1131,4 +1134,102 @@ fn the_token_is_not_kept_in_the_outputs_of_a_task() {
     assert_eq!(o.get("p").map(String::as_str), Some(""), "{o:?}");
     assert_eq!(o.get("q").map(String::as_str), Some("kept"), "{o:?}");
     assert!(!format!("{r:?}").contains(TOKEN));
+}
+
+// ---- what a child of a step can read from the pipe the script came by ----
+
+/// Run `jobs` (the body of a `jobs:` section) with the fake token on this
+/// machine; the result and the name the run's files are under.
+fn run_jobs(jobs: &str, name: &str) -> (tempfile::TempDir, RunResult) {
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, name);
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    (tmp, r)
+}
+
+fn log_of(r: &RunResult, step: usize) -> String {
+    std::fs::read_to_string(r.units[0].jobs[0].steps[step].log.as_ref().unwrap()).unwrap()
+}
+
+#[test]
+fn a_child_of_a_step_cannot_read_the_rest_of_the_script() {
+    // bash and sh read a script that is not a file one byte at a time: the
+    // lines not run yet are in the pipe. A child that read them would see
+    // the token, and the shell would end having run nothing of them.
+    let script = "sh -c 'cat <&3' 2>/dev/null || echo child-cannot-read\necho \"after ${{ github.token }}\"\necho last";
+    for (n, shell) in ["", "shell: bash\n        ", "shell: sh\n        "]
+        .iter()
+        .enumerate()
+    {
+        let jobs = format!(
+            "  a:\n    runs-on: x\n    steps:\n      - {shell}run: |\n{}",
+            indented(script)
+        );
+        let (tmp, r) = run_jobs(&jobs, &format!("fd{n}"));
+        assert_eq!(r.state, "success", "{shell:?} {}", r.description);
+        assert_eq!(
+            log_of(&r, 0),
+            "child-cannot-read\nafter ***\nlast\n",
+            "{shell:?}"
+        );
+        assert_no_token_in(&tmp, &format!("fd{n}"));
+    }
+}
+
+#[test]
+fn a_python_script_is_read_whole_before_a_child_can_ask_for_it() {
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - shell: python\n        run: |\n          import os\n          try:\n              left = os.read(3, 65536)\n          except OSError:\n              left = b''\n          print('left', len(left))\n          print('after ${{ github.token }}')\n";
+    let (tmp, r) = run_jobs(jobs, "pyfd");
+    assert_eq!(r.state, "success", "{}", r.description);
+    assert_eq!(log_of(&r, 0), "left 0\nafter ***\n");
+    assert_no_token_in(&tmp, "pyfd");
+}
+
+#[test]
+fn a_custom_shell_is_not_given_a_script_that_holds_the_token() {
+    // `bash {0} && bash {0}` would open the pipe twice and run nothing the
+    // second time; the step is not run and says why
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - shell: bash {0}\n        run: |\n          touch ran.marker\n          echo ${{ github.token }}\n      - shell: bash {0}\n        if: always()\n        env:\n          T: ${{ secrets.GITHUB_TOKEN }}\n        run: test \"${#T}\" = 16\n";
+    let (tmp, r) = run_jobs(jobs, "custom");
+    let steps = &r.units[0].jobs[0].steps;
+    assert!(
+        matches!(&steps[0].outcome, Outcome::Error(e) if e.contains("GitHub token") && e.contains("bash, sh or python")),
+        "{:?}",
+        steps[0].outcome
+    );
+    assert_eq!(r.state, "error", "{}", r.description);
+    assert!(!tmp.path().join("lab/wt/custom/ran.marker").exists());
+    // only the script is the problem: the token in the environment of a
+    // script that does not hold it is passed as before
+    assert_eq!(steps[1].outcome, Outcome::Pass, "{:?}", steps[1].outcome);
+    assert!(!serde_json::to_string(&r).unwrap().contains(TOKEN));
+    assert_no_token_in(&tmp, "custom");
+}
+
+#[test]
+fn the_token_is_hidden_where_it_is_only_read() {
+    // in `if:`, through toJSON and join, in the name of a step (which can
+    // hold the token through a step output), and in what a `uses:` step
+    // records of its `with:`
+    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - id: s1\n        run: echo \"t=$GH_TOKEN\" >> \"$GITHUB_OUTPUT\"\n      - name: label ${{ steps.s1.outputs.t }}\n        if: ${{ github.token == 'ghs_faketoken123' && contains(toJSON(github.token), 'faketoken') }}\n        run: echo ${{ join(fromJSON(toJSON(github.token)), '') }} ok\n      - if: ${{ startsWith(github.token, 'ghs_') }}\n        run: echo ${{ toJSON(github.token) }} json\n      - uses: actions/setup-python@v5\n        with:\n          python-version: ${{ github.token }}\n";
+    let (tmp, r) = run_jobs(jobs, "hidden");
+    let steps = &r.units[0].jobs[0].steps;
+    assert_eq!(steps[1].label, "label ***", "{}", steps[1].label);
+    assert_eq!(steps[1].outcome, Outcome::Pass, "{:?}", steps[1].outcome);
+    assert_eq!(steps[2].outcome, Outcome::Pass, "{:?}", steps[2].outcome);
+    assert!(log_of(&r, 2).contains("*** json"), "{}", log_of(&r, 2));
+    // the `uses:` note holds what `python3 --version` printed and what was
+    // asked for, which here is the value
+    let note = steps[3].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("wants ***"),
+        "{note:?} {:?}",
+        steps[3].outcome
+    );
+    assert!(!serde_json::to_string(&r).unwrap().contains(TOKEN));
+    assert!(!format!("{r:?}").contains(TOKEN));
+    assert!(!r.description.contains(TOKEN), "{}", r.description);
+    assert_no_token_in(&tmp, "hidden");
 }
