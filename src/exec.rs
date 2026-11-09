@@ -3,8 +3,8 @@
 use crate::expr::{self, Ctx, Status};
 use crate::matrix;
 use crate::plan::{self, Plan, Unit};
+use crate::run::Repo;
 use crate::workflow::{Job, Service, Step, Workflow};
-use crate::Repo;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
@@ -19,13 +19,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub static CANCEL: AtomicBool = AtomicBool::new(false);
+/// Process-global cancellation and child tracking; to be replaced by per-attempt
+/// ownership. Kept out of the public API on purpose: use `local_ci::cancel`.
+pub(crate) static CANCEL: AtomicBool = AtomicBool::new(false);
 static PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static CONTAINERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static COMPOSE_PROJECTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Stop everything that is running (Ctrl-C).
-pub fn kill_all() {
+pub(crate) fn kill_all() {
     CANCEL.store(true, Ordering::SeqCst);
     for &pg in PGIDS.lock().unwrap().iter() {
         unsafe {
@@ -34,7 +36,7 @@ pub fn kill_all() {
     }
 }
 
-pub fn remove_containers() {
+pub(crate) fn remove_containers() {
     let projects: Vec<String> = COMPOSE_PROJECTS.lock().unwrap().drain(..).collect();
     compose_down(&projects);
     let names: Vec<String> = CONTAINERS.lock().unwrap().drain(..).collect();
@@ -53,7 +55,7 @@ pub fn remove_containers() {
 /// killed before it cleaned up left its database behind on the service's
 /// declared port, and later runs could not bind it. A container is named
 /// `local-ci-<pid>-<n>` by the run that started it.
-pub fn remove_orphan_containers() {
+pub(crate) fn remove_orphan_containers() {
     let Ok(out) = Command::new("docker")
         .args([
             "ps",
