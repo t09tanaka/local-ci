@@ -36,12 +36,15 @@ impl JobStatus {
     }
 
     /// The status of one job (or matrix entry) from how it ended: an error
-    /// counts as a failure, a skip because the run was cancelled as cancelled.
-    pub(crate) fn of(o: &Outcome) -> Self {
-        match o {
+    /// counts as a failure, a job the run was cancelled under (before it
+    /// started or while it ran) as cancelled.
+    pub(crate) fn of(r: &JobResult) -> Self {
+        if r.cancelled {
+            return JobStatus::Cancelled;
+        }
+        match r.outcome {
             Outcome::Pass => JobStatus::Success,
             Outcome::Fail | Outcome::Error(_) => JobStatus::Failure,
-            Outcome::Skip(r) if r == "cancelled" => JobStatus::Cancelled,
             Outcome::Skip(_) => JobStatus::Skipped,
         }
     }
@@ -109,7 +112,7 @@ pub(crate) fn outcome_of(
     JobOutcome {
         job: job.to_string(),
         variant,
-        status: JobStatus::of(&r.outcome),
+        status: JobStatus::of(r),
         outputs: outputs
             .iter()
             .map(|(k, v)| (k.clone(), crate::expr::to_string(v)))
@@ -121,9 +124,10 @@ pub(crate) fn outcome_of(
     }
 }
 
-/// The entries of a matrix job as the job: failed if any failed, skipped if
-/// all were, otherwise success. Outputs are merged in matrix order (by
-/// `variant`, whatever order `parts` is in), a name set by several entries
+/// The entries of a matrix job as the job, as `needs.<id>.result` is for a
+/// matrix on GitHub: failed if any failed, otherwise cancelled if any was,
+/// skipped if all were, otherwise success. Outputs are merged in matrix order
+/// (by `variant`, whatever order `parts` is in), a name set by several entries
 /// keeping the value of the last in matrix order.
 ///
 /// GitHub takes, for a name set by several entries, the value of the entry that
@@ -140,16 +144,10 @@ pub(crate) fn combine(job: &str, mut parts: Vec<JobOutcome>) -> JobOutcome {
     let any = |s: JobStatus| parts.iter().any(|p| p.status == s);
     let status = if any(JobStatus::Failure) {
         JobStatus::Failure
-    } else if !parts.is_empty()
-        && parts
-            .iter()
-            .all(|p| !matches!(p.status, JobStatus::Success))
-    {
-        if any(JobStatus::Cancelled) {
-            JobStatus::Cancelled
-        } else {
-            JobStatus::Skipped
-        }
+    } else if any(JobStatus::Cancelled) {
+        JobStatus::Cancelled
+    } else if !parts.is_empty() && parts.iter().all(|p| p.status == JobStatus::Skipped) {
+        JobStatus::Skipped
     } else {
         JobStatus::Success
     };

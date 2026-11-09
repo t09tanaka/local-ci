@@ -151,6 +151,43 @@ pub struct PlanParts {
     pub plan: Plan,
 }
 
+/// Take the workflows `broken` (index, reason) out of `plan` and note them as
+/// skipped. The units follow the workflows left, and the installs the plan
+/// hoists are worked out again from them.
+fn drop_workflows(plan: &mut Plan, broken: &[(usize, String)]) {
+    let gone = |i: usize| broken.iter().any(|(b, _)| *b == i);
+    let new_index: Vec<Option<usize>> = {
+        let mut next = 0;
+        (0..plan.selected.len())
+            .map(|i| {
+                (!gone(i)).then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect()
+    };
+    for (i, why) in broken {
+        plan.skipped
+            .push((plan.selected[*i].wf.file.clone(), why.clone()));
+    }
+    let selected = std::mem::take(&mut plan.selected);
+    plan.selected = selected
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !gone(*i))
+        .map(|(_, s)| s)
+        .collect();
+    plan.units.retain_mut(|u| match new_index[u.wf] {
+        Some(n) => {
+            u.wf = n;
+            true
+        }
+        None => false,
+    });
+    crate::plan::fill_setup(plan);
+}
+
 /// `value` as compact JSON with the keys of every object sorted.
 pub fn canonical_json(value: &Value) -> String {
     fn sorted(v: &Value) -> Value {
@@ -180,15 +217,30 @@ fn sha256_of(text: &str) -> String {
 
 impl FrozenPlan {
     /// Fix `parts` and compute the digests.
-    pub fn new(parts: PlanParts) -> Result<Self> {
+    ///
+    /// A workflow whose jobs cannot be run in an order (a cycle, a `needs` of a
+    /// job that does not exist) is left out and listed in `skipped` with the
+    /// reason, as GitHub does not start that workflow; the others are planned.
+    pub fn new(mut parts: PlanParts) -> Result<Self> {
         let config_digest = sha256_of(&canonical_json(&serde_json::to_value(&parts.config)?));
-        let workflows: Vec<WorkflowSpec> = parts
-            .plan
-            .selected
-            .iter()
-            .map(WorkflowSpec::from_selected)
-            .collect();
-        let units: Vec<UnitSpec> = parts.plan.units.iter().map(UnitSpec::from_unit).collect();
+        let specs = |plan: &Plan| {
+            (
+                plan.selected
+                    .iter()
+                    .map(WorkflowSpec::from_selected)
+                    .collect::<Vec<_>>(),
+                plan.units
+                    .iter()
+                    .map(UnitSpec::from_unit)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (mut workflows, mut units) = specs(&parts.plan);
+        let broken = dag::unrunnable_workflows(&workflows, &units);
+        if !broken.is_empty() {
+            drop_workflows(&mut parts.plan, &broken);
+            (workflows, units) = specs(&parts.plan);
+        }
         let setup: Vec<SetupSpec> = parts.plan.setup.iter().map(SetupSpec::from_setup).collect();
         let graph = dag::build_graph(&workflows, &units)?;
         let (tasks, shard_groups) = dag::derive_tasks(

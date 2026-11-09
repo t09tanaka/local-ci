@@ -105,6 +105,10 @@ pub struct JobResult {
     pub outcome: Outcome,
     pub secs: f64,
     pub steps: Vec<StepResult>,
+    /// The run was cancelled while the job ran (its `outcome` is an error) or
+    /// before it started (a skip). `needs.<id>.result` is `cancelled` then.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
     /// Where the time went. Absent for jobs that did not run and for reused results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<JobTime>,
@@ -1401,6 +1405,7 @@ impl<'a> Runner<'a> {
                         outcome: Outcome::Error(reason.clone()),
                         secs: 0.0,
                         steps: vec![],
+                        cancelled: false,
                         time: None,
                     })
                     .collect();
@@ -1461,6 +1466,7 @@ impl<'a> Runner<'a> {
                             outcome: Outcome::Error(reason.clone()),
                             secs: 0.0,
                             steps: vec![],
+                            cancelled: false,
                             time: None,
                         });
                     }
@@ -1577,10 +1583,17 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Skip(reason),
                     secs: 0.0,
                     steps: vec![],
+                    cancelled: false,
                     time: None,
                 },
                 Map::new(),
             )
+        };
+        // the run was cancelled before this entry started
+        let cancelled_skip = |display: String| {
+            let mut r = skip(display, "cancelled".into());
+            r.0.cancelled = true;
+            r
         };
         let error = |display: String, reason: String| {
             (
@@ -1591,6 +1604,7 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Error(reason),
                     secs: 0.0,
                     steps: vec![],
+                    cancelled: false,
                     time: None,
                 },
                 Map::new(),
@@ -1712,7 +1726,7 @@ impl<'a> Runner<'a> {
             let slot = if exclusive {
                 match self.container_slot() {
                     Ok(Some(s)) => Some(s),
-                    Ok(None) => return skip(display, "cancelled".into()),
+                    Ok(None) => return cancelled_skip(display),
                     // no lock files: run without a slot rather than not at all
                     Err(_) => None,
                 }
@@ -1721,7 +1735,7 @@ impl<'a> Runner<'a> {
             };
             let wait_slot = t_slot.elapsed().as_secs_f64();
             if self.ctx.cancel.is_cancelled() {
-                return skip(display, "cancelled".into());
+                return cancelled_skip(display);
             }
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
@@ -1823,6 +1837,7 @@ impl<'a> Runner<'a> {
             outcome,
             secs: t0.elapsed().as_secs_f64(),
             steps,
+            cancelled: false,
             time: None,
         };
 
@@ -1837,10 +1852,9 @@ impl<'a> Runner<'a> {
                 }
                 Err(e) => {
                     self.stop_services(&names);
-                    return (
-                        finish(Outcome::Error(format!("services: {e:#}")), steps, t0),
-                        Map::new(),
-                    );
+                    let mut r = finish(Outcome::Error(format!("services: {e:#}")), steps, t0);
+                    r.cancelled = self.ctx.cancel.is_cancelled();
+                    return (r, Map::new());
                 }
             }
         }
@@ -1920,6 +1934,8 @@ impl<'a> Runner<'a> {
         let mut projects = vec![compose_default.clone()];
         self.ctx.cancel.track_compose(compose_default.clone());
         let mut errored: Option<String> = None;
+        // the first error was the run being cancelled
+        let mut cancelled = false;
         // canirun's queue, summed over the steps
         let mut queue = Duration::ZERO;
 
@@ -2258,7 +2274,10 @@ impl<'a> Runner<'a> {
                         Some(log),
                         None,
                     );
-                    errored.get_or_insert("cancelled".into());
+                    if errored.is_none() {
+                        errored = Some("cancelled".into());
+                        cancelled = true;
+                    }
                 }
                 Err(e) => {
                     push(
@@ -2296,6 +2315,7 @@ impl<'a> Runner<'a> {
             Outcome::Pass
         };
         let mut result = finish(outcome, steps, t0);
+        result.cancelled = cancelled && matches!(result.outcome, Outcome::Error(_));
         result.time = Some(JobTime {
             work_secs: (result.secs - queue.as_secs_f64()).max(0.0),
             wait_queue_secs: queue.as_secs_f64(),
@@ -2646,6 +2666,7 @@ mod tests {
             outcome: Outcome::Pass,
             secs,
             steps: vec![],
+            cancelled: false,
             time: None,
         }
     }

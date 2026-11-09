@@ -2,6 +2,7 @@
 //! results of the ones before it.
 
 use local_ci::dag::{GroupedReason, NodeKind};
+use local_ci::exec::Outcome;
 use local_ci::frozen::{DisabledSource, DisabledWorkflow};
 use local_ci::{
     ExecContext, FrozenPlan, JobOutcome, JobStatus, Quiet, Target, TaskInputs, TaskResult,
@@ -46,6 +47,18 @@ fn repo(jobs: &str) -> (tempfile::TempDir, PathBuf) {
     git(&dir, &["checkout", "-qb", "feature"]);
     std::fs::write(dir.join("a.txt"), "b\n").unwrap();
     git(&dir, &["commit", "-qam", "change"]);
+    (tmp, dir)
+}
+
+/// Like [`repo`], with the workflows `files` (name, full YAML) in place of one.
+fn repo_of(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, dir) = repo("  x:\n    runs-on: x\n    steps:\n      - run: echo x\n");
+    std::fs::remove_file(dir.join(F)).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(".github/workflows").join(name), text).unwrap();
+    }
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "workflows"]);
     (tmp, dir)
 }
 
@@ -182,17 +195,50 @@ fn a_matrix_is_variants_joined_at_the_node_later_jobs_need() {
 }
 
 #[test]
-fn a_cycle_and_a_needs_of_nothing_are_errors() {
-    let (tmp, dir) = repo(
-        "  a:\n    needs: b\n    runs-on: x\n    steps:\n      - run: echo a\n  b:\n    needs: a\n    runs-on: x\n    steps:\n      - run: echo b\n",
+fn a_workflow_with_a_cycle_or_a_needs_of_nothing_is_skipped_and_the_others_run() {
+    let good = "name: good\non: pull_request\njobs:\n  g:\n    runs-on: x\n    steps:\n      - run: echo good\n";
+    let cycle = "name: cycle\non: pull_request\njobs:\n  a:\n    needs: b\n    runs-on: x\n    steps:\n      - run: echo a\n  b:\n    needs: a\n    runs-on: x\n    steps:\n      - run: echo b\n";
+    let nothing = "name: nothing\non: pull_request\njobs:\n  a:\n    needs: nope\n    runs-on: x\n    steps:\n      - run: echo a\n";
+    let (tmp, dir) = repo_of(&[
+        ("a-cycle.yml", cycle),
+        ("good.yml", good),
+        ("nothing.yml", nothing),
+    ]);
+    let fp = local_ci::build_frozen_plan(&ctx(tmp.path()), &target(&dir), &mut Quiet).unwrap();
+    // only the workflow that can run is planned, with its tasks
+    let files: Vec<&str> = fp.workflows.iter().map(|w| w.file.as_str()).collect();
+    assert_eq!(files, [".github/workflows/good.yml"]);
+    assert_eq!(fp.units.len(), 1);
+    let ids: Vec<&str> = fp.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, [".github/workflows/good.yml::g"]);
+    // the others are skipped, each with the job and the needs that broke it
+    let why = |f: &str| {
+        fp.skipped
+            .iter()
+            .find(|s| s.workflow == format!(".github/workflows/{f}"))
+            .unwrap_or_else(|| panic!("{f} is not in {:?}", fp.skipped))
+            .reason
+            .clone()
+    };
+    let r = why("a-cycle.yml");
+    assert!(
+        r.contains("cycle") && r.contains("::a") && r.contains("::b"),
+        "{r}"
     );
-    let e = local_ci::build_frozen_plan(&ctx(tmp.path()), &target(&dir), &mut Quiet).unwrap_err();
-    assert!(format!("{e:#}").contains("cycle"), "{e:#}");
-    let (tmp, dir) =
-        repo("  a:\n    needs: nope\n    runs-on: x\n    steps:\n      - run: echo a\n");
-    let e = local_ci::build_frozen_plan(&ctx(tmp.path()), &target(&dir), &mut Quiet).unwrap_err();
-    let text = format!("{e:#}");
-    assert!(text.contains("nope") && text.contains("needs"), "{text}");
+    let r = why("nothing.yml");
+    assert!(
+        r.contains("job `a`") && r.contains("needs `nope`") && r.contains("nothing.yml"),
+        "{r}"
+    );
+    // it is a plan like any other: it verifies, and survives the engine's view
+    fp.verify().unwrap();
+    assert_eq!(fp.with_plan(fp.to_plan()).unwrap(), fp);
+    // and the workflow that remains runs
+    let mut lab = Lab::from_plan(tmp, dir, fp);
+    let r = lab
+        .run(".github/workflows/good.yml::g", &TaskInputs::default())
+        .unwrap();
+    assert_eq!(r.outcomes[0].status, JobStatus::Success);
 }
 
 #[test]
@@ -271,6 +317,10 @@ struct Lab {
 impl Lab {
     fn new(jobs: &str) -> Self {
         let (tmp, dir, fp) = plan_of(jobs);
+        Self::from_plan(tmp, dir, fp)
+    }
+
+    fn from_plan(tmp: tempfile::TempDir, dir: PathBuf, fp: FrozenPlan) -> Self {
         let cache = tmp.path().join("lab");
         std::fs::create_dir_all(cache.join("locks")).unwrap();
         Lab {
@@ -284,6 +334,17 @@ impl Lab {
 
     /// Run `task` in a checkout of its own.
     fn run(&mut self, task: &str, inputs: &TaskInputs) -> anyhow::Result<TaskResult> {
+        let c = ctx(self.tmp.path());
+        self.run_in(&c, task, inputs)
+    }
+
+    /// Run `task` in a checkout of its own, under `c`.
+    fn run_in(
+        &mut self,
+        c: &ExecContext,
+        task: &str,
+        inputs: &TaskInputs,
+    ) -> anyhow::Result<TaskResult> {
         self.n += 1;
         let name = format!("t{}", self.n);
         let wt = self.cache.join("wt").join(&name);
@@ -305,15 +366,14 @@ impl Lab {
             keep: false,
             trash: self.cache.join("trash"),
         };
-        let c = ctx(self.tmp.path());
-        let r = local_ci::execute_task(&c, &self.fp, task, inputs, &ws, opts);
+        let r = local_ci::execute_task(c, &self.fp, task, inputs, &ws, opts);
         local_ci::git::remove_worktree(&self.dir, &wt, &self.cache.join("trash"));
         r
     }
 
     /// All the tasks, each in a checkout of its own, passing results on as
     /// inputs. `reverse_variants`: matrix variants run last to first.
-    fn run_all(&mut self, reverse_variants: bool) -> (BTreeMap<String, String>, TaskInputs) {
+    fn run_all(&mut self, reverse_variants: bool) -> (BTreeMap<String, Expected>, TaskInputs) {
         let mut inputs = TaskInputs::default();
         let mut results = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<JobOutcome>> = BTreeMap::new();
@@ -338,7 +398,13 @@ impl Lab {
                 for j in &r.jobs {
                     results.insert(
                         j.display.clone(),
-                        serde_json::to_string(&j.outcome).unwrap(),
+                        (
+                            j.outcome.clone(),
+                            j.steps
+                                .iter()
+                                .map(|s| (s.label.clone(), s.outcome.clone()))
+                                .collect(),
+                        ),
                     );
                 }
                 for o in r.outcomes {
@@ -360,56 +426,71 @@ impl Lab {
     }
 }
 
-#[test]
-fn tasks_run_one_by_one_in_checkouts_of_their_own_give_what_a_run_gives() {
-    let mut lab = Lab::new(WORKFLOW);
-    let c = ctx(lab.tmp.path());
-    let ran = local_ci::run(
-        &c,
-        local_ci::RunOptions {
-            target: target(&lab.dir),
-            parallel: Some(2),
-            no_canirun: true,
-            no_portool: true,
-            containers: 1,
-            keep: false,
-            job_timeout: 5.0,
-            no_cache: true,
-            cache_dir: lab.tmp.path().join("run-cache"),
-        },
-        &mut Quiet,
-    )
-    .unwrap()
-    .result;
-    let mut want = BTreeMap::new();
-    for j in ran.units.iter().flat_map(|u| &u.jobs) {
-        want.insert(
-            j.display.clone(),
-            serde_json::to_string(&j.outcome).unwrap(),
-        );
-    }
-    assert_eq!(want.len(), 11, "{want:?}");
+/// A job as it ends up, written out by hand from the fixture: how it ended, and
+/// the steps it ran as (label, how each ended).
+type Expected = (Outcome, Vec<(String, Outcome)>);
 
+#[test]
+fn tasks_run_one_by_one_in_checkouts_of_their_own_give_what_the_fixture_says() {
+    let mut lab = Lab::new(WORKFLOW);
     let (got, inputs) = lab.run_all(false);
+
+    let passed =
+        |label: &str| -> Expected { (Outcome::Pass, vec![(label.to_string(), Outcome::Pass)]) };
+    let skipped = |why: &str| -> Expected { (Outcome::Skip(why.into()), vec![]) };
+    let out_step = |n: u32| format!("echo \"o={n}\" >> \"$GITHUB_OUTPUT\"");
+    let want: BTreeMap<String, Expected> = [
+        ("prep", passed("echo \"v=hello\" >> \"$GITHUB_OUTPUT\"")),
+        ("use", passed("test \"hello\" = hello")),
+        (
+            "broken",
+            (Outcome::Fail, vec![("exit 3".to_string(), Outcome::Fail)]),
+        ),
+        ("after_broken", skipped("needs failed")),
+        ("cleanup", passed("echo cleanup")),
+        ("only_on_failure", passed("echo saw failure")),
+        ("only_on_success", skipped("if: false")),
+        ("m (1)", passed(&out_step(1))),
+        ("m (2)", passed(&out_step(2))),
+        ("m (3)", passed(&out_step(3))),
+        ("gather", passed("test \"3\" = 3")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
     assert_eq!(got, want);
-    // what each job came to, as the jobs after it saw it
-    let status = |j: &str| inputs.needs[j].status;
-    assert_eq!(status("prep"), JobStatus::Success);
-    assert_eq!(status("use"), JobStatus::Success);
-    assert_eq!(status("broken"), JobStatus::Failure);
-    assert_eq!(status("after_broken"), JobStatus::Skipped);
-    assert_eq!(status("cleanup"), JobStatus::Success);
-    assert_eq!(status("only_on_failure"), JobStatus::Success);
-    assert_eq!(status("only_on_success"), JobStatus::Skipped);
-    assert_eq!(status("gather"), JobStatus::Success);
-    assert_eq!(
-        inputs.needs["after_broken"].skipped.as_deref(),
-        Some("needs failed")
-    );
-    assert_eq!(
-        inputs.needs["only_on_success"].skipped.as_deref(),
-        Some("if: false")
-    );
+
+    // what each job came to, as the jobs after it saw it: needs.<id>.result,
+    // its outputs, and why it did not run
+    let out = |job: &str, status, outputs: &[(&str, &str)], skipped: Option<&str>| {
+        (
+            job.to_string(),
+            JobOutcome {
+                job: job.to_string(),
+                variant: None,
+                status,
+                outputs: outputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                skipped: skipped.map(String::from),
+            },
+        )
+    };
+    use JobStatus::*;
+    let want_needs: BTreeMap<String, JobOutcome> = [
+        out("prep", Success, &[("v", "hello")], None),
+        out("use", Success, &[], None),
+        out("broken", Failure, &[], None),
+        out("after_broken", Skipped, &[], Some("needs failed")),
+        out("cleanup", Success, &[], None),
+        out("only_on_failure", Success, &[], None),
+        out("only_on_success", Skipped, &[], Some("if: false")),
+        out("m", Success, &[("o", "3")], None),
+        out("gather", Success, &[], None),
+    ]
+    .into();
+    assert_eq!(inputs.needs, want_needs);
 }
 
 #[test]
@@ -471,15 +552,256 @@ fn a_task_reads_needs_outputs_and_results_from_its_inputs() {
     assert_eq!(skipped.outcomes[0].status, JobStatus::Skipped);
     assert_eq!(skipped.outcomes[0].skipped.as_deref(), Some("needs failed"));
     assert!(skipped.jobs[0].steps.is_empty());
-    // cancelled()/needs.*.result are evaluated from the inputs too
-    let sk = lab
-        .run(&id("only_on_success"), &given(JobStatus::Skipped, "x"))
-        .unwrap();
-    assert_eq!(sk.outcomes[0].status, JobStatus::Success);
     // a task is not run without the results it needs, and no other job starts
     let e = lab.run(&id("use"), &TaskInputs::default()).unwrap_err();
     assert!(format!("{e:#}").contains("prep"), "{e:#}");
     assert!(lab.run("no-such-task", &TaskInputs::default()).is_err());
+}
+
+const RESULTS: &str = "  prep:\n    runs-on: x\n    steps:\n      - run: echo prep\n  on_cancelled:\n    needs: prep\n    if: cancelled()\n    runs-on: x\n    steps:\n      - run: echo c\n  on_failure:\n    needs: prep\n    if: failure()\n    runs-on: x\n    steps:\n      - run: echo f\n  on_result:\n    needs: prep\n    if: always() && needs.prep.result == 'cancelled'\n    runs-on: x\n    steps:\n      - run: echo r\n  on_default:\n    needs: prep\n    runs-on: x\n    steps:\n      - run: echo d\n";
+
+/// The inputs of a task that needs `prep`, which ended as `status`.
+fn prep_as(status: JobStatus) -> TaskInputs {
+    TaskInputs {
+        needs: [(
+            "prep".to_string(),
+            JobOutcome {
+                job: "prep".into(),
+                variant: None,
+                status,
+                outputs: BTreeMap::new(),
+                skipped: None,
+            },
+        )]
+        .into(),
+    }
+}
+
+#[test]
+fn cancelled_failure_and_the_result_of_a_needed_job_are_read_from_the_inputs() {
+    let mut lab = Lab::new(RESULTS);
+    // (status of prep, job) -> did the job run?
+    let ran = |lab: &mut Lab, status, job: &str| {
+        let r = lab.run(&id(job), &prep_as(status)).unwrap();
+        match r.outcomes[0].status {
+            JobStatus::Success => true,
+            JobStatus::Skipped => false,
+            other => panic!("{job} after {status:?}: {other:?}"),
+        }
+    };
+    use JobStatus::*;
+    for (status, on_cancelled, on_failure, on_result, on_default) in [
+        (Success, false, false, false, true),
+        (Failure, false, true, false, false),
+        (Cancelled, true, false, true, false),
+    ] {
+        assert_eq!(
+            ran(&mut lab, status, "on_cancelled"),
+            on_cancelled,
+            "{status:?}"
+        );
+        assert_eq!(
+            ran(&mut lab, status, "on_failure"),
+            on_failure,
+            "{status:?}"
+        );
+        assert_eq!(ran(&mut lab, status, "on_result"), on_result, "{status:?}");
+        assert_eq!(
+            ran(&mut lab, status, "on_default"),
+            on_default,
+            "{status:?}"
+        );
+    }
+    // a skipped job is not a cancelled one
+    assert!(!ran(&mut lab, Skipped, "on_cancelled"));
+    assert!(!ran(&mut lab, Skipped, "on_result"));
+}
+
+#[test]
+fn a_job_cancelled_while_it_runs_is_cancelled_for_the_jobs_after_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mark = tmp.path().join("started");
+    let mut lab = Lab::new(&format!(
+        "  slow:\n    runs-on: x\n    steps:\n      - run: touch '{}' && sleep 60\n  on_failure:\n    needs: slow\n    if: failure()\n    runs-on: x\n    steps:\n      - run: echo f\n  on_cancelled:\n    needs: slow\n    if: cancelled()\n    runs-on: x\n    steps:\n      - run: echo c\n",
+        mark.display()
+    ));
+    let c = ctx(lab.tmp.path());
+    let cancel = c.cancel.clone();
+    let m = mark.clone();
+    let canceller = std::thread::spawn(move || {
+        for _ in 0..600 {
+            if m.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cancel.cancel();
+    });
+    let slow = lab.run_in(&c, &id("slow"), &TaskInputs::default()).unwrap();
+    canceller.join().unwrap();
+    assert!(mark.exists(), "the step never started");
+    // the step was stopped; a local run still reports it as it did
+    assert!(matches!(slow.jobs[0].outcome, Outcome::Error(_)));
+    assert!(slow.jobs[0].cancelled);
+    assert_eq!(slow.outcomes[0].status, JobStatus::Cancelled);
+
+    // the jobs after it, in a context that is not cancelled
+    let inputs = TaskInputs {
+        needs: [("slow".to_string(), slow.outcomes[0].clone())].into(),
+    };
+    let f = lab.run(&id("on_failure"), &inputs).unwrap();
+    assert_eq!(f.outcomes[0].status, JobStatus::Skipped);
+    assert_eq!(f.outcomes[0].skipped.as_deref(), Some("if: false"));
+    let c = lab.run(&id("on_cancelled"), &inputs).unwrap();
+    assert_eq!(c.outcomes[0].status, JobStatus::Success);
+}
+
+#[test]
+fn a_matrix_is_as_failed_as_its_worst_entry_then_as_cancelled() {
+    let lab = Lab::new(MATRIX);
+    let node = lab.fp.graph.node(&id("m")).unwrap().clone();
+    let part = |i: usize, status| JobOutcome {
+        job: "m".into(),
+        variant: Some(i),
+        status,
+        outputs: BTreeMap::new(),
+        skipped: None,
+    };
+    use JobStatus::*;
+    let of = |a, b, c| {
+        local_ci::aggregate_matrix(&node, &[part(0, a), part(1, b), part(2, c)])
+            .unwrap()
+            .status
+    };
+    assert_eq!(of(Success, Success, Success), Success);
+    assert_eq!(of(Success, Cancelled, Success), Cancelled);
+    assert_eq!(of(Cancelled, Skipped, Success), Cancelled);
+    assert_eq!(of(Skipped, Skipped, Cancelled), Cancelled);
+    assert_eq!(of(Cancelled, Failure, Success), Failure);
+    assert_eq!(of(Skipped, Skipped, Skipped), Skipped);
+    assert_eq!(of(Success, Skipped, Skipped), Success);
+    assert_eq!(of(Success, Failure, Skipped), Failure);
+}
+
+#[test]
+fn jobs_keep_the_order_of_the_workflow_when_a_job_sits_between_two_that_share_a_file() {
+    // a and c write the same file, b needs a: cutting {a, c} and {b} apart
+    // would run c before b
+    let (_t, _d, fp) = plan_of(
+        "  a:\n    runs-on: x\n    steps:\n      - run: echo a > s.txt\n  b:\n    needs: a\n    runs-on: x\n    steps:\n      - run: echo b\n  c:\n    runs-on: x\n    steps:\n      - run: echo c > s.txt\n",
+    );
+    let order: Vec<&str> = fp
+        .tasks
+        .iter()
+        .flat_map(|t| t.jobs.iter().map(String::as_str))
+        .collect();
+    assert_eq!(order, ["a", "b", "c"]);
+    assert_eq!(fp.units[0].jobs, ["a", "b", "c"]);
+    assert_eq!(
+        fp.tasks[0].grouped_reason,
+        Some(GroupedReason::OrderAroundSharedOutputs)
+    );
+    // independent jobs that do not share a file are still apart, in order
+    let (_t, _d, fp) = plan_of(
+        "  a:\n    runs-on: x\n    steps:\n      - run: echo a\n  b:\n    needs: a\n    runs-on: x\n    steps:\n      - run: echo b\n  c:\n    runs-on: x\n    steps:\n      - run: echo c\n",
+    );
+    let order: Vec<&str> = fp.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(order, [id("a"), id("b"), id("c")]);
+}
+
+#[test]
+fn needs_outputs_are_found_however_they_are_spelled() {
+    let (_t, _d, fp) = plan_of(
+        r#"  p:
+    runs-on: x
+    outputs:
+      x: ${{ steps.s.outputs.x }}
+      y: ${{ steps.s.outputs.y }}
+      z: ${{ steps.s.outputs.z }}
+    steps:
+      - id: s
+        run: echo "x=1" >> "$GITHUB_OUTPUT"
+  dot:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ needs.p.outputs.x }}
+  bracket:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ needs['p'].outputs['y'] }}
+  mixed:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ needs.p.outputs['z'] }}
+  in_if:
+    needs: p
+    if: needs.p.outputs.x == '1'
+    runs-on: x
+    steps:
+      - run: echo hi
+  whole_outputs:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ toJSON(needs.p.outputs) }}
+  whole_needs:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo '${{ toJSON(needs) }}'
+  computed:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ needs.p.outputs[format('{0}', 'y')] }}
+  result_only:
+    needs: p
+    runs-on: x
+    steps:
+      - run: echo ${{ needs.p.result }}
+"#,
+    );
+    let of = |job: &str| -> Vec<String> {
+        fp.task(&id(job))
+            .unwrap()
+            .needs_outputs
+            .iter()
+            .map(|o| format!("{}.{}", o.job, o.name))
+            .collect()
+    };
+    assert_eq!(of("dot"), ["p.x"]);
+    assert_eq!(of("bracket"), ["p.y"]);
+    assert_eq!(of("mixed"), ["p.z"]);
+    assert_eq!(of("in_if"), ["p.x"]);
+    // not named: every output the job declares
+    assert_eq!(of("whole_outputs"), ["p.x", "p.y", "p.z"]);
+    assert_eq!(of("whole_needs"), ["p.x", "p.y", "p.z"]);
+    assert_eq!(of("computed"), ["p.x", "p.y", "p.z"]);
+    assert!(of("result_only").is_empty());
+}
+
+#[test]
+fn a_matrix_with_two_keys_that_print_alike_is_not_planned() {
+    let good = "name: good\non: pull_request\njobs:\n  g:\n    runs-on: x\n    steps:\n      - run: echo good\n";
+    let twins = "name: twins\non: pull_request\njobs:\n  m:\n    runs-on: x\n    strategy:\n      matrix:\n        1: [a]\n        \"1\": [b]\n    steps:\n      - run: echo hi\n";
+    let (tmp, dir) = repo_of(&[("good.yml", good), ("twins.yml", twins)]);
+    let fp = local_ci::build_frozen_plan(&ctx(tmp.path()), &target(&dir), &mut Quiet).unwrap();
+    let files: Vec<&str> = fp.workflows.iter().map(|w| w.file.as_str()).collect();
+    assert_eq!(files, [".github/workflows/good.yml"]);
+    let sk = &fp.skipped[0];
+    assert_eq!(sk.workflow, ".github/workflows/twins.yml");
+    assert!(
+        sk.reason.contains("job `m`")
+            && sk.reason.contains("two keys")
+            && sk.reason.contains("`1`"),
+        "{}",
+        sk.reason
+    );
+    // what is planned goes through the engine's view and back unchanged
+    assert_eq!(fp.with_plan(fp.to_plan()).unwrap(), fp);
 }
 
 // ---- planning without the network ----

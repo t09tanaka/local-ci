@@ -22,8 +22,13 @@
   `build_frozen_plan_with` takes that list so planning needs no network.
   `ExecContext` is no longer `Clone` (`fresh_attempt` makes a second one), and
   the docker, compose and python commands run with the context's environment.
-  A workflow with a dependency cycle or a `needs` of a job that does not exist
-  is now an error at planning. No other change to the command line.
+  A workflow with a dependency cycle, a `needs` of a job that does not exist or
+  a matrix with two keys that print alike is left out of the plan and listed
+  under "not triggered" with the reason, as GitHub does not start it; the other
+  workflows are planned and run. A job cancelled while it ran counts as
+  `cancelled` for the jobs that need it (`cancelled()`, `needs.<id>.result`),
+  and a matrix is `failure` if any entry failed, else `cancelled` if any was.
+  No other change to the command line.
 
 ## 0.7.0
 

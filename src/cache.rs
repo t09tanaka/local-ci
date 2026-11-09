@@ -294,6 +294,7 @@ impl Store {
                     None => Outcome::Pass,
                 },
                 secs: 0.0,
+                cancelled: false,
                 time: None,
                 steps: j
                     .steps
@@ -544,6 +545,7 @@ jobs:
                     note: None,
                 },
             ],
+            cancelled: false,
             time: None,
         };
         let u = |o: Outcome| UnitResult {

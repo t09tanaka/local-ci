@@ -551,6 +551,118 @@ fn find_close(s: &str) -> Option<usize> {
     None
 }
 
+/// What an expression takes from the `needs` context.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NeedsRef {
+    /// `needs.<job>.outputs.<name>`, however it is spelled.
+    Output { job: String, name: String },
+    /// Outputs of one job taken without naming one: `needs.<job>`,
+    /// `needs.<job>.outputs`, `needs.<job>.outputs.*`, `needs.<job>.outputs[x]`.
+    JobOutputs(String),
+    /// `needs` taken whole or through a computed job: `toJSON(needs)`,
+    /// `needs[matrix.job]`.
+    All,
+}
+
+enum Seg {
+    Name(String),
+    Star,
+    Dyn,
+}
+
+fn collect_needs(ast: &Ast, out: &mut Vec<NeedsRef>) {
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut computed: Vec<&Ast> = Vec::new();
+    let mut cur = ast;
+    loop {
+        match cur {
+            Ast::Prop(base, key) => {
+                match &**key {
+                    Ast::Lit(Value::String(s)) => segs.push(Seg::Name(s.clone())),
+                    other => {
+                        segs.push(Seg::Dyn);
+                        computed.push(other);
+                    }
+                }
+                cur = base;
+            }
+            Ast::Star(base) => {
+                segs.push(Seg::Star);
+                cur = base;
+            }
+            _ => break,
+        }
+    }
+    segs.reverse();
+    match cur {
+        Ast::Ctx(name) if name.eq_ignore_ascii_case("needs") => {
+            let is = |s: Option<&Seg>, w: &str| matches!(s, Some(Seg::Name(n)) if n.eq_ignore_ascii_case(w));
+            match segs.first() {
+                None | Some(Seg::Star) | Some(Seg::Dyn) => out.push(NeedsRef::All),
+                Some(Seg::Name(job)) => {
+                    let job = job.clone();
+                    match segs.get(1) {
+                        None => out.push(NeedsRef::JobOutputs(job)),
+                        Some(_) if is(segs.get(1), "outputs") => match segs.get(2) {
+                            Some(Seg::Name(name)) => out.push(NeedsRef::Output {
+                                job,
+                                name: name.clone(),
+                            }),
+                            _ => out.push(NeedsRef::JobOutputs(job)),
+                        },
+                        // `result`, or a name computed: it could be `outputs`
+                        Some(Seg::Dyn) => out.push(NeedsRef::JobOutputs(job)),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        Ast::Call(_, args) => args.iter().for_each(|a| collect_needs(a, out)),
+        Ast::Not(a) => collect_needs(a, out),
+        Ast::Bin(_, a, b) => {
+            collect_needs(a, out);
+            collect_needs(b, out);
+        }
+        _ => {}
+    }
+    for k in computed {
+        collect_needs(k, out);
+    }
+}
+
+/// What `text` takes from `needs`. `${{ }}` expressions in it are read; with
+/// `bare`, the whole text is an expression too (an `if:`). Text that mentions
+/// `needs` but cannot be read counts as taking all of it.
+pub fn needs_refs(text: &str, bare: bool) -> Vec<NeedsRef> {
+    let mut exprs: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        match find_close(after) {
+            Some(end) => {
+                exprs.push(&after[..end]);
+                rest = &after[end + 2..];
+            }
+            None => {
+                exprs.push(after);
+                break;
+            }
+        }
+    }
+    if bare && exprs.is_empty() {
+        exprs.push(text);
+    }
+    let mut out = Vec::new();
+    for e in exprs {
+        match parse(e) {
+            Ok(ast) => collect_needs(&ast, &mut out),
+            Err(_) if e.to_ascii_lowercase().contains("needs") => out.push(NeedsRef::All),
+            Err(_) => {}
+        }
+    }
+    out
+}
+
 /// Does an `if:` condition call a status function? If not, GitHub wraps it in `success() && (...)`.
 fn has_status_fn(src: &str) -> bool {
     let l = src.to_ascii_lowercase();

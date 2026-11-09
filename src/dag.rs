@@ -10,14 +10,13 @@
 //!
 //! Nothing here runs anything; see [`crate::execute_task`].
 
+use crate::expr::NeedsRef;
 use crate::plan::{self, Plan};
 use crate::wire::{JobSpec, MatrixValue, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::OnceLock;
 
 /// `<workflow file>::<job id>`; a matrix variant adds `#<index>`.
 pub fn node_id(workflow: &str, job: &str) -> String {
@@ -115,72 +114,118 @@ pub(crate) fn matrix_plan(job: &JobSpec) -> MatrixPlan {
 }
 
 /// The graph of the jobs `units` hold. Fails on a `needs` that names no job of
-/// the plan and on a cycle.
+/// the plan and on a cycle; [`unrunnable_workflows`] tells which workflows
+/// those are, so a plan can leave them out.
 pub fn build_graph(workflows: &[WorkflowSpec], units: &[UnitSpec]) -> Result<JobGraph> {
     let mut nodes: Vec<JobNode> = Vec::new();
+    for wi in 0..workflows.len() {
+        nodes.extend(workflow_nodes(workflows, units, wi)?);
+    }
+    order(nodes)
+}
+
+/// The workflows (by index) that cannot be a job graph, each with why: a
+/// `needs` of a job that is not in the plan, a cycle, or a matrix with two
+/// keys that print alike. GitHub does not start such a workflow; the others
+/// are not affected.
+pub fn unrunnable_workflows(
+    workflows: &[WorkflowSpec],
+    units: &[UnitSpec],
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
     for (wi, w) in workflows.iter().enumerate() {
-        let planned: BTreeSet<&str> = units
+        let why = w
+            .jobs
             .iter()
-            .filter(|u| u.workflow == wi)
-            .flat_map(|u| u.jobs.iter().map(String::as_str))
-            .collect();
-        for job in w.jobs.iter().filter(|j| planned.contains(j.id.as_str())) {
-            let mut deps = Vec::new();
-            for n in &job.needs {
-                if !planned.contains(n.as_str()) {
-                    bail!(
-                        "job `{}` of {} needs `{n}`, which is not a job of the plan",
-                        job.id,
-                        w.file
-                    );
-                }
-                deps.push(node_id(&w.file, n));
+            .find_map(|j| {
+                let key = j.matrix.as_ref()?.duplicate_key()?;
+                Some(format!(
+                    "the matrix of job `{}` has two keys that print as `{key}`",
+                    j.id
+                ))
+            })
+            .or_else(|| {
+                workflow_nodes(workflows, units, wi)
+                    .and_then(order)
+                    .err()
+                    .map(|e| format!("{e:#}"))
+            });
+        if let Some(why) = why {
+            out.push((wi, why));
+        }
+    }
+    out
+}
+
+/// The nodes of workflow `wi`, in the order of its jobs.
+fn workflow_nodes(
+    workflows: &[WorkflowSpec],
+    units: &[UnitSpec],
+    wi: usize,
+) -> Result<Vec<JobNode>> {
+    let w = &workflows[wi];
+    let mut nodes: Vec<JobNode> = Vec::new();
+    let planned: BTreeSet<&str> = units
+        .iter()
+        .filter(|u| u.workflow == wi)
+        .flat_map(|u| u.jobs.iter().map(String::as_str))
+        .collect();
+    for job in w.jobs.iter().filter(|j| planned.contains(j.id.as_str())) {
+        let mut deps = Vec::new();
+        for n in &job.needs {
+            if !planned.contains(n.as_str()) {
+                bail!(
+                    "job `{}` of {} needs `{n}`, which is not a job of the plan",
+                    job.id,
+                    w.file
+                );
             }
-            let id = node_id(&w.file, &job.id);
-            let mk = |id: String, kind: NodeKind, depends_on: Vec<String>| JobNode {
-                id,
-                workflow: w.file.clone(),
-                job: job.id.clone(),
-                kind,
-                depends_on,
-            };
-            match matrix_plan(job) {
-                MatrixPlan::None => nodes.push(mk(id, NodeKind::Job, deps)),
-                MatrixPlan::Dynamic(expression) => {
-                    nodes.push(mk(id, NodeKind::DynamicMatrix { expression }, deps))
-                }
-                MatrixPlan::Static(combos) => {
-                    let mut ids = Vec::new();
-                    for (i, c) in combos.into_iter().enumerate() {
-                        let vid = variant_id(&w.file, &job.id, i);
-                        ids.push(vid.clone());
-                        let label = crate::matrix::describe(&c);
-                        nodes.push(mk(
-                            vid,
-                            NodeKind::MatrixVariant {
-                                group: id.clone(),
-                                index: i,
-                                values: c,
-                                label,
-                            },
-                            deps.clone(),
-                        ));
-                    }
+            deps.push(node_id(&w.file, n));
+        }
+        let id = node_id(&w.file, &job.id);
+        let mk = |id: String, kind: NodeKind, depends_on: Vec<String>| JobNode {
+            id,
+            workflow: w.file.clone(),
+            job: job.id.clone(),
+            kind,
+            depends_on,
+        };
+        match matrix_plan(job) {
+            MatrixPlan::None => nodes.push(mk(id, NodeKind::Job, deps)),
+            MatrixPlan::Dynamic(expression) => {
+                nodes.push(mk(id, NodeKind::DynamicMatrix { expression }, deps))
+            }
+            MatrixPlan::Static(combos) => {
+                let mut ids = Vec::new();
+                for (i, c) in combos.into_iter().enumerate() {
+                    let vid = variant_id(&w.file, &job.id, i);
+                    ids.push(vid.clone());
+                    let label = crate::matrix::describe(&c);
                     nodes.push(mk(
-                        id,
-                        NodeKind::MatrixGroup {
-                            variants: ids.clone(),
-                            fail_fast: job.fail_fast,
-                            max_parallel: job.max_parallel,
-                            aggregation: OutputAggregation::MatrixOrder,
+                        vid,
+                        NodeKind::MatrixVariant {
+                            group: id.clone(),
+                            index: i,
+                            values: c,
+                            label,
                         },
-                        ids,
+                        deps.clone(),
                     ));
                 }
+                nodes.push(mk(
+                    id,
+                    NodeKind::MatrixGroup {
+                        variants: ids.clone(),
+                        fail_fast: job.fail_fast,
+                        max_parallel: job.max_parallel,
+                        aggregation: OutputAggregation::MatrixOrder,
+                    },
+                    ids,
+                ));
             }
         }
     }
-    order(nodes)
+    Ok(nodes)
 }
 
 /// Dependency order, keeping plan order where it allows; a cycle is an error.
@@ -337,21 +382,54 @@ pub struct ShardGroup {
     pub aggregation: Option<OutputAggregation>,
 }
 
-fn needs_output_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"needs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)").unwrap()
-    })
-}
-
-fn needs_outputs_of(job: &JobSpec) -> Vec<NeedsOutput> {
-    let text = serde_json::to_string(job).unwrap_or_default();
+/// The outputs of other jobs that `job` reads, found by reading its
+/// expressions. An output named by `needs.x.outputs.y`, `needs['x'].outputs['y']`
+/// and the like is that one; `needs.x.outputs` taken whole or `toJSON(needs)`
+/// count as every output the job needed declares, since the plan cannot say
+/// which are read.
+fn needs_outputs_of(job: &JobSpec, wf: &WorkflowSpec) -> Vec<NeedsOutput> {
+    fn strings(v: &Value, bare: bool, out: &mut Vec<(String, bool)>) {
+        match v {
+            Value::String(s) => out.push((s.clone(), bare)),
+            Value::Array(a) => a.iter().for_each(|e| strings(e, false, out)),
+            Value::Object(m) => {
+                for (k, e) in m {
+                    strings(e, k == "cond", out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut texts = Vec::new();
+    strings(
+        &serde_json::to_value(job).unwrap_or_default(),
+        false,
+        &mut texts,
+    );
+    let declared = |id: &str| -> Vec<NeedsOutput> {
+        wf.job(id)
+            .map(|j| {
+                j.outputs
+                    .iter()
+                    .map(|(name, _)| NeedsOutput {
+                        job: id.to_string(),
+                        name: name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut out = BTreeSet::new();
-    for c in needs_output_re().captures_iter(&text) {
-        out.insert(NeedsOutput {
-            job: c[1].to_string(),
-            name: c[2].to_string(),
-        });
+    for (text, bare) in texts {
+        for r in crate::expr::needs_refs(&text, bare) {
+            match r {
+                NeedsRef::Output { job, name } => {
+                    out.insert(NeedsOutput { job, name });
+                }
+                NeedsRef::JobOutputs(id) => out.extend(declared(&id)),
+                NeedsRef::All => job.needs.iter().for_each(|n| out.extend(declared(n))),
+            }
+        }
     }
     out.into_iter().collect()
 }
@@ -412,12 +490,25 @@ pub(crate) fn derive_tasks(
                 }
             }
         }
+        // Tasks run in the order of the unit (the workflow's order, with each
+        // job after the jobs it needs). When cutting the unit into groups would
+        // run a job earlier or later than that (a group around a job that is not
+        // part of it, or groups that need each other in a cycle), the unit stays
+        // one task in its own order.
         let mut merged = false;
-        if order_groups(wf, u, &groups, &pos).is_none() {
+        let in_unit_order = |groups: &[Vec<usize>], order: &[usize]| {
+            order
+                .iter()
+                .flat_map(|&g| groups[g].iter().copied())
+                .eq(0..n)
+        };
+        let mut ordered = order_groups(wf, u, &groups, &pos).filter(|o| in_unit_order(&groups, o));
+        if ordered.is_none() {
             groups = vec![(0..n).collect()];
             merged = true;
+            ordered = Some(vec![0]);
         }
-        let ordered = order_groups(wf, u, &groups, &pos).expect("one group is acyclic");
+        let ordered = ordered.unwrap();
         for gi in ordered {
             let g = &groups[gi];
             let ids: Vec<String> = g.iter().map(|&i| u.jobs[i].clone()).collect();
@@ -491,7 +582,7 @@ pub(crate) fn derive_tasks(
                 .collect();
             let needs_outputs: Vec<NeedsOutput> = specs_of
                 .iter()
-                .flat_map(|j| needs_outputs_of(j))
+                .flat_map(|j| needs_outputs_of(j, wf))
                 .filter(|o| external.contains(o.job.as_str()))
                 .collect::<BTreeSet<_>>()
                 .into_iter()

@@ -437,6 +437,7 @@ mod tests {
             outcome,
             secs: 1.0,
             steps: vec![],
+            cancelled: false,
             time: None,
         }
     }

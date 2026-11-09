@@ -22,7 +22,9 @@ use serde_yaml::Value as Y;
 /// Mapping keys are strings. A key that is not a string in the YAML is written
 /// the way it prints: `true` / `false`, a number as its shortest decimal form
 /// (`1.5`, `10`), `null` as `null`. Two keys that print alike (`1` and `"1"`)
-/// stay two entries, in file order. Numbers are kept as text, so a float is the
+/// stay two entries here, in file order, but would be one key as YAML or JSON,
+/// so [`MatrixValue::duplicate_key`] finds them and a plan leaves the
+/// workflow out (see [`crate::dag::unrunnable_workflows`]). Numbers are kept as text, so a float is the
 /// same on every host. Values keep their order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -69,6 +71,20 @@ impl MatrixValue {
                 }
                 Y::Mapping(out)
             }
+        }
+    }
+
+    /// A key that prints like another key of the same mapping, at any depth.
+    pub fn duplicate_key(&self) -> Option<String> {
+        match self {
+            MatrixValue::Seq(s) => s.iter().find_map(Self::duplicate_key),
+            MatrixValue::Map(m) => {
+                let mut seen = std::collections::BTreeSet::new();
+                m.iter()
+                    .find_map(|(k, _)| (!seen.insert(k.as_str())).then(|| k.clone()))
+                    .or_else(|| m.iter().find_map(|(_, v)| v.duplicate_key()))
+            }
+            _ => None,
         }
     }
 
