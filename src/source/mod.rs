@@ -303,6 +303,9 @@ pub enum SourceError {
     /// be repeated without writing the original's shared config, which a run
     /// never does: capture again.
     OriginalConfigChanged { keys: Vec<String> },
+    /// Git could not say where the repository's common directory is, so the
+    /// settings it reads cannot be compared.
+    RepositoryUnreadable { path: String, detail: String },
 }
 
 impl fmt::Display for SourceError {
@@ -351,6 +354,10 @@ impl fmt::Display for SourceError {
                 f,
                 "the original repository's settings changed after the capture ({}): capture again; a run does not write the original's config",
                 keys.join(", ")
+            ),
+            SourceError::RepositoryUnreadable { path, detail } => write!(
+                f,
+                "cannot read the Git directory of {path}: {detail}"
             ),
             SourceError::WorkspaceNotClean { paths } => write!(
                 f,

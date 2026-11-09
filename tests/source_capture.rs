@@ -2293,3 +2293,191 @@ fn info_attributes_that_disagree_with_gitattributes_end_in_an_explicit_error() {
         other => panic!("{e:#} ({other:?})"),
     }
 }
+
+// ---- the comparison is made in the new worktree -----------------------------
+
+/// Capture `p.work`, make the objects reachable there, and add a worktree of
+/// the capture in `repo` (a path of the original).
+fn add_in(
+    p: &Pair,
+    m: &local_ci::source::SourceManifest,
+    repo: &Path,
+    name: &str,
+) -> (anyhow::Result<()>, PathBuf) {
+    let c = ctx(&p.home);
+    let wt = p.home.join(name);
+    let r = local_ci::source::add_worktree(
+        &c,
+        &ObjectStore::open(p.home.join("sources")).unwrap(),
+        repo,
+        &wt,
+        m,
+    );
+    (r, wt)
+}
+
+fn captured(p: &Pair) -> local_ci::source::SourceManifest {
+    let c = ctx(&p.home);
+    let m = capture_source(&c, &p.work, &opts()).unwrap().manifest;
+    import_objects(&c, &p.work, &export_objects(&c, &m).unwrap(), &m).unwrap();
+    m
+}
+
+/// The keys of the `OriginalConfigChanged` that adding a worktree in the
+/// original gives, with the original's config as it was and the new worktree
+/// gone from the disk and from Git's list.
+fn refused_keys(p: &Pair, m: &local_ci::source::SourceManifest, repo: &Path) -> Vec<String> {
+    let before = config_bytes(&p.work);
+    let (r, wt) = add_in(p, m, repo, "wt");
+    let e = r.unwrap_err();
+    let keys = match e.downcast_ref::<SourceError>() {
+        Some(SourceError::OriginalConfigChanged { keys }) => keys.clone(),
+        other => panic!("{e:#} ({other:?})"),
+    };
+    assert_eq!(config_bytes(&p.work), before);
+    assert!(!wt.exists(), "the new worktree is left behind");
+    let list = git_out(&p.work, &["worktree", "list", "--porcelain"]);
+    assert!(!list.contains("/wt\n") && !list.ends_with("/wt"), "{list}");
+    keys
+}
+
+#[test]
+fn a_changed_eol_or_safecrlf_or_filter_names_its_key_and_removes_the_new_worktree() {
+    let p = pair(|w| {
+        git(w, &["config", "filter.pre.clean", "cat"]);
+        git(w, &["config", "filter.pre.smudge", "cat"]);
+        git(w, &["config", "core.safecrlf", "false"]);
+        std::fs::write(w.join(".gitattributes"), "*.pf filter=pre\n").unwrap();
+        std::fs::write(w.join("x.pf"), "x\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    std::fs::write(p.work.join("x.pf"), "y\n").unwrap();
+    let m = captured(&p);
+    git(&p.work, &["config", "core.eol", "crlf"]);
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["core.eol"]);
+    git(&p.work, &["config", "--unset", "core.eol"]);
+    git(&p.work, &["config", "core.safecrlf", "warn"]);
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["core.safecrlf"]);
+    git(&p.work, &["config", "--unset", "core.safecrlf"]);
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["core.safecrlf"]);
+    git(&p.work, &["config", "core.safecrlf", "false"]);
+    git(&p.work, &["config", "filter.pre.clean", "tr a b"]);
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["filter.pre.clean"]);
+}
+
+#[test]
+fn changed_info_attributes_of_the_original_are_the_key_attributes() {
+    let p = local_pair(false);
+    let m = captured(&p);
+    std::fs::write(p.work.join(".git/info/attributes"), "*.txt -text\n").unwrap();
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["attributes"]);
+}
+
+#[test]
+fn a_setting_that_only_the_path_of_the_original_brings_is_not_read_by_a_new_worktree() {
+    // an `includeIf gitdir:` that matches the Git directory of the original
+    // alone: a worktree added in it does not read the included file
+    let p = pair(|w| {
+        let real = std::fs::canonicalize(w).unwrap();
+        std::fs::write(w.join("inc.cfg"), "[core]\n\tautocrlf = true\n").unwrap();
+        let cfg = w.join(".git/config");
+        let mut s = std::fs::read_to_string(&cfg).unwrap();
+        s.push_str(&format!(
+            "[includeIf \"gitdir:{}/.git\"]\n\tpath = {}\n",
+            real.display(),
+            real.join("inc.cfg").display()
+        ));
+        std::fs::write(&cfg, s).unwrap();
+        std::fs::write(w.join("a.txt"), "a\r\n").unwrap();
+        git(w, &["add", "a.txt"]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    assert_eq!(
+        git_out(&p.work, &["config", "--get", "core.autocrlf"]),
+        "true"
+    );
+    dirty_crlf(&p.work);
+    let m = captured(&p);
+    assert_eq!(refused_keys(&p, &m, &p.work), vec!["core.autocrlf"]);
+}
+
+#[test]
+fn an_unset_value_is_its_default_and_a_valueless_filter_variable_is_unset() {
+    let p = local_pair(false);
+    let m = captured(&p);
+    git(&p.work, &["config", "core.autocrlf", "false"]);
+    git(&p.work, &["config", "core.eol", "native"]);
+    let (r, wt) = add_in(&p, &m, &p.work, "wt");
+    r.unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+
+    let p = pair(|w| {
+        git(w, &["config", "filter.pre.clean", "cat"]);
+        let cfg = w.join(".git/config");
+        let mut s = std::fs::read_to_string(&cfg).unwrap();
+        s.push_str("[filter \"pre\"]\n\trequired\n");
+        std::fs::write(&cfg, s).unwrap();
+        std::fs::write(w.join(".gitattributes"), "*.pf filter=pre\n").unwrap();
+        std::fs::write(w.join("x.pf"), "x\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-qm", "base"]);
+    });
+    std::fs::write(p.work.join("x.pf"), "y\n").unwrap();
+    let m = captured(&p);
+    let (r, wt) = add_in(&p, &m, &p.work, "wt");
+    r.unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_linked_worktree_and_a_symlinked_path_of_the_original_are_the_original() {
+    let p = local_pair(true);
+    let m = captured(&p);
+    let linked = p.home.join("linked");
+    git(
+        &p.work,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            linked.to_str().unwrap(),
+        ],
+    );
+    git(&p.work, &["config", "core.autocrlf", "false"]);
+    assert_eq!(refused_keys(&p, &m, &linked), vec!["core.autocrlf"]);
+    let link = p.home.join("link");
+    std::os::unix::fs::symlink(&p.work, &link).unwrap();
+    assert_eq!(refused_keys(&p, &m, &link), vec!["core.autocrlf"]);
+}
+
+#[test]
+fn a_manifest_without_a_repository_id_is_not_taken_for_the_original() {
+    let p = local_pair(true);
+    let mut m = captured(&p);
+    m.repository_id = None;
+    let m = local_ci::source::seal_manifest(m);
+    git(&p.work, &["config", "core.autocrlf", "false"]);
+    let (r, wt) = add_in(&p, &m, &p.work, "wt");
+    r.unwrap();
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_directory_that_is_not_a_repository_is_an_error_not_a_worker() {
+    let p = local_pair(false);
+    let m = captured(&p);
+    let plain = p.home.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let (r, wt) = add_in(&p, &m, &plain, "wt");
+    let e = r.unwrap_err();
+    assert!(
+        matches!(
+            e.downcast_ref::<SourceError>(),
+            Some(SourceError::RepositoryUnreadable { .. })
+        ),
+        "{e:#}"
+    );
+    assert!(!wt.exists());
+}

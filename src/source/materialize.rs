@@ -179,12 +179,14 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
 /// checkout, the manifest's bytes are written, and the index is read from the
 /// commit; Git then sees the same content as clean that the capture saw.
 ///
-/// The settings of the manifest are compared with what `repo` reads. If they
-/// all agree (a run on the machine that captured, in the original itself,
-/// always does) no config is written anywhere. If not, they are repeated in
-/// the worktree only, but never when `repo` is a repository the manifest was
-/// captured from: a run does not write the original's config, so that is
-/// `SourceError::OriginalConfigChanged` and nothing is added.
+/// The settings of the manifest are compared with what Git reads in the new
+/// worktree itself (so its own config, and `includeIf` rules that depend on
+/// its path, count). If they all agree (a run in the original, on the machine
+/// that captured, always does) no config is written anywhere. If not, they are
+/// repeated in the worktree only, but never when `repo` is a repository the
+/// manifest was captured from: a run does not write the original's config, so
+/// the worktree is removed again and that is
+/// `SourceError::OriginalConfigChanged`.
 pub fn add_worktree(
     ctx: &ExecContext,
     store: &ObjectStore,
@@ -196,16 +198,14 @@ pub fn add_worktree(
         bail!("{} has no execution commit", m.source_id);
     };
     check_filters(ctx, &m.canonical)?;
-    // decided before anything is added to `repo`
-    let differs = !differing_settings(ctx, repo, &m.canonical).is_empty();
-    if differs {
-        let keys = differing_settings(ctx, repo, &m.canonical);
-        if is_capture_source(ctx, store, repo, m) {
+    let from_capture = is_capture_source(ctx, store, repo, m)?;
+    crate::git::add_worktree_no_checkout(ctx, repo, path, commit)?;
+    let keys = differing_settings(ctx, path, &m.canonical)?;
+    if !keys.is_empty() {
+        if from_capture {
+            crate::git::remove_new_worktree(ctx, repo, path)?;
             return Err(SourceError::OriginalConfigChanged { keys }.into());
         }
-    }
-    crate::git::add_worktree_no_checkout(ctx, repo, path, commit)?;
-    if differs {
         apply_canonical(ctx, repo, path, &m.canonical)?;
     }
     materialize_from(store, m, path)?;
@@ -261,34 +261,60 @@ fn check_filters(ctx: &ExecContext, c: &CanonicalConfig) -> Result<()> {
     Ok(())
 }
 
-/// The keys of `c` that `repo` does not have the same value for, as its own
-/// Git reads them. The attribute rules are compared as bytes, in the order the
-/// capture wrote them.
-fn differing_settings(ctx: &ExecContext, repo: &Path, c: &CanonicalConfig) -> Vec<String> {
-    use super::capture::{attribute_rules, og_str};
-    let get = |k: &str| {
-        og_str(ctx, repo, &["config", "--get", k])
-            .ok()
-            .filter(|v| !v.is_empty())
-    };
-    let mut keys = vec![];
-    for (k, want) in [
-        ("core.autocrlf", &c.autocrlf),
-        ("core.eol", &c.eol),
-        ("core.safecrlf", &c.safecrlf),
-    ] {
-        if &get(k) != want {
-            keys.push(k.to_string());
-        }
-    }
-    let git_dir = og_str(
+/// The value of a variable that is set to something. A key without a value
+/// reads as empty, which is the same as unset for every setting compared here.
+fn non_empty(v: Option<&String>) -> Option<String> {
+    v.filter(|v| !v.is_empty()).cloned()
+}
+
+/// The common Git directory of `repo`, as Git says it.
+fn common_dir(ctx: &ExecContext, repo: &Path) -> Result<String> {
+    super::capture::og_str(
         ctx,
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    );
-    let rules = git_dir
-        .map(|d| attribute_rules(ctx, repo, Path::new(&d)))
-        .unwrap_or_default();
+    )
+    .map_err(|e| {
+        SourceError::RepositoryUnreadable {
+            path: repo.display().to_string(),
+            detail: format!("{e:#}"),
+        }
+        .into()
+    })
+}
+
+/// The keys of `c` that the worktree at `wt` does not have the same value for,
+/// as its own Git reads them. An unset `core.autocrlf` or `core.eol` is its
+/// default (as `apply_canonical` writes it). The attribute rules are compared
+/// as bytes, in the order the capture wrote them.
+fn differing_settings(ctx: &ExecContext, wt: &Path, c: &CanonicalConfig) -> Result<Vec<String>> {
+    use super::capture::{attribute_rules, og_str};
+    let get = |k: &str| {
+        og_str(ctx, wt, &["config", "--get", k])
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let or = |v: Option<String>, d: &str| Some(v.unwrap_or_else(|| d.to_string()));
+    let mut keys = vec![];
+    for (k, have, want) in [
+        (
+            "core.autocrlf",
+            or(get("core.autocrlf"), "false"),
+            or(c.autocrlf.clone(), "false"),
+        ),
+        (
+            "core.eol",
+            or(get("core.eol"), "native"),
+            or(c.eol.clone(), "native"),
+        ),
+        // `apply_canonical` writes it only when there is one
+        ("core.safecrlf", get("core.safecrlf"), c.safecrlf.clone()),
+    ] {
+        if have != want {
+            keys.push(k.to_string());
+        }
+    }
+    let rules = attribute_rules(ctx, wt, Path::new(&common_dir(ctx, wt)?));
     if super::store::hex(&rules) != c.attributes {
         keys.push("attributes".to_string());
     }
@@ -300,12 +326,12 @@ fn differing_settings(ctx: &ExecContext, repo: &Path, c: &CanonicalConfig) -> Ve
             ("required", &f.required),
         ] {
             let key = format!("filter.{}.{var}", f.name);
-            if &get(&key) != want {
+            if get(&key) != non_empty(want.as_ref()) {
                 keys.push(key);
             }
         }
     }
-    keys
+    Ok(keys)
 }
 
 /// Whether `repo` is a repository `m` was captured from on this host: the
@@ -315,21 +341,15 @@ fn is_capture_source(
     store: &ObjectStore,
     repo: &Path,
     m: &SourceManifest,
-) -> bool {
+) -> Result<bool> {
+    let common = common_dir(ctx, repo)?;
     let Some(id) = &m.repository_id else {
-        return false;
+        return Ok(false);
     };
-    let Ok(common) = super::capture::og_str(
-        ctx,
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ) else {
-        return false;
-    };
-    store
+    Ok(store
         .git_dir(&super::capture::private_key(id, &common))
         .join("HEAD")
-        .is_file()
+        .is_file())
 }
 
 /// Make Git in the worktree at `path` read the settings that made the blobs,

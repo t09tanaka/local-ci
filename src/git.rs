@@ -233,6 +233,14 @@ pub fn add_worktree_no_checkout(
     add_worktree_with(ctx, repo, path, sha, false)
 }
 
+/// Remove the worktree at `path` that was just added, whatever is in it.
+pub fn remove_new_worktree(ctx: &ExecContext, repo: &Path, path: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        let p = path.to_string_lossy();
+        git(ctx, repo, &["worktree", "remove", "--force", &p]).map(|_| ())
+    })
+}
+
 /// Let worktrees of `repo` have a config of their own (`git config
 /// --worktree`). The switch is in the shared config, so it is written under
 /// the same lock as worktree adds, and only when it is not on yet.

@@ -9,7 +9,8 @@
   blobs, so a clean repository has the tree of `HEAD`; a worker writes the raw
   bytes into a `--no-checkout` worktree (`source::add_worktree`). When the
   repository already reads the settings the manifest records (`core.autocrlf`
-  / `eol` / `safecrlf`, `info/attributes`, the filters in use), as the
+  / `eol` / `safecrlf`, `info/attributes`, the filters in use; compared in the
+  new worktree itself, unset `autocrlf` / `eol` being their defaults), as the
   original does in a local run, no config is written; otherwise a worker
   repeats them in that worktree only, and the original is never written to
   (`OriginalConfigChanged` when its settings changed after the capture). It
