@@ -266,7 +266,7 @@ impl TemplateContext {
     /// the template; fill them in before reusing one in a persistent scope.
     pub fn local(fp: &FrozenPlan, run_id: &str) -> Self {
         TemplateContext {
-            source_digest: fp.source.sha.clone(),
+            source_digest: fp.source.execution_commit.clone(),
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             profile: "local".into(),

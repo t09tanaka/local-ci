@@ -15,6 +15,7 @@ use crate::frozen::{
     DisabledRecord, DisabledSource, DisabledWorkflow, Filters, FrozenConfig, FrozenPlan, PlanParts,
     SourceRef,
 };
+use crate::source::{self, SourceInfo, SourceKind, SourceManifest};
 use crate::{cache, config, exec, filter, git, plan, report, setup, workflow};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -59,6 +60,10 @@ pub struct RunOptions {
     pub no_cache: bool,
     /// Where runs, results, worktrees and locks live (see [`ExecContext::cache_dir`]).
     pub cache_dir: PathBuf,
+    /// The captured source the run is over: `target.sha` is its execution
+    /// commit (found in `target.dir`, e.g. after `source::import_objects`).
+    /// `None` for a run of a plain commit.
+    pub source: Option<SourceManifest>,
 }
 
 /// What [`run`] produced; the caller prints it and picks the exit code.
@@ -68,6 +73,9 @@ pub struct RunReport {
     pub cancelled: bool,
     /// How to print `result` (see [`report::print`]).
     pub style: report::Style,
+    /// The captured source the run was over, if it was over one. Decides
+    /// whether the result may be a commit status: see [`publish_target`].
+    pub source: Option<SourceInfo>,
 }
 
 pub struct Repo {
@@ -398,7 +406,8 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
     FrozenPlan::new(PlanParts {
         repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {
-            sha: repo.sha.clone(),
+            source_id: format!("commit:{}", repo.sha),
+            execution_commit: repo.sha.clone(),
             base: repo.base.clone(),
         },
         branch: repo.head.clone(),
@@ -498,7 +507,17 @@ pub fn execute_plan(
 
 pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
     let t_start = std::time::Instant::now();
-    let full = build_frozen_plan(ctx, &a.target, obs)?;
+    let mut full = build_frozen_plan(ctx, &a.target, obs)?;
+    if let Some(m) = &a.source {
+        if m.execution_commit.as_deref() != Some(full.source.execution_commit.as_str()) {
+            bail!(
+                "the target is {}, not the execution commit of source {}",
+                &full.source.execution_commit[..7],
+                m.source_id
+            );
+        }
+        full = full.with_source_id(&m.source_id)?;
+    }
     let root = git::toplevel(ctx, &a.target.dir)?;
     let cache = a.cache_dir.clone();
     let key = repo_key(ctx, &root);
@@ -511,7 +530,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
     store.prune(stamp);
-    let sha = full.source.sha.as_str();
+    let sha = full.source.execution_commit.as_str();
     let fingerprints: Vec<Option<String>> = if full.units.is_empty() {
         vec![]
     } else {
@@ -560,6 +579,10 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let fp = full.with_plan(p)?;
     let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));
     std::fs::create_dir_all(&run_dir)?;
+    let source_info = a.source.as_ref().map(SourceInfo::of);
+    if let Some(info) = &source_info {
+        exec::write_json(&run_dir.join("source.json"), info)?;
+    }
     std::fs::create_dir_all(cache.join("locks"))?;
     if git::is_dirty(ctx, &root) {
         obs.notice(&format!(
@@ -654,7 +677,36 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             workflows_dir: full.config.default_workflows_dir.clone(),
             home: ctx.home().map(String::from),
         },
+        source: source_info,
     })
+}
+
+/// The commit a result may be posted to as its `local-ci` status.
+///
+/// A run of a plain commit (`info` is `None`) posts to the commit it tested.
+/// A run of a captured source posts to the commit it was captured from, and
+/// only when what was tested is what that commit holds; otherwise `Err` says
+/// why not. Success of a dirty worktree, a synthetic commit or a directory
+/// is never success of the original `HEAD`.
+pub fn publish_target(
+    ctx: &ExecContext,
+    root: &std::path::Path,
+    tested_sha: &str,
+    info: Option<&SourceInfo>,
+) -> std::result::Result<String, String> {
+    let Some(info) = info else {
+        return Ok(tested_sha.to_string());
+    };
+    let target = match info.source_kind {
+        SourceKind::Worktree => info.original_head.clone(),
+        SourceKind::Commit => info.execution_commit.clone(),
+        SourceKind::Directory => None,
+    };
+    let Some(target) = target else {
+        return Err("the run tested a directory snapshot, not a commit".into());
+    };
+    source::publishable(ctx, root, info, &target)?;
+    Ok(target)
 }
 
 /// Record the last run's result as the `local-ci` commit status.
@@ -676,13 +728,26 @@ pub fn status(
     let saved: report::Saved = serde_json::from_str(&std::fs::read_to_string(
         PathBuf::from(run_dir.trim()).join("result.json"),
     )?)?;
-    if saved.sha != want {
-        bail!(
+    let run_dir = PathBuf::from(run_dir.trim());
+    let info: Option<SourceInfo> = match std::fs::read_to_string(run_dir.join("source.json")) {
+        Ok(t) => Some(serde_json::from_str(&t).context("source.json is not readable")?),
+        Err(_) => None,
+    };
+    match &info {
+        None if saved.sha != want => bail!(
             "the last run tested {}, not {}; run `local-ci run` again",
             &saved.sha[..7],
             &want[..7]
-        );
+        ),
+        None => {}
+        Some(i) => {
+            // the run was over a captured source: it speaks for `want` only
+            // when it tested the same content
+            if let Err(why) = source::publishable(ctx, &root, i, &want) {
+                bail!("not posting: {why}");
+            }
+        }
     }
-    post_status(ctx, &root, &saved.sha, &saved.state, &saved.description)?;
+    post_status(ctx, &root, &want, &saved.state, &saved.description)?;
     Ok((saved.state.clone(), saved.sha[..7].to_string()))
 }

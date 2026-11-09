@@ -19,6 +19,7 @@ pub mod portool;
 pub mod report;
 mod run;
 pub mod setup;
+pub mod source;
 pub mod task;
 pub mod template;
 pub mod wire;
@@ -27,8 +28,8 @@ pub mod workflow;
 pub use context::{CancelHandle, ExecContext};
 pub use frozen::{derive_job_dag, FrozenPlan};
 pub use run::{
-    build_frozen_plan, build_frozen_plan_with, execute_plan, freeze, post_status, resolve,
-    resolve_with, run, status, Observer, Quiet, Repo, RunOptions, RunReport, Target,
+    build_frozen_plan, build_frozen_plan_with, execute_plan, freeze, post_status, publish_target,
+    resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions, RunReport, Target,
 };
 pub use task::{
     aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,

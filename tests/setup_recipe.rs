@@ -129,7 +129,13 @@ impl<'a> Place<'a> {
 
     fn workspace(&self, name: &str) -> Workspace {
         let wt = self.cache.join("wt").join(name);
-        local_ci::git::add_worktree(&ctx(self.home), self.dir, &wt, &self.fp.source.sha).unwrap();
+        local_ci::git::add_worktree(
+            &ctx(self.home),
+            self.dir,
+            &wt,
+            &self.fp.source.execution_commit,
+        )
+        .unwrap();
         let ws = Workspace {
             root: wt,
             repo_root: self.dir.to_path_buf(),

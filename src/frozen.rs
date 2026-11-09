@@ -16,14 +16,19 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bumped when the shape of a [`FrozenPlan`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
-/// What the plan was made from: a commit and the ref it was compared with.
-/// (Snapshots of uncommitted work are added later.)
+/// What the plan was made from: a [`crate::source::SourceManifest`] by its
+/// id, the commit the jobs run against, and the ref the changed files were
+/// taken against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceRef {
-    /// The full commit sha the jobs run against.
-    pub sha: String,
+    /// `SourceManifest::source_id` of the captured input. A run of a plain
+    /// commit (nothing captured) names itself `commit:<sha>`.
+    pub source_id: String,
+    /// The full commit sha the jobs run against: the commit itself, or the
+    /// synthetic commit made from a captured worktree.
+    pub execution_commit: String,
     /// The base the changed files were taken against (a ref or a sha).
     pub base: String,
 }
@@ -347,6 +352,15 @@ impl FrozenPlan {
             disabled: self.disabled.clone(),
             plan,
         })
+    }
+
+    /// This plan naming `source_id` as its input, sealed again. For a run of
+    /// a captured source: the commit the plan was made from is the
+    /// manifest's execution commit.
+    pub fn with_source_id(mut self, source_id: &str) -> Result<Self> {
+        self.source.source_id = source_id.to_string();
+        self.digest = self.compute_digest()?;
+        Ok(self)
     }
 
     pub fn job(&self, wf: usize, id: &str) -> &JobSpec {

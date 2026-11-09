@@ -163,6 +163,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
         job_timeout: a.job_timeout,
         no_cache: a.no_cache,
         cache_dir: ctx.cache_dir(),
+        source: None,
     };
     let rep = local_ci::run(
         ctx,
@@ -189,19 +190,28 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
                 }
             );
         } else {
-            match local_ci::post_status(
-                ctx,
-                &rep.repo_root,
-                &result.sha,
-                &result.state,
-                &result.description,
-            ) {
-                Ok(()) => println!(
+            // a run over a captured source posts only to a commit whose
+            // content it tested
+            let posted =
+                local_ci::publish_target(ctx, &rep.repo_root, &result.sha, rep.source.as_ref())
+                    .and_then(|target| {
+                        local_ci::post_status(
+                            ctx,
+                            &rep.repo_root,
+                            &target,
+                            &result.state,
+                            &result.description,
+                        )
+                        .map(|()| target)
+                        .map_err(|e| format!("{e:#}"))
+                    });
+            match posted {
+                Ok(target) => println!(
                     "status: local-ci={} posted to {}",
                     result.state,
-                    &result.sha[..7]
+                    &target[..7]
                 ),
-                Err(e) => println!("status: not posted ({e:#})"),
+                Err(e) => println!("status: not posted ({e})"),
             }
         }
     }

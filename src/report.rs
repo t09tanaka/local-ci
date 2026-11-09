@@ -205,7 +205,7 @@ pub fn assemble(
     let description = description(state, &units, nothing_triggered, not_covered.len(), dir);
     RunResult {
         version: env!("CARGO_PKG_VERSION").into(),
-        sha: fp.source.sha.clone(),
+        sha: fp.source.execution_commit.clone(),
         base: fp.source.base.clone(),
         changed_files: fp.changed_files.len(),
         mode: if fp.filters.all { "all" } else { "changes" }.into(),

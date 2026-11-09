@@ -793,8 +793,8 @@ impl<'a> Runner<'a> {
         let pr = event == "pull_request";
         json!({
             "event_name": event,
-            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.fp.source.sha}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
-            "sha": self.fp.source.sha,
+            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.fp.source.execution_commit}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
+            "sha": self.fp.source.execution_commit,
             "ref": if pr { "refs/pull/0/merge".to_string() } else { format!("refs/heads/{head}") },
             "ref_name": if pr { "0/merge".to_string() } else { head.clone() },
             "head_ref": if pr { head.clone() } else { String::new() },
@@ -849,7 +849,7 @@ impl<'a> Runner<'a> {
                 self.marks(Path::new(&ws)).to_string_lossy().into_owned(),
             ),
             ("GITHUB_WORKSPACE".into(), ws),
-            ("GITHUB_SHA".into(), self.fp.source.sha.clone()),
+            ("GITHUB_SHA".into(), self.fp.source.execution_commit.clone()),
             ("GITHUB_REF".into(), s("ref")),
             ("GITHUB_REF_NAME".into(), s("ref_name")),
             ("GITHUB_HEAD_REF".into(), s("head_ref")),
@@ -1200,7 +1200,7 @@ impl<'a> Runner<'a> {
     pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> PreparedSetup {
         if recipe.steps.is_empty() {
             return PreparedSetup {
-                receipt: PreparedReceipt::empty(key, &self.fp.source.sha),
+                receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
                 steps: vec![],
             };
         }
@@ -1208,7 +1208,7 @@ impl<'a> Runner<'a> {
             Ok(id) => id,
             Err(e) => {
                 return PreparedSetup {
-                    receipt: PreparedReceipt::empty(key, &self.fp.source.sha),
+                    receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
                     steps: vec![StepResult {
                         label: "setup".into(),
                         outcome: Outcome::Error(format!("cannot record the workspace id: {e:#}")),
@@ -1323,7 +1323,7 @@ impl<'a> Runner<'a> {
         PreparedSetup {
             receipt: PreparedReceipt {
                 template_key: key.into(),
-                source: self.fp.source.sha.clone(),
+                source: self.fp.source.execution_commit.clone(),
                 workspace,
                 steps: prepared,
                 artifacts,
@@ -1459,7 +1459,7 @@ impl<'a> Runner<'a> {
             &self.repo_root,
             from,
             to,
-            &self.fp.source.sha,
+            &self.fp.source.execution_commit,
             self.fp.config.link_node_modules,
         )?;
         let marks = self.marks(to);
@@ -1491,7 +1491,7 @@ impl<'a> Runner<'a> {
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
-            &self.fp.source.sha[..7],
+            &self.fp.source.execution_commit[..7],
             std::process::id()
         ));
         let t0 = Instant::now();
@@ -1670,7 +1670,7 @@ impl<'a> Runner<'a> {
             Some((r, tctx)) => match setup::derive_in(&self.plan, &self.hoisted, task)?
                 .prepared_places(
                     r,
-                    &self.fp.source.sha,
+                    &self.fp.source.execution_commit,
                     setup::workspace_id(ws).as_deref(),
                     ws,
                     tctx,
@@ -1972,7 +1972,7 @@ impl<'a> Runner<'a> {
                         // the pid stays last in the name: cleanup scripts read it from there
                         let copy = self.wt.with_file_name(format!(
                             "{}-c{}-{}",
-                            &self.fp.source.sha[..7],
+                            &self.fp.source.execution_commit[..7],
                             self.seq.fetch_add(1, Ordering::SeqCst),
                             std::process::id()
                         ));

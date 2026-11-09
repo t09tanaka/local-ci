@@ -98,7 +98,7 @@ fn a_frozen_plan_survives_json_and_keeps_its_digest() {
     // a changed plan no longer matches its digest
     let tampered = text.replace("echo hi", "echo bye");
     assert!(FrozenPlan::from_json(&tampered).is_err());
-    let newer = text.replace("\"schema_version\":3", "\"schema_version\":4");
+    let newer = text.replace("\"schema_version\":4", "\"schema_version\":5");
     assert!(FrozenPlan::from_json(&newer).is_err());
 }
 
@@ -121,7 +121,7 @@ fn the_digest_follows_the_input_and_nothing_else() {
     git(&dir, &["commit", "-qam", "again"]);
     let c = plan_of(&dir, "main", tmp.path());
     assert_ne!(a.digest, c.digest);
-    assert_ne!(a.source.sha, c.source.sha);
+    assert_ne!(a.source.execution_commit, c.source.execution_commit);
 }
 
 #[test]
@@ -187,6 +187,7 @@ fn run_options(dir: &Path, cache: &Path) -> RunOptions {
         job_timeout: 5.0,
         no_cache: true,
         cache_dir: cache.to_path_buf(),
+        source: None,
     }
 }
 
@@ -202,7 +203,7 @@ fn executing_a_built_plan_gives_what_run_gives() {
     let fp = local_ci::build_frozen_plan(&c, &target(&dir, "main"), &mut Quiet).unwrap();
     let cache = tmp.path().join("c2");
     let wt = cache.join("wt/manual");
-    local_ci::git::add_worktree(&c, &dir, &wt, &fp.source.sha).unwrap();
+    local_ci::git::add_worktree(&c, &dir, &wt, &fp.source.execution_commit).unwrap();
     let ws = local_ci::exec::Workspace {
         root: wt,
         repo_root: dir.clone(),
@@ -266,15 +267,21 @@ fn cancelling_one_attempt_leaves_a_concurrent_one_running() {
 fn the_library_does_not_read_the_process_environment() {
     // clippy's disallowed-methods (clippy.toml) says the same; this holds when
     // only `cargo test` runs.
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for e in std::fs::read_dir(src).unwrap() {
-        let p = e.unwrap().path();
-        if p.file_name().unwrap() == "main.rs" {
-            continue;
-        }
-        let text = std::fs::read_to_string(&p).unwrap();
-        for needle in ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("] {
-            assert!(!text.contains(needle), "{} uses {needle}", p.display());
+    let mut todo = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = todo.pop() {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+                continue;
+            }
+            if p.file_name().unwrap() == "main.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            for needle in ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("] {
+                assert!(!text.contains(needle), "{} uses {needle}", p.display());
+            }
         }
     }
 }
