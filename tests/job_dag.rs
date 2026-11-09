@@ -901,6 +901,7 @@ fn a_fresh_attempt_is_not_cancelled_with_the_one_it_came_from() {
     assert!(!b.cancel.is_cancelled());
     assert_eq!(a.env(), b.env());
 }
+
 // ---- status functions and `needs` as GitHub reads them ----
 
 /// What a job came to: its status and why it did not run.
