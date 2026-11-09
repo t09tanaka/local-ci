@@ -2425,7 +2425,9 @@ impl<'a> Runner<'a> {
             // every place it may stand, so such a step is skipped.
             let token_in_script = script.contains(expr::TOKEN_MARK);
             let sh_like = matches!(shell_now.map(str::trim), None | Some("bash") | Some("sh"));
-            let secrets = secrets || (token_in_script && !sh_like);
+            let secrets = secrets
+                || (token_in_script && !sh_like)
+                || crate::script::token_may_be_literal(&script, expr::TOKEN_MARK);
             let script = script.replace(expr::TOKEN_MARK, &format!("${{{}}}", expr::TOKEN_ENV));
             if secrets {
                 push(
@@ -2443,10 +2445,19 @@ impl<'a> Runner<'a> {
                 .tools
                 .join(format!("files/{}", self.seq.fetch_add(1, Ordering::SeqCst)));
             let _ = fs::create_dir_all(&files_dir);
-            let fc = |name: &str| files_dir.join(name);
-            for f in ["output", "env", "path", "summary"] {
-                let _ = File::create(fc(f));
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                let _ = fs::set_permissions(&files_dir, fs::Permissions::from_mode(0o700));
+                for f in ["output", "env", "path", "summary"] {
+                    let _ = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(files_dir.join(f));
+                }
             }
+            let fc = |name: &str| files_dir.join(name);
             let gh = scm["github"].clone();
             let mut env: Vec<(String, String)> = self.base_env(&gh, &extra_path);
             env.extend(port_env.iter().cloned());
@@ -2535,8 +2546,14 @@ impl<'a> Runner<'a> {
             }
             let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
             let mut outputs = Map::new();
+            // an output is read by later steps and written to result.json: the
+            // token does not go there
+            let hide = |v: String| match self.ctx.github_token_if_fetched() {
+                Some(t) if t.len() >= 4 => v.replace(t, "***"),
+                _ => v,
+            };
             for (k, v) in parse_file_command(&read("output")) {
-                outputs.insert(k, Value::String(v));
+                outputs.insert(k, Value::String(hide(v)));
             }
             extra_env.extend(parse_file_command(&read("env")));
             extra_path.extend(
@@ -2622,6 +2639,10 @@ impl<'a> Runner<'a> {
         let octx = Ctx::new(&ocm, Status::Success);
         for (k, v) in &job.outputs {
             if let Ok(val) = expr::interpolate(v, &octx) {
+                let val = match self.ctx.github_token_if_fetched() {
+                    Some(t) if t.len() >= 4 => val.replace(t, "***"),
+                    _ => val,
+                };
                 outputs.insert(k.clone(), Value::String(val));
             }
         }

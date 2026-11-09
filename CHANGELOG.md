@@ -136,8 +136,9 @@
 - When jobs that share one install have other values of an `ignore-env`
   variable, the install ran with the values of the first. The setup step's
   note, the run's warnings and the receipt's `notes` now say which job's
-  value it ran with and which other jobs differ. Values are shown as a name and the first 8 hex
-  digits of the value's SHA-256, never the value (it may hold a credential).
+  value it ran with and which other jobs differ. Only the name and the jobs
+  are shown, not a value or a fingerprint of one (a short value can be guessed
+  from a fingerprint).
 - What is left out is decided from the commands a `run:` script runs, not from
   words in it. The script is cut into simple commands (at `;`, `&&`, `||`,
   `|`, `&` and newlines; comments and heredoc bodies are dropped; `bash -c`
@@ -147,8 +148,12 @@
   `gh pr list`, `aws sts get-caller-identity` and `sudo -n true` are run;
   `git push`, `npm publish`, `gh pr merge|create|comment|edit`,
   `gh api -X POST`, `aws s3 cp|sync|rm` to a bucket, `aws ... deploy`,
-  `kubectl apply|delete|create|replace|patch|rollout`, `vercel`/`netlify`
-  deploys and installs of system packages (`sudo apt-get install`, `brew
+  `kubectl apply|delete|create|replace|patch|rollout`, `vercel`/`netlify`/
+  `wrangler` deploys, `docker push` / `image push` / `compose push` /
+  `buildx build --push`, `curl`/`wget` with a writing method or a body, the
+  same commands behind `npx`, `bunx`, `pnpm dlx|exec`, `yarn dlx|exec` and
+  `npm exec`, a `publish` of npm/pnpm/yarn/bun wherever it stands among the
+  options, and installs of system packages (`sudo apt-get install`, `brew
   install`) are left out. A `brew install` of formulae that are on the PATH
   already is run.
 - A step that reads `github.token` or `secrets.GITHUB_TOKEN` is run with this
@@ -157,7 +162,14 @@
   before (`incomplete`). The value is never written to a file of the run: a
   script holds a reference to `$LOCAL_CI_GITHUB_TOKEN` (set only in the step's
   process, as is a `GH_TOKEN: ${{ github.token }}` env), and a step in another
-  shell than bash/sh that uses it is skipped. Step scripts are mode 0600. Other secrets are still never supplied.
+  shell than bash/sh that uses it is skipped. A reference the shell would not
+  expand (inside `'...'`, `$'...'`, after a backslash, in the body of a quoted
+  heredoc, or a part of one left by `format()`/`substring()`) would reach the
+  command as literal text, so that step is skipped too (`incomplete`). The
+  value is also replaced by `***` in step and job outputs before they are
+  recorded, and the files behind `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`
+  and `GITHUB_STEP_SUMMARY` are private (directory 0700, files 0600). Step
+  scripts are mode 0600. Other secrets are still never supplied.
 - A receipt is believed without hashing the tree again in the workspace the
   run's own setup made, and in a unit's copy of it (checked once, when the copy
   is made, before any task wrote in it), so a job that writes next to the

@@ -640,51 +640,36 @@ fn ignored_differences(
         .collect()
 }
 
-/// The first 8 hex digits of a value's SHA-256: enough to tell two values
-/// apart, and no way to read one (it may hold a credential).
-fn fingerprint(value: &str) -> String {
-    let d = sha256_of(value);
-    format!("sha256:{}", &d["sha256:".len()..][..8])
-}
-
-/// One line on the `ignore-env` values a shared install ran with, when another
-/// job that shares it has other ones: which job's which env, with which value.
+/// One line saying which `ignore-env` names have other values in a job that
+/// shares an install, and whose values the install ran with. No value is
+/// printed, not even a fingerprint: a short value can be guessed from one.
 pub(crate) fn ignored_env_note(s: &RecipeStep) -> Option<String> {
     if s.ignored_env_differs.is_empty() {
         return None;
     }
-    let show = |m: &[(String, String)]| {
-        if m.is_empty() {
-            "no ignore-env entry".to_string()
-        } else {
-            m.iter()
-                .map(|(k, v)| format!("{k}={}", fingerprint(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    };
+    let mut names: Vec<&str> = s
+        .ignored_env_differs
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let names = names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let others = s
         .ignored_env_differs
         .iter()
-        .map(|d| {
-            format!(
-                "{} › {}: {}",
-                d.workflow,
-                d.job,
-                match &d.value {
-                    Some(v) => format!("{}={}", d.name, fingerprint(v)),
-                    None => format!("{} unset", d.name),
-                }
-            )
-        })
+        .map(|d| format!("{} › {}", d.workflow, d.job))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>()
-        .join("; ");
+        .join(", ");
     Some(format!(
-        "ignore-env: `{}` was installed with {} (from {} › {}); other jobs that share it have {others}",
-        s.label,
-        show(&s.ignored_env),
-        s.workflow,
-        s.job,
+        "ignore-env: the value of {names} differs between jobs that share `{}` (install ran with the values of {} › {}; others: {others})",
+        s.label, s.workflow, s.job,
     ))
 }
 

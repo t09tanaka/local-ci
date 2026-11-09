@@ -332,9 +332,62 @@ fn strip(cmd: &[String]) -> Option<(bool, &[String])> {
                 }
                 i += 1; // the duration
             }
+            "npx" | "bunx" => i = skip_runner_options(cmd, i + 1),
+            tool @ ("npm" | "pnpm" | "yarn" | "bun") if runner_sub(cmd, i, tool).is_some() => {
+                i = skip_runner_options(cmd, runner_sub(cmd, i, tool).unwrap_or(i + 1));
+            }
             _ => return Some((sudo, &cmd[i..])),
         }
     }
+}
+
+/// For `pnpm dlx x`, `pnpm exec x`, `yarn dlx x`, `yarn exec x`, `npm exec x`
+/// and `bun x x`: the index after the runner subcommand, past options before it
+/// (`pnpm --filter pkg exec x`).
+fn runner_sub(cmd: &[String], i: usize, tool: &str) -> Option<usize> {
+    let subs: &[&str] = match tool {
+        "npm" => &["exec", "x"],
+        "pnpm" | "yarn" => &["dlx", "exec"],
+        "bun" => &["x"],
+        _ => return None,
+    };
+    let mut j = i + 1;
+    loop {
+        let a = cmd.get(j)?.as_str();
+        if a.starts_with('-') {
+            j += if matches!(
+                a,
+                "--filter" | "-F" | "--prefix" | "-C" | "--cwd" | "--dir" | "--workspace" | "-w"
+            ) {
+                2
+            } else {
+                1
+            };
+        } else {
+            return subs.contains(&a).then_some(j + 1);
+        }
+    }
+}
+
+/// Past the options of a package runner (`-y`, `-p pkg`, `--`) to the command.
+fn skip_runner_options(cmd: &[String], mut j: usize) -> usize {
+    while let Some(a) = cmd.get(j).map(String::as_str) {
+        if !a.starts_with('-') {
+            break;
+        }
+        j += if matches!(
+            a,
+            "-p" | "--package" | "--registry" | "--cache" | "--node-options" | "-c"
+        ) {
+            2
+        } else {
+            1
+        };
+        if a == "--" {
+            break;
+        }
+    }
+    j
 }
 
 /// The words of `args` that are not options, skipping the values of the
@@ -572,6 +625,132 @@ fn git_remote(args: &[String]) -> bool {
     !(has_flag(after, &["--dry-run"]) || short_n(after))
 }
 
+const DOCKER_VALUED: &[&str] = &[
+    "--context",
+    "-c",
+    "-H",
+    "--host",
+    "--config",
+    "-l",
+    "--log-level",
+    "-f",
+    "--file",
+    "-p",
+    "--project-name",
+    "--profile",
+    "--env-file",
+    "--project-directory",
+];
+
+fn docker_remote(head: &str, args: &[String]) -> bool {
+    let pos = positionals(args, DOCKER_VALUED);
+    let (first, second) = (
+        pos.first().copied().unwrap_or(""),
+        pos.get(1).copied().unwrap_or(""),
+    );
+    let pushes = has_flag(args, &["--push"])
+        || args
+            .iter()
+            .any(|a| a.contains("type=registry") || a.contains("push=true"));
+    // `docker-compose push` has no `compose` word
+    let (first, second) = if base(head) == "docker-compose" {
+        ("compose", first)
+    } else {
+        (first, second)
+    };
+    match first {
+        "push" | "login" => true,
+        "image" | "manifest" => second == "push",
+        "compose" => second == "push",
+        "buildx" => {
+            matches!(second, "build" | "bake" | "b") && pushes
+                || (second == "imagetools" && pos.get(2).copied() == Some("create"))
+        }
+        "build" | "bake" => pushes,
+        _ => false,
+    }
+}
+
+/// Short options of `curl` that take a value, so the rest of the cluster (or
+/// the next word) is theirs.
+const CURL_SHORT_VALUED: &str = "oHuAebcDEKwxyYzUrCmQ";
+
+fn write_method(m: &str) -> bool {
+    matches!(
+        m.to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    )
+}
+
+fn curl_remote(args: &[String]) -> bool {
+    let get = has_flag(args, &["-G", "--get"]);
+    let mut body = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            match name {
+                "request" => {
+                    let v = inline.or_else(|| args.get(i + 1).map(String::as_str));
+                    if v.is_some_and(write_method) {
+                        return true;
+                    }
+                }
+                "data" | "data-raw" | "data-binary" | "data-urlencode" | "data-ascii" | "form"
+                | "form-string" | "upload-file" | "json" => body = true,
+                _ => {}
+            }
+        } else if a.starts_with('-') && a.len() > 1 {
+            let cluster: Vec<char> = a[1..].chars().collect();
+            let mut k = 0;
+            while k < cluster.len() {
+                match cluster[k] {
+                    'X' => {
+                        let rest: String = cluster[k + 1..].iter().collect();
+                        let v = if rest.is_empty() {
+                            args.get(i + 1).cloned().unwrap_or_default()
+                        } else {
+                            rest
+                        };
+                        if write_method(&v) {
+                            return true;
+                        }
+                        break;
+                    }
+                    'd' | 'F' | 'T' => {
+                        body = true;
+                        break;
+                    }
+                    c if CURL_SHORT_VALUED.contains(c) => break,
+                    _ => {}
+                }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    // `-G` turns `-d` into a query string
+    body && !get
+}
+
+fn wget_remote(args: &[String]) -> bool {
+    has_flag(
+        args,
+        &["--post-data", "--post-file", "--body-data", "--body-file"],
+    ) || args.iter().enumerate().any(|(i, a)| {
+        let v = if a == "--method" {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            a.strip_prefix("--method=")
+        };
+        v.is_some_and(write_method)
+    })
+}
+
 fn is_remote(sudo_less: &[String]) -> bool {
     let Some((head, args)) = sudo_less.split_first() else {
         return false;
@@ -585,23 +764,36 @@ fn is_remote(sudo_less: &[String]) -> bool {
         "gh" => gh_remote(args),
         "aws" => aws_remote(args),
         "kubectl" | "oc" => kubectl_remote(args),
+        // options take values (`--filter pkg`, `--prefix a`, `yarn npm`,
+        // `yarn workspace x`): look for the word anywhere, not at one place
         "npm" | "pnpm" | "yarn" | "bun" => {
-            matches!(first, "publish" | "unpublish" | "deprecate") && !dry
+            args.iter()
+                .any(|a| matches!(a.as_str(), "publish" | "unpublish" | "deprecate"))
+                && !dry
         }
         "cargo" => first == "publish" && !dry,
         "dart" | "flutter" => first == "pub" && second == "publish" && !dry,
         "twine" => first == "upload",
-        "docker" => matches!(first, "push" | "login"),
+        "docker" | "docker-compose" | "podman" | "buildah" => docker_remote(head, args),
+        "curl" => curl_remote(args),
+        "wget" => wget_remote(args),
         "helm" => matches!(first, "install" | "upgrade" | "uninstall" | "rollback") && !dry,
         "terraform" | "tofu" => matches!(first, "apply" | "destroy"),
         "serverless" | "sls" => matches!(first, "deploy" | "remove"),
         "firebase" => first == "deploy",
-        "wrangler" => matches!(first, "deploy" | "publish" | "secret"),
+        "wrangler" => {
+            (matches!(
+                first,
+                "deploy" | "publish" | "secret" | "delete" | "rollback"
+            ) || (first == "pages" && matches!(second, "deploy" | "publish")))
+                && !has_flag(args, &["--dry-run"])
+        }
         "vercel" => {
             if has_flag(args, &["--version", "-v", "--help", "-h"]) {
                 return false;
             }
             first.is_empty()
+                || first.starts_with(['.', '/', '~'])
                 || matches!(
                     first,
                     "deploy" | "promote" | "rollback" | "remove" | "rm" | "alias"
@@ -639,6 +831,166 @@ pub(crate) fn remote_effect(script: &str) -> bool {
     commands(script)
         .iter()
         .any(|c| strip(c).is_some_and(|(_, rest)| is_remote(rest)))
+}
+
+/// Whether a reference to the GitHub token, which becomes `${LOCAL_CI_GITHUB_TOKEN}`
+/// in the script, could end up as that literal text instead of the value: in
+/// single quotes, in `$'...'`, after a backslash, or in the body of a quoted
+/// heredoc, the shell does not expand it. Also true when a part of a mark is
+/// left (an expression such as `substring()` cut one), and when the quoting
+/// cannot be followed to its end. Such a step is not run.
+pub(crate) fn token_may_be_literal(script: &str, mark: &str) -> bool {
+    if script.replace(mark, "").contains(['\u{e000}', '\u{e001}']) {
+        return true;
+    }
+    if !script.contains(mark) {
+        return false;
+    }
+    let chars: Vec<char> = script.chars().collect();
+    let m: Vec<char> = mark.chars().collect();
+    let n = chars.len();
+    let at_mark = |i: usize| chars[i..].starts_with(&m);
+    enum Ctx {
+        Dq,
+        Sub(usize),
+    }
+    let mut stack: Vec<Ctx> = Vec::new();
+    // heredocs whose bodies start on the next line: (delimiter, `<<-`, quoted)
+    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if at_mark(i) {
+            i += m.len();
+            continue;
+        }
+        if matches!(stack.last(), Some(Ctx::Dq)) {
+            match c {
+                '\\' => {
+                    if i + 1 < n && at_mark(i + 1) {
+                        return true;
+                    }
+                    i += 2;
+                }
+                '"' => {
+                    stack.pop();
+                    i += 1;
+                }
+                '$' if chars.get(i + 1) == Some(&'(') => {
+                    stack.push(Ctx::Sub(1));
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        let ansi = c == '$' && chars.get(i + 1) == Some(&'\'');
+        match c {
+            '\\' => {
+                if i + 1 < n && at_mark(i + 1) {
+                    return true;
+                }
+                i += 2;
+            }
+            '\'' | '$' if c == '\'' || ansi => {
+                let mut j = if ansi { i + 2 } else { i + 1 };
+                loop {
+                    if j >= n {
+                        return true;
+                    }
+                    if at_mark(j) {
+                        return true;
+                    }
+                    if ansi && chars[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == '\'' {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+            }
+            '"' => {
+                stack.push(Ctx::Dq);
+                i += 1;
+            }
+            '#' if i == 0 || chars[i - 1].is_whitespace() || ";&|(".contains(chars[i - 1]) => {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '(' => {
+                if let Some(Ctx::Sub(d)) = stack.last_mut() {
+                    *d += 1;
+                }
+                i += 1;
+            }
+            ')' => {
+                if let Some(Ctx::Sub(d)) = stack.last_mut() {
+                    *d -= 1;
+                    if *d == 0 {
+                        stack.pop();
+                    }
+                }
+                i += 1;
+            }
+            '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                let mut j = i + 2;
+                let strip_tabs = chars.get(j) == Some(&'-');
+                if strip_tabs {
+                    j += 1;
+                }
+                while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    j += 1;
+                }
+                let (mut delim, mut quoted) = (String::new(), false);
+                while let Some(&d) = chars.get(j) {
+                    if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')') {
+                        break;
+                    }
+                    if matches!(d, '\'' | '"' | '\\') {
+                        quoted = true;
+                    } else {
+                        delim.push(d);
+                    }
+                    j += 1;
+                }
+                if !delim.is_empty() {
+                    heredocs.push((delim, strip_tabs, quoted));
+                }
+                i = j;
+            }
+            '\n' => {
+                i += 1;
+                for (delim, strip_tabs, quoted) in std::mem::take(&mut heredocs) {
+                    while i < n {
+                        let end = chars[i..]
+                            .iter()
+                            .position(|&c| c == '\n')
+                            .map_or(n, |p| i + p);
+                        let line: String = chars[i..end].iter().collect();
+                        i = (end + 1).min(n);
+                        if quoted && line.contains(mark) {
+                            return true;
+                        }
+                        let t = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line.as_str()
+                        };
+                        if t.trim_end() == delim {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // a quote that never closes: the reading above cannot be trusted
+    !stack.is_empty()
 }
 
 /// What a script wants of the system's packages.
@@ -807,6 +1159,31 @@ mod tests {
             "command -v kubectl",
             "FOO=1 echo vercel",
             "git status && git log -1",
+            "git push -n",
+            "aws s3 ls",
+            "curl https://example.test",
+            "curl -I https://example.test",
+            "curl -sSL -o out.tgz https://example.test/x.tgz",
+            "curl -G -d q=1 https://example.test",
+            "curl -X GET https://example.test",
+            "wget https://example.test/x",
+            "wget -q -O - https://example.test",
+            "npx --yes prettier --check .",
+            "pnpm exec eslint .",
+            "pnpm dlx create-thing",
+            "yarn dlx tsc",
+            "npm exec -- tsc -p .",
+            "npm --prefix a run build",
+            "pnpm --filter pkg test",
+            "yarn workspace x build",
+            "docker build -t x .",
+            "docker image ls",
+            "docker compose up -d",
+            "docker buildx build -t x .",
+            "wrangler deploy --dry-run",
+            "vercel pull --yes",
+            "vercel ls",
+            "npx publish-check",
         ] {
             assert!(!remote_effect(s), "{s:?}");
         }
@@ -847,6 +1224,50 @@ mod tests {
             "cargo publish",
             "docker push img:1",
             "true | gh pr merge 1",
+            "npx wrangler deploy",
+            "npx --yes vercel --prod",
+            "bunx netlify deploy --prod",
+            "pnpm dlx wrangler pages deploy dist",
+            "pnpm exec npm publish",
+            "yarn dlx vercel deploy",
+            "yarn exec -- npm publish",
+            "npm exec -y -- wrangler deploy",
+            "npm exec --package=x -- git push",
+            "yarn npm publish",
+            "yarn workspace x publish",
+            "pnpm --filter pkg publish",
+            "pnpm -r publish --no-git-checks",
+            "npm --prefix a publish",
+            "bun publish",
+            "docker image push img:1",
+            "docker buildx build --push -t x .",
+            "docker buildx bake --push",
+            "docker compose push",
+            "docker compose -f ci.yml push",
+            "docker-compose push",
+            "docker manifest push img:1",
+            "docker buildx imagetools create -t a b",
+            "wrangler deploy",
+            "wrangler pages deploy dist",
+            "vercel",
+            "vercel ./app",
+            "netlify deploy",
+            "curl -X POST https://example.test",
+            "curl -XPUT https://example.test",
+            "curl --request DELETE https://example.test",
+            "curl --request=patch https://example.test",
+            "curl -d a=b https://example.test",
+            "curl --data-binary @f https://example.test",
+            "curl -sSd a=b https://example.test",
+            "curl -F f=@x https://example.test",
+            "curl --form f=@x https://example.test",
+            "curl -T f https://example.test/f",
+            "curl --upload-file f https://example.test/f",
+            "curl --json '{}' https://example.test",
+            "wget --post-data=a=b https://example.test",
+            "wget --post-file f https://example.test",
+            "wget --method=PUT https://example.test",
+            "wget --method DELETE https://example.test",
         ] {
             assert!(remote_effect(s), "{s:?}");
         }
@@ -921,5 +1342,62 @@ mod tests {
         assert!(remote_effect(s));
         let s = "cat > f <<EOF\ngit push\naws s3 rm x\nEOF\n";
         assert!(!remote_effect(s));
+    }
+
+    const M: &str = "\u{e000}local-ci-github-token\u{e001}";
+
+    fn with_mark(t: &str) -> String {
+        t.replace("@T@", M)
+    }
+
+    #[test]
+    fn a_token_that_would_stay_literal_is_found() {
+        for t in [
+            "cat <<'EOF2'\n@T@\nEOF2\n",
+            "cat <<\"EOF\"\nx @T@\nEOF\n",
+            "cat <<\\EOF\n@T@\nEOF\n",
+            "cat <<-'EOF'\n\t@T@\n\tEOF\n",
+            "curl -H 'Authorization: token @T@' https://x.test",
+            "jq -n '{t: \"@T@\"}'",
+            "python -c 'print(\"@T@\")'",
+            "node -e 'console.log(\"@T@\")'",
+            "echo $'a @T@'",
+            "echo \\@T@",
+            "echo \"\\@T@\"",
+            "echo \"x $(echo '@T@')\"",
+            // an unterminated quote cannot be followed
+            "echo \"@T@",
+            "echo '@T@",
+            // a part of a mark, as `substring()` leaves it
+            "echo \u{e000}local-ci-github",
+            "echo @T@ \u{e001}",
+        ] {
+            assert!(token_may_be_literal(&with_mark(t), M), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_the_shell_expands_is_not() {
+        for t in [
+            "echo @T@",
+            "echo \"token @T@\"",
+            "curl -H \"Authorization: token @T@\" https://x.test",
+            "git clone https://x:@T@@host/r.git",
+            "cat <<EOF\nx @T@\nEOF\n",
+            "cat <<EOF2\n@T@\nEOF2\necho @T@",
+            // the quotes close before the token
+            "echo 'a' @T@ 'b'",
+            "echo 'it' \"@T@\"",
+            "cat <<'EOF'\nplain\nEOF\necho @T@",
+            "# don't @T@\necho @T@",
+            "echo \"$(echo @T@)\"",
+            "echo \"a 'b' @T@\"",
+            "export T=@T@",
+            "echo ${X:-@T@}",
+        ] {
+            assert!(!token_may_be_literal(&with_mark(t), M), "{t:?}");
+        }
+        // no mark at all
+        assert!(!token_may_be_literal("echo 'a'", M));
     }
 }
