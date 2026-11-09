@@ -1,9 +1,10 @@
 //! Workflow files, read into plain structs. Only the parts local-ci acts on.
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value as Y;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Trigger {
     pub event: String,
     pub branches: Vec<String>,
@@ -15,7 +16,7 @@ pub struct Trigger {
     pub types: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Workflow {
     pub file: String,
     pub name: String,
@@ -26,7 +27,7 @@ pub struct Workflow {
     pub jobs: Vec<Job>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
     pub name: Option<String>,
@@ -49,7 +50,7 @@ pub struct Job {
     pub outputs: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Service {
     pub id: String,
     pub image: String,
@@ -59,7 +60,7 @@ pub struct Service {
     pub options: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Step {
     pub id: Option<String>,
     pub name: Option<String>,

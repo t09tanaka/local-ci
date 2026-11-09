@@ -562,7 +562,7 @@ jobs:
         assert_eq!(hit.cached.as_deref(), Some("aaaaaaa, 2h ago"));
         // what was not covered is still reported
         assert_eq!(
-            crate::report::not_covered(&[hit]),
+            crate::report::not_covered(&[hit], ".github/workflows"),
             vec!["ci.yml › test › deploy: uses secrets"]
         );
         assert!(store.get("f2", "ci.yml", 100 + TTL_SECS + 1).is_none());

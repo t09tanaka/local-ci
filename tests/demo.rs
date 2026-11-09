@@ -1,5 +1,7 @@
 //! End-to-end runs against `examples/demo`, copied into a fresh git repository.
 
+#![allow(clippy::disallowed_methods)] // the tests build the binary's environment
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

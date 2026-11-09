@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Library: planning and executing are separate. `build_frozen_plan` returns a
+  `FrozenPlan` (serde, schema version and sha256 digest, no host paths) and
+  `execute_plan` runs it in a given `Workspace`; `run` composes them with the
+  results cache, the worktree and the saved result. The process environment is
+  read only by the binary: the library takes an `ExecContext` (env map, cancel
+  handle). Process and container tracking for cancelling moved from
+  process-global statics into the context's `CancelHandle`, so concurrent runs
+  do not stop each other. No change to the command line.
+
 ## 0.7.0
 
 - Each job that ran has a `time` in `result.json` and `--json`: how long its

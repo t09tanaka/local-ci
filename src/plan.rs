@@ -15,16 +15,17 @@
 use crate::filter::{decide, Decision, Event};
 use crate::workflow::{Job, Step, Workflow};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Selected {
     pub wf: Workflow,
     pub event: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Unit {
     pub wf: usize,
     /// Job ids in dependency order.
@@ -32,14 +33,14 @@ pub struct Unit {
     pub exclusive: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StepKey {
     pub wd: String,
     pub run: String,
     pub env: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SetupStep {
     pub key: StepKey,
     pub label: String,

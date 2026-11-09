@@ -1,9 +1,10 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
+use crate::context::ExecContext;
 use crate::expr::{self, Ctx, Status};
+use crate::frozen::FrozenPlan;
 use crate::matrix;
-use crate::plan::{self, Plan, Unit};
-use crate::run::Repo;
+use crate::plan::{self, Unit};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -18,38 +19,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Process-global cancellation and child tracking; to be replaced by per-attempt
-/// ownership. Kept out of the public API on purpose: use `local_ci::cancel`.
-pub(crate) static CANCEL: AtomicBool = AtomicBool::new(false);
-static PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-static CONTAINERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static COMPOSE_PROJECTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Stop everything that is running (Ctrl-C).
-pub(crate) fn kill_all() {
-    CANCEL.store(true, Ordering::SeqCst);
-    for &pg in PGIDS.lock().unwrap().iter() {
-        unsafe {
-            libc::killpg(pg, libc::SIGTERM);
-        }
-    }
-}
-
-pub(crate) fn remove_containers() {
-    let projects: Vec<String> = COMPOSE_PROJECTS.lock().unwrap().drain(..).collect();
-    compose_down(&projects);
-    let names: Vec<String> = CONTAINERS.lock().unwrap().drain(..).collect();
-    if !names.is_empty() {
-        let _ = Command::new("docker")
-            .arg("rm")
-            .arg("-f")
-            .args(&names)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
 
 /// Remove the service containers of `local-ci` runs that are gone: a run
 /// killed before it cleaned up left its database behind on the service's
@@ -216,9 +185,27 @@ pub struct Opts {
     pub trash: PathBuf,
 }
 
+/// Where one attempt runs: the host paths the plan is materialized at. The
+/// plan itself holds no path of the host.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    /// The checkout of the planned commit the jobs run in.
+    pub root: PathBuf,
+    /// The repository that checkout belongs to; copies for parallel units are
+    /// made from it.
+    pub repo_root: PathBuf,
+    /// Where logs go.
+    pub run_dir: PathBuf,
+    /// The attempt's own tool directory (shims, scripts, installed tools).
+    pub tools: PathBuf,
+    /// Held while exclusive units run.
+    pub lock_file: PathBuf,
+}
+
 pub struct Runner<'a> {
-    pub repo: &'a Repo,
-    pub plan: &'a Plan,
+    pub ctx: &'a ExecContext,
+    pub fp: &'a FrozenPlan,
+    pub repo_root: PathBuf,
     pub wt: PathBuf,
     pub run_dir: PathBuf,
     pub tools: PathBuf,
@@ -479,7 +466,7 @@ fn compose_globals(args: &str) -> &str {
 }
 
 /// `docker compose -p <name> down` for each project that still has containers.
-fn compose_down(projects: &[String]) {
+pub(crate) fn compose_down(projects: &[String]) {
     for p in projects {
         let label = format!("label=com.docker.compose.project={p}");
         let has = Command::new("docker")
@@ -756,26 +743,17 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 }
 
 impl<'a> Runner<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        repo: &'a Repo,
-        plan: &'a Plan,
-        wt: PathBuf,
-        run_dir: PathBuf,
-        tools: PathBuf,
-        lock_file: PathBuf,
-        slug: String,
-        opts: Opts,
-    ) -> Self {
-        let base_path = std::env::var("PATH").unwrap_or_default();
+    pub fn new(ctx: &'a ExecContext, fp: &'a FrozenPlan, ws: &Workspace, opts: Opts) -> Self {
+        let base_path = ctx.var("PATH").unwrap_or_default().to_string();
         Runner {
-            repo,
-            plan,
-            wt,
-            run_dir,
-            tools,
-            lock_file,
-            slug,
+            ctx,
+            fp,
+            repo_root: ws.repo_root.clone(),
+            wt: ws.root.clone(),
+            run_dir: ws.run_dir.clone(),
+            tools: ws.tools.clone(),
+            lock_file: ws.lock_file.clone(),
+            slug: fp.repository.clone().unwrap_or_default(),
             opts,
             base_path,
             seq: AtomicUsize::new(0),
@@ -784,13 +762,13 @@ impl<'a> Runner<'a> {
     }
 
     fn github_ctx(&self, ws: &Path, w: &Workflow, event: &str, job: &str) -> Value {
-        let base = crate::git::branch_name(&self.repo.base);
-        let head = self.repo.head.clone().unwrap_or_default();
+        let base = crate::git::branch_name(&self.fp.source.base);
+        let head = self.fp.branch.clone().unwrap_or_default();
         let pr = event == "pull_request";
         json!({
             "event_name": event,
-            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.repo.sha}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
-            "sha": self.repo.sha,
+            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.fp.source.sha}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
+            "sha": self.fp.source.sha,
             "ref": if pr { "refs/pull/0/merge".to_string() } else { format!("refs/heads/{head}") },
             "ref_name": if pr { "0/merge".to_string() } else { head.clone() },
             "head_ref": if pr { head.clone() } else { String::new() },
@@ -845,7 +823,7 @@ impl<'a> Runner<'a> {
                 self.marks(Path::new(&ws)).to_string_lossy().into_owned(),
             ),
             ("GITHUB_WORKSPACE".into(), ws),
-            ("GITHUB_SHA".into(), self.repo.sha.clone()),
+            ("GITHUB_SHA".into(), self.fp.source.sha.clone()),
             ("GITHUB_REF".into(), s("ref")),
             ("GITHUB_REF_NAME".into(), s("ref_name")),
             ("GITHUB_HEAD_REF".into(), s("head_ref")),
@@ -1004,6 +982,7 @@ impl<'a> Runner<'a> {
             .stdout(out)
             .stderr(err)
             .process_group(0);
+        cmd.env_clear().envs(self.ctx.env());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1012,7 +991,7 @@ impl<'a> Runner<'a> {
             .with_context(|| format!("cannot start {}", argv[0]))?;
         let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
-        PGIDS.lock().unwrap().push(pid);
+        self.ctx.cancel.track_pgid(pid);
         // With canirun the clock starts when the command gets its turn, not while it waits.
         let mut started: Option<Instant> = if self.opts.canirun.is_some() {
             None
@@ -1047,7 +1026,7 @@ impl<'a> Runner<'a> {
                 }
             }
             let over = matches!((timeout, started), (Some(t), Some(s)) if s.elapsed() > t);
-            if (over || CANCEL.load(Ordering::SeqCst)) && term_at.is_none() {
+            if (over || self.ctx.cancel.is_cancelled()) && term_at.is_none() {
                 timed_out = over;
                 unsafe {
                     libc::killpg(pid, libc::SIGTERM);
@@ -1061,7 +1040,7 @@ impl<'a> Runner<'a> {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        PGIDS.lock().unwrap().retain(|&p| p != pid);
+        self.ctx.cancel.untrack_pgid(pid);
         let _ = fs::remove_file(&file);
         // Waiting for its turn: until the script touched `turn`, or the first
         // line of output that is not canirun's own, or, when neither came
@@ -1086,7 +1065,7 @@ impl<'a> Runner<'a> {
         if timed_out {
             return Ok((Exit::Timeout, waited));
         }
-        if CANCEL.load(Ordering::SeqCst) {
+        if self.ctx.cancel.is_cancelled() {
             return Ok((Exit::Cancelled, waited));
         }
         Ok((
@@ -1101,7 +1080,7 @@ impl<'a> Runner<'a> {
         let dir = self.run_dir.join(format!(
             "{}-{}",
             slug_of(
-                crate::report::short(wf)
+                crate::report::short(&self.fp.config.default_workflows_dir, wf)
                     .trim_end_matches(".yml")
                     .trim_end_matches(".yaml")
             ),
@@ -1134,7 +1113,7 @@ impl<'a> Runner<'a> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
         }
-        let wants_pip = self.plan.selected.iter().any(|s| {
+        let wants_pip = self.fp.workflows.iter().any(|s| {
             s.wf.jobs.iter().any(|j| {
                 j.steps.iter().any(|st| {
                     st.run
@@ -1164,12 +1143,12 @@ impl<'a> Runner<'a> {
 
     pub fn run_setup(&self) -> Vec<StepResult> {
         let mut out = Vec::new();
-        for (i, s) in self.plan.setup.iter().enumerate() {
+        for (i, s) in self.fp.setup.iter().enumerate() {
             if !s.execute {
                 continue;
             }
-            let sel = &self.plan.selected[s.wf];
-            let job = self.plan.job(s.wf, &s.job);
+            let sel = &self.fp.workflows[s.wf];
+            let job = self.fp.job(s.wf, &s.job);
             let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &job.id);
             let mut env = self.base_env(&gh, &[]);
             for (k, v) in sel
@@ -1231,9 +1210,9 @@ impl<'a> Runner<'a> {
             cv: Condvar::new(),
         };
         let results: Mutex<Vec<(usize, UnitResult)>> = Mutex::new(Vec::new());
-        let isolate = self.plan.units.len() > 1;
+        let isolate = self.fp.units.len() > 1;
         std::thread::scope(|scope| {
-            for (i, u) in self.plan.units.iter().enumerate() {
+            for (i, u) in self.fp.units.iter().enumerate() {
                 let sem = &sem;
                 let results = &results;
                 scope.spawn(move || {
@@ -1249,7 +1228,7 @@ impl<'a> Runner<'a> {
                         lock: locked_at,
                         parallel: t0.elapsed().as_secs_f64() - locked_at,
                     };
-                    let r = if isolate && !CANCEL.load(Ordering::SeqCst) {
+                    let r = if isolate && !self.ctx.cancel.is_cancelled() {
                         self.run_unit_in_copy(i + 1, u, waited)
                     } else {
                         self.run_unit(u, waited, &self.wt)
@@ -1292,7 +1271,7 @@ impl<'a> Runner<'a> {
             && (!self.isolated()
                 || u.jobs
                     .iter()
-                    .any(|id| !self.plan.job(u.wf, id).services.is_empty()))
+                    .any(|id| !self.fp.job(u.wf, id).services.is_empty()))
     }
 
     /// One of the `--containers` slots, shared by every `local-ci` run on the
@@ -1313,7 +1292,7 @@ impl<'a> Runner<'a> {
                     return Ok(Some(f));
                 }
             }
-            if CANCEL.load(Ordering::SeqCst) {
+            if self.ctx.cancel.is_cancelled() {
                 return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -1348,11 +1327,11 @@ impl<'a> Runner<'a> {
     /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
     fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
         crate::git::clone_worktree(
-            &self.repo.root,
+            &self.repo_root,
             from,
             to,
-            &self.repo.sha,
-            self.repo.link_node_modules,
+            &self.fp.source.sha,
+            self.fp.config.link_node_modules,
         )?;
         let marks = self.marks(to);
         fs::create_dir_all(&marks)?;
@@ -1371,7 +1350,7 @@ impl<'a> Runner<'a> {
     fn remove_copy(&self, ws: &Path) {
         if !self.opts.keep {
             self.release_ports(ws);
-            crate::git::remove_worktree(&self.repo.root, ws, &self.opts.trash);
+            crate::git::remove_worktree(&self.repo_root, ws, &self.opts.trash);
         }
     }
 
@@ -1382,7 +1361,7 @@ impl<'a> Runner<'a> {
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
-            &self.repo.sha[..7],
+            &self.fp.source.sha[..7],
             std::process::id()
         ));
         let t0 = Instant::now();
@@ -1396,7 +1375,7 @@ impl<'a> Runner<'a> {
                 }
             }
             Err(e) => {
-                let w = &self.plan.selected[u.wf].wf;
+                let w = &self.fp.workflows[u.wf].wf;
                 let reason = format!("cannot copy the worktree: {e:#}");
                 let mut jobs: Vec<JobResult> = u
                     .jobs
@@ -1404,7 +1383,7 @@ impl<'a> Runner<'a> {
                     .map(|id| JobResult {
                         workflow: w.file.clone(),
                         job: id.clone(),
-                        display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
+                        display: self.fp.job(u.wf, id).name.clone().unwrap_or(id.clone()),
                         outcome: Outcome::Error(reason.clone()),
                         secs: 0.0,
                         steps: vec![],
@@ -1439,13 +1418,13 @@ impl<'a> Runner<'a> {
     }
 
     fn run_unit(&self, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
-        let sel = &self.plan.selected[u.wf];
+        let sel = &self.fp.workflows[u.wf];
         let w = &sel.wf;
         let mut needs_ctx = Map::new();
         let mut jobs = Vec::new();
         let locked = self.unit_locked(u);
         for id in &u.jobs {
-            let job = self.plan.job(u.wf, id);
+            let job = self.fp.job(u.wf, id);
             let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked);
             let failed = job_results
                 .iter()
@@ -1636,7 +1615,7 @@ impl<'a> Runner<'a> {
                 None
             };
             let wait_slot = t_slot.elapsed().as_secs_f64();
-            if CANCEL.load(Ordering::SeqCst) {
+            if self.ctx.cancel.is_cancelled() {
                 return skip(display, "cancelled".into());
             }
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
@@ -1675,7 +1654,7 @@ impl<'a> Runner<'a> {
                         // the pid stays last in the name: cleanup scripts read it from there
                         let copy = self.wt.with_file_name(format!(
                             "{}-c{}-{}",
-                            &self.repo.sha[..7],
+                            &self.fp.source.sha[..7],
                             self.seq.fetch_add(1, Ordering::SeqCst),
                             std::process::id()
                         ));
@@ -1834,10 +1813,7 @@ impl<'a> Runner<'a> {
         );
         let tag = format!("lc{}", &compose_default["local-ci-".len()..]);
         let mut projects = vec![compose_default.clone()];
-        COMPOSE_PROJECTS
-            .lock()
-            .unwrap()
-            .push(compose_default.clone());
+        self.ctx.cancel.track_compose(compose_default.clone());
         let mut errored: Option<String> = None;
         // canirun's queue, summed over the steps
         let mut queue = Duration::ZERO;
@@ -1868,7 +1844,7 @@ impl<'a> Runner<'a> {
                 });
             };
             stopped |= stop.is_some_and(|s| s.load(Ordering::SeqCst));
-            let status = if CANCEL.load(Ordering::SeqCst) || stopped {
+            let status = if self.ctx.cancel.is_cancelled() || stopped {
                 Status::Cancelled
             } else if failed || errored.is_some() {
                 Status::Failure
@@ -1938,7 +1914,7 @@ impl<'a> Runner<'a> {
                 continue;
             };
             if let Some(k) = plan::step_key(w, job, s) {
-                if self.plan.is_setup(&k) {
+                if self.fp.is_setup(&k) {
                     push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
                     record(&mut steps_ctx, &s.id, "success", "success", Map::new());
                     continue;
@@ -2070,7 +2046,7 @@ impl<'a> Runner<'a> {
                 .filter(|p| !p.is_empty());
             for p in compose_projects(&script).into_iter().chain(from_env) {
                 if !projects.contains(&p) {
-                    COMPOSE_PROJECTS.lock().unwrap().push(p.clone());
+                    self.ctx.cancel.track_compose(p.clone());
                     projects.push(p);
                 }
             }
@@ -2086,7 +2062,7 @@ impl<'a> Runner<'a> {
                 .unwrap_or(remaining);
             let key = format!(
                 "local-ci {} {} {}",
-                crate::report::short(&w.file),
+                crate::report::short(&self.fp.config.default_workflows_dir, &w.file),
                 job.id,
                 label
             );
@@ -2193,10 +2169,7 @@ impl<'a> Runner<'a> {
         }
         self.stop_services(&names);
         compose_down(&projects);
-        COMPOSE_PROJECTS
-            .lock()
-            .unwrap()
-            .retain(|p| !projects.contains(p));
+        self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
         let mut outputs = Map::new();
@@ -2324,7 +2297,7 @@ impl<'a> Runner<'a> {
         .clone()
     }
 
-    fn docker(args: &[&str], timeout: Duration) -> Result<String> {
+    fn docker(&self, args: &[&str], timeout: Duration) -> Result<String> {
         let mut child = Command::new("docker")
             .args(args)
             .stdin(Stdio::null())
@@ -2336,7 +2309,7 @@ impl<'a> Runner<'a> {
             if child.try_wait()?.is_some() {
                 break;
             }
-            if t0.elapsed() > timeout || CANCEL.load(Ordering::SeqCst) {
+            if t0.elapsed() > timeout || self.ctx.cancel.is_cancelled() {
                 let _ = child.kill();
                 bail!(
                     "docker {} did not finish in {}s",
@@ -2370,8 +2343,11 @@ impl<'a> Runner<'a> {
         let mut sctx = Map::new();
         for svc in &job.services {
             let image = expr::interpolate(&svc.image, &ctx)?;
-            if Self::docker(&["image", "inspect", &image], Duration::from_secs(30)).is_err() {
-                Self::docker(&["pull", "--quiet", &image], Duration::from_secs(600))
+            if self
+                .docker(&["image", "inspect", &image], Duration::from_secs(30))
+                .is_err()
+            {
+                self.docker(&["pull", "--quiet", &image], Duration::from_secs(600))
                     .with_context(|| format!("pull {image}"))?;
             }
             let name = format!(
@@ -2405,12 +2381,12 @@ impl<'a> Runner<'a> {
             );
             args.push(image.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            Self::docker(&refs, Duration::from_secs(120))?;
-            CONTAINERS.lock().unwrap().push(name.clone());
+            self.docker(&refs, Duration::from_secs(120))?;
+            self.ctx.cancel.track_container(name.clone());
             names.push(name.clone());
             let mut ports = Map::new();
             for (d, c) in &svc.ports {
-                let line = Self::docker(
+                let line = self.docker(
                     &["port", &name, &format!("{c}/tcp")],
                     Duration::from_secs(30),
                 )?;
@@ -2441,10 +2417,10 @@ impl<'a> Runner<'a> {
         let t0 = Instant::now();
         let limit = Duration::from_secs(180);
         loop {
-            if CANCEL.load(Ordering::SeqCst) {
+            if self.ctx.cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            let state = Self::docker(&["inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], Duration::from_secs(30))?;
+            let state = self.docker(&["inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], Duration::from_secs(30))?;
             let mut parts = state.split_whitespace();
             let (run, health) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             if run == "exited" || run == "dead" {
@@ -2501,7 +2477,7 @@ impl<'a> Runner<'a> {
             .stderr(Stdio::null())
             .status();
         let set: HashSet<&String> = names.iter().collect();
-        CONTAINERS.lock().unwrap().retain(|n| !set.contains(n));
+        self.ctx.cancel.untrack_containers(&set);
     }
 }
 

@@ -1,0 +1,8 @@
+# The library takes its environment from an ExecContext; only the command-line
+# adapter (src/main.rs, which allows these) may read the process environment.
+disallowed-methods = [
+    { path = "std::env::var", reason = "read the environment from the ExecContext" },
+    { path = "std::env::var_os", reason = "read the environment from the ExecContext" },
+    { path = "std::env::vars", reason = "read the environment from the ExecContext" },
+    { path = "std::env::vars_os", reason = "read the environment from the ExecContext" },
+]
