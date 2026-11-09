@@ -35,8 +35,12 @@ pub fn materialize_source(ctx: &ExecContext, m: &SourceManifest, dest: &Path) ->
 pub fn materialize_from(store: &ObjectStore, m: &SourceManifest, dest: &Path) -> Result<()> {
     check_digest_of(m)?;
     match std::fs::read_dir(dest) {
-        Ok(mut it) => {
-            if it.next().is_some() {
+        Ok(it) => {
+            // a worktree made with `--no-checkout` holds its `.git` file
+            let others = it
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().as_bytes() != b".git");
+            if others {
                 bail!("{} is not empty", dest.display());
             }
         }
@@ -119,6 +123,9 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
         };
         for ent in std::fs::read_dir(&here)? {
             let name = ent?.file_name();
+            if rel.is_empty() && name.as_bytes() == b".git" {
+                continue; // the worktree's own link to its repository
+            }
             let mut b = rel.0.clone();
             if !b.is_empty() {
                 b.push(b'/');
@@ -161,6 +168,33 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
     walk(dest, &RelPath(vec![]), skip, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// A worktree of `repo` at the execution commit of `m` whose files are the
+/// captured bytes.
+///
+/// The commit holds Git's canonical content (what `HEAD` would hold), not the
+/// bytes that were captured: a checkout would convert line endings and run
+/// smudge filters over them a second time. So the worktree is made without a
+/// checkout, the manifest's bytes are written, and the index is read from the
+/// commit; Git then sees the same content as clean that the capture saw.
+pub fn add_worktree(
+    ctx: &ExecContext,
+    store: &ObjectStore,
+    repo: &Path,
+    path: &Path,
+    m: &SourceManifest,
+) -> Result<()> {
+    let Some(commit) = &m.execution_commit else {
+        bail!("{} has no execution commit", m.source_id);
+    };
+    crate::git::add_worktree_no_checkout(ctx, repo, path, commit)?;
+    materialize_from(store, m, path)?;
+    crate::git::git(ctx, path, &["read-tree", "HEAD"])?;
+    // stat data for the index, so `git status` does not hash every file; a
+    // filter that cannot run here only makes it do so
+    let _ = crate::git::git(ctx, path, &["update-index", "-q", "--refresh"]);
+    Ok(())
 }
 
 /// Put the secret files in `dest`, 0600, after checking each against the HMAC

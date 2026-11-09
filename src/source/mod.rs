@@ -5,8 +5,8 @@
 //! private, content-addressed store and describes it in a
 //! [`SourceManifest`]. The original worktree, its index, branches, refs and
 //! stash are never written: objects the capture needs go to a private bare
-//! repository under the store, which borrows the original's objects through
-//! `objects/info/alternates`.
+//! repository under the store, which holds its own copy of the history it
+//! needs and the blobs Git itself would make of the captured files.
 //!
 //! From the manifest a workspace can be rebuilt ([`materialize_source`]) on
 //! this host or, through a `git bundle` ([`export_objects`] /
@@ -24,7 +24,9 @@ mod transfer;
 
 pub use capture::{capture_directory, capture_source, seal_manifest};
 pub use gate::{publishable, SourceInfo};
-pub use materialize::{default_store, materialize_from, materialize_secrets, materialize_source};
+pub use materialize::{
+    add_worktree, default_store, materialize_from, materialize_secrets, materialize_source,
+};
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
 pub use store::{ObjectStore, RelPath};
 pub use transfer::{export_from, export_objects, import_objects};
@@ -37,6 +39,10 @@ use std::sync::Arc;
 
 /// Bumped when the shape of a [`SourceManifest`] changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// A `secret_files` capture needs a key of at least this many bytes: an empty
+/// or short key makes the recorded HMACs a guessable fingerprint of the file.
+pub const MIN_SECRET_KEY: usize = 16;
 
 /// Captures are retried this many times in all before `SOURCE_BUSY`.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -248,6 +254,8 @@ pub enum SourceError {
     Unmerged { path: String },
     /// The content in the store does not match its manifest.
     Corrupt { what: String },
+    /// `secret_files` is declared with a key that is empty or too short.
+    SecretKeyTooShort { len: usize },
 }
 
 impl fmt::Display for SourceError {
@@ -276,6 +284,10 @@ impl fmt::Display for SourceError {
                 write!(f, "{path}: unmerged; resolve the merge before capturing")
             }
             SourceError::Corrupt { what } => write!(f, "source store: {what}"),
+            SourceError::SecretKeyTooShort { len } => write!(
+                f,
+                "secret_files needs a secret key of at least {MIN_SECRET_KEY} bytes (got {len})"
+            ),
         }
     }
 }

@@ -598,7 +598,17 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         let wt = cache.join("wt").join(&name);
         let tools = cache.join("wt").join(format!("{name}.tools"));
         std::fs::create_dir_all(cache.join("wt"))?;
-        git::add_worktree(ctx, &root, &wt, sha)?;
+        match &a.source {
+            // the captured bytes, not a checkout of the commit
+            Some(m) => source::add_worktree(
+                ctx,
+                &source::ObjectStore::open(cache.join("sources"))?,
+                &root,
+                &wt,
+                m,
+            )?,
+            None => git::add_worktree(ctx, &root, &wt, sha)?,
+        }
         obs.executing();
         exec::remove_orphan_containers(ctx);
         let canirun = if a.no_canirun {
@@ -749,5 +759,5 @@ pub fn status(
         }
     }
     post_status(ctx, &root, &want, &saved.state, &saved.description)?;
-    Ok((saved.state.clone(), saved.sha[..7].to_string()))
+    Ok((saved.state.clone(), want[..7].to_string()))
 }

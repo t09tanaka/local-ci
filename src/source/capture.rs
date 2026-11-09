@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,8 +27,24 @@ pub(crate) fn git_run(
     envs: &[(&str, &OsStr)],
     stdin: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
+    let mut all: Vec<OsString> = pre.to_vec();
+    all.extend(args.iter().map(OsString::from));
+    git_run_os(ctx, None, &all, envs, stdin)
+}
+
+/// [`git_run`] with arguments that are bytes (paths) and a working directory.
+pub(crate) fn git_run_os(
+    ctx: &ExecContext,
+    cwd: Option<&Path>,
+    args: &[OsString],
+    envs: &[(&str, &OsStr)],
+    stdin: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let mut c = ctx.command("git");
-    c.args(pre).args(args);
+    c.args(args);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
     for (k, v) in envs {
         c.env(k, v);
     }
@@ -51,9 +67,19 @@ pub(crate) fn git_run(
         let _ = w.join();
     }
     if !out.status.success() {
+        // `-c key=value` pairs (a filter's command line) are not worth repeating
+        let mut shown: Vec<String> = vec![];
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == "-c" {
+                it.next();
+            } else {
+                shown.push(a.to_string_lossy().into_owned());
+            }
+        }
         bail!(
             "git {}: {}",
-            args.join(" "),
+            shown.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -177,6 +203,9 @@ struct Meta {
 struct Selection {
     meta: Meta,
     index_bytes: Vec<u8>,
+    /// Tracked files a `secret_files` glob matches: they are commit content,
+    /// so they are taken as such (declaration index, path).
+    tracked_secrets: Vec<(usize, RelPath)>,
 }
 
 impl Meta {
@@ -312,17 +341,23 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
         find_special(root, &RelPath(vec![]), &skip_dirs, o)?;
     }
 
-    // secrets: any file the declaration matches, tracked or not, ignored or not
+    // secrets: an untracked file the declaration matches, ignored or not. A
+    // tracked one is part of the commit and cannot be kept apart from it.
     let mut secret = vec![];
     let mut secret_paths = BTreeSet::new();
+    let mut tracked_secrets = vec![];
     if !o.secrets.is_empty() {
-        let all = tracked
+        for p in tracked
             .iter()
             .filter(|t| t.0 != 0o160000)
             .map(|t| &t.2)
-            .chain(untracked.iter())
-            .chain(ignored.iter());
-        for p in all {
+            .filter(|p| !o.exclude.matches(p))
+        {
+            if let Some(i) = o.secrets.iter().position(|g| g.matches(p)) {
+                tracked_secrets.push((i, p.clone()));
+            }
+        }
+        for p in untracked.iter().chain(ignored.iter()) {
             for (i, g) in o.secrets.iter().enumerate() {
                 if g.matches(p) {
                     secret.push((i, p.clone()));
@@ -365,6 +400,7 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
             stats,
         },
         index_bytes,
+        tracked_secrets,
     })
 }
 
@@ -437,11 +473,20 @@ fn select_directory(dir: &Path, o: &Opts, warnings: &mut Vec<String>) -> Result<
                 continue;
             }
             let m = std::fs::symlink_metadata(root.join(p.to_path()))?;
-            if m.is_dir() {
-                if n.as_bytes() == b".git" {
+            if n.as_bytes().eq_ignore_ascii_case(b".git") {
+                // a `.git` directory is left out; anything else called that
+                // could never be written into a workspace
+                if m.is_dir() && n.as_bytes() == b".git" {
                     warnings.push(format!("{}: a .git directory is left out", p.display()));
                     continue;
                 }
+                return Err(SourceError::UnsafePath {
+                    path: p.display(),
+                    why: "a file or directory named .git cannot be part of a workspace".into(),
+                }
+                .into());
+            }
+            if m.is_dir() {
                 walk(root, &p, o, out, warnings)?;
             } else {
                 out.push(p);
@@ -732,8 +777,13 @@ pub(crate) fn check_digest(m: &SourceManifest) -> Result<()> {
 
 // ---- the private repository ----------------------------------------------
 
-/// The bare repository that holds the synthetic commits of one repository. It
-/// reads the original's objects through `alternates` and writes only its own.
+/// The bare repository that holds the synthetic commits of one repository.
+///
+/// It owns its objects: [`import_history`] copies in the history a capture
+/// needs, so a rewrite or a `git gc` in the original does not break an export
+/// later. The original's `info/attributes` is copied here, because
+/// `.gitattributes` files are read from the working tree but this one does
+/// not have it.
 fn private_repo(
     ctx: &ExecContext,
     store: &ObjectStore,
@@ -762,9 +812,53 @@ fn private_repo(
             bail!("git init: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
     }
-    let alt = format!("{common}/objects\n");
-    write_atomic(&dir.join("objects/info/alternates"), alt.as_bytes(), 0o644)?;
+    let dest = dir.join("info/attributes");
+    match std::fs::read(Path::new(&common).join("info/attributes")) {
+        Ok(b) => write_atomic(&dest, &b, 0o644)?,
+        Err(_) => {
+            let _ = std::fs::remove_file(&dest);
+        }
+    }
     Ok(dir)
+}
+
+/// The history of `head` (so the merge base and the unpushed commits too),
+/// fetched from the original into the private repository. Reads the original,
+/// writes only the private one.
+fn import_history(ctx: &ExecContext, git_dir: &Path, root: &Path, head: &str) -> Result<()> {
+    let r = format!("refs/local-ci/heads/{head}");
+    if pg(
+        ctx,
+        git_dir,
+        &["rev-parse", "--verify", "-q", &r],
+        &[],
+        None,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let args: Vec<OsString> = vec![
+        "--git-dir".into(),
+        git_dir.into(),
+        "-c".into(),
+        "uploadpack.allowAnySHA1InWant=true".into(),
+        "fetch".into(),
+        "-q".into(),
+        "--no-tags".into(),
+        "--no-write-fetch-head".into(),
+        root.into(),
+        format!("+{head}:{r}").into(),
+    ];
+    git_run_os(
+        ctx,
+        None,
+        &args,
+        &[("GIT_OPTIONAL_LOCKS", OsStr::new("0"))],
+        None,
+    )
+    .context("cannot copy the history of HEAD into the source store")?;
+    Ok(())
 }
 
 fn repository_id(ctx: &ExecContext, root: &Path) -> Result<String> {
@@ -832,21 +926,255 @@ fn write_blobs(
     Ok(shas)
 }
 
-/// The tree of `entries` and `gitlinks` in the private repository.
+/// `-c key=value` arguments for the settings of the original that decide how
+/// content becomes a blob: filters and line-ending conversion. They are passed
+/// on the command line, so the original's config is read and never written.
+fn filter_config(ctx: &ExecContext, root: &Path) -> Vec<OsString> {
+    let out = og(
+        ctx,
+        root,
+        &[
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^(filter\..*|core\.(autocrlf|eol|safecrlf|attributesfile|whitespace))$",
+        ],
+    )
+    .unwrap_or_default();
+    let mut args = vec![];
+    for rec in out.split(|&c| c == 0).filter(|r| !r.is_empty()) {
+        let kv = match rec.iter().position(|&c| c == b'\n') {
+            Some(i) => [&rec[..i], b"=", &rec[i + 1..]].concat(),
+            None => rec.to_vec(),
+        };
+        args.push(OsString::from("-c"));
+        args.push(OsString::from_vec(kv));
+    }
+    args
+}
+
+/// Hash `content` as Git would when adding the file `path` of the original:
+/// attributes from the original's working tree, filters and line endings
+/// from its config. The blob goes to the private repository.
+fn hash_filtered(
+    ctx: &ExecContext,
+    root: &Path,
+    git_dir: &Path,
+    cfg: &[OsString],
+    path: &RelPath,
+    content: Vec<u8>,
+) -> Result<String> {
+    let mut args: Vec<OsString> = vec![
+        "--git-dir".into(),
+        git_dir.into(),
+        "--work-tree".into(),
+        root.into(),
+    ];
+    args.extend(cfg.iter().cloned());
+    args.extend(["hash-object", "-w", "--stdin"].map(OsString::from));
+    args.push(OsString::from_vec(
+        [b"--path=".as_slice(), &path.0].concat(),
+    ));
+    let out = git_run_os(ctx, Some(root), &args, &[], Some(content))
+        .with_context(|| format!("cannot hash {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Hash bytes as they are (no path, so no filter).
+fn hash_plain(ctx: &ExecContext, git_dir: &Path, content: Vec<u8>) -> Result<String> {
+    let out = pg(
+        ctx,
+        git_dir,
+        &["hash-object", "-w", "--stdin"],
+        &[],
+        Some(content),
+    )?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Paths (of `paths`) that no attribute and no setting touches on their way
+/// into Git: their blob is their bytes.
+fn untouched_paths(
+    ctx: &ExecContext,
+    root: &Path,
+    paths: &[&RelPath],
+) -> Result<BTreeSet<RelPath>> {
+    let autocrlf = og_str(ctx, root, &["config", "--get", "core.autocrlf"]).unwrap_or_default();
+    if !(autocrlf.is_empty() || autocrlf == "false") || paths.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut input = vec![];
+    for p in paths {
+        input.extend_from_slice(&p.0);
+        input.push(0);
+    }
+    let out = og_with_stdin(
+        ctx,
+        root,
+        &[
+            "check-attr",
+            "-z",
+            "--stdin",
+            "text",
+            "eol",
+            "filter",
+            "ident",
+            "working-tree-encoding",
+            "crlf",
+        ],
+        input,
+    )?;
+    let fields: Vec<&[u8]> = out.split(|&c| c == 0).collect();
+    let mut touched = BTreeSet::new();
+    for rec in fields.chunks(3) {
+        if rec.len() == 3 && rec[2] != b"unspecified" {
+            touched.insert(RelPath(rec[0].to_vec()));
+        }
+    }
+    Ok(paths
+        .iter()
+        .filter(|p| !touched.contains(**p))
+        .map(|p| (*p).clone())
+        .collect())
+}
+
+fn og_with_stdin(ctx: &ExecContext, root: &Path, args: &[&str], stdin: Vec<u8>) -> Result<Vec<u8>> {
+    git_run(
+        ctx,
+        &["-C".into(), root.into()],
+        args,
+        &[("GIT_OPTIONAL_LOCKS", OsStr::new("0"))],
+        Some(stdin),
+    )
+}
+
+/// Make sure the blobs `shas` of the original are in the private repository
+/// (staged content that was never committed is only in the original).
+fn copy_blobs(ctx: &ExecContext, root: &Path, git_dir: &Path, shas: &[&str]) -> Result<()> {
+    if shas.is_empty() {
+        return Ok(());
+    }
+    let input: Vec<u8> = shas
+        .iter()
+        .flat_map(|s| format!("{s}\n").into_bytes())
+        .collect();
+    let out = pg(
+        ctx,
+        git_dir,
+        &["cat-file", "--batch-check"],
+        &[],
+        Some(input),
+    )?;
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Some(sha) = line.strip_suffix(" missing") else {
+            continue;
+        };
+        let content = og(ctx, root, &["cat-file", "blob", sha])?;
+        let got = hash_plain(ctx, git_dir, content)?;
+        if got != sha {
+            bail!("blob {sha} was copied as {got}");
+        }
+    }
+    Ok(())
+}
+
+/// The Git blob of every entry, in the private repository.
+///
+/// A blob is what Git itself would store, not the bytes of the file: the
+/// content as it is in the original's index when the file is unchanged, the
+/// result of the original's `.gitattributes` and filters (`hash-object
+/// --path`) when it is not, the pointer for an LFS file, and the link value
+/// for a symlink. Reading the commit therefore gives what Git gives:
+/// a clean repository has the tree of `HEAD`.
+#[allow(clippy::too_many_arguments)]
+fn blob_ids(
+    ctx: &ExecContext,
+    store: &ObjectStore,
+    root: &Path,
+    git_dir: &Path,
+    entries: &[FileEntry],
+    tracked: &[(u32, String, RelPath)],
+    lfs: &[LfsRef],
+) -> Result<Vec<String>> {
+    let lfs_by: HashMap<&RelPath, &LfsRef> = lfs.iter().map(|l| (&l.path, l)).collect();
+    let index: HashMap<&RelPath, &str> = tracked
+        .iter()
+        .filter(|t| t.0 == 0o100644 || t.0 == 0o100755)
+        .map(|t| (&t.2, t.1.as_str()))
+        .collect();
+    let changed: BTreeSet<RelPath> = split_z(&og(ctx, root, &["diff-files", "--name-only", "-z"])?)
+        .into_iter()
+        .map(|p| RelPath(p.to_vec()))
+        .collect();
+
+    let mut shas: Vec<Option<String>> = vec![None; entries.len()];
+    let mut from_index: Vec<String> = vec![];
+    let mut need_attrs = vec![];
+    for (i, e) in entries.iter().enumerate() {
+        if e.mode == 0o120000 || lfs_by.contains_key(&e.path) {
+            continue;
+        }
+        match index.get(&e.path) {
+            Some(sha) if !changed.contains(&e.path) => {
+                shas[i] = Some((*sha).to_string());
+                from_index.push((*sha).to_string());
+            }
+            _ => need_attrs.push(i),
+        }
+    }
+    let untouched = untouched_paths(
+        ctx,
+        root,
+        &need_attrs
+            .iter()
+            .map(|&i| &entries[i].path)
+            .collect::<Vec<_>>(),
+    )?;
+
+    // bytes that go in as they are: symlinks and files nothing touches
+    let mut raw: Vec<&str> = vec![];
+    for (i, e) in entries.iter().enumerate() {
+        if shas[i].is_none() && (e.mode == 0o120000 || untouched.contains(&e.path)) {
+            raw.push(&e.hash);
+        }
+    }
+    raw.sort();
+    raw.dedup();
+    let raw_ids = write_blobs(ctx, store, git_dir, &raw)?;
+
+    let cfg = filter_config(ctx, root);
+    for (i, e) in entries.iter().enumerate() {
+        if shas[i].is_some() {
+            continue;
+        }
+        shas[i] = Some(if e.mode == 0o120000 {
+            raw_ids[&e.hash].clone()
+        } else if let Some(l) = lfs_by.get(&e.path) {
+            hash_plain(ctx, git_dir, lfs_pointer_text(&l.oid, l.size).into_bytes())?
+        } else if untouched.contains(&e.path) {
+            raw_ids[&e.hash].clone()
+        } else {
+            hash_filtered(ctx, root, git_dir, &cfg, &e.path, store.read(&e.hash)?)?
+        });
+    }
+    let from_index: Vec<&str> = from_index.iter().map(String::as_str).collect();
+    copy_blobs(ctx, root, git_dir, &from_index)?;
+    Ok(shas.into_iter().map(|s| s.unwrap()).collect())
+}
+
+/// The tree of `entries` (with the blobs `shas`) and `gitlinks` in the
+/// private repository.
 fn build_tree(
     ctx: &ExecContext,
     store: &ObjectStore,
     git_dir: &Path,
     entries: &[FileEntry],
+    shas: &[String],
     gitlinks: &[(RelPath, String)],
 ) -> Result<String> {
-    let mut uniq: Vec<&str> = entries.iter().map(|e| e.hash.as_str()).collect();
-    uniq.sort();
-    uniq.dedup();
-    let shas = write_blobs(ctx, store, git_dir, &uniq)?;
     let mut input = vec![];
-    for e in entries {
-        input.extend_from_slice(format!("{:o} {}\t", e.mode, shas[&e.hash]).as_bytes());
+    for (e, sha) in entries.iter().zip(shas) {
+        input.extend_from_slice(format!("{:o} {sha}\t", e.mode).as_bytes());
         input.extend_from_slice(&e.path.0);
         input.push(0);
     }
@@ -872,24 +1200,38 @@ fn build_tree(
     res
 }
 
-/// The tree of the index, taken from a copy of it.
+/// The tree of the index, taken from a copy of it. The blobs that are staged
+/// and not committed exist only in the original: they are copied here first.
 fn index_tree(
     ctx: &ExecContext,
     store: &ObjectStore,
+    root: &Path,
     git_dir: &Path,
     bytes: &[u8],
 ) -> Result<String> {
     let idx = store::tmp_name(&store.tmp_dir(), "index");
     std::fs::write(&idx, bytes)?;
-    let res = pg(
-        ctx,
-        git_dir,
-        &["write-tree"],
-        &[("GIT_INDEX_FILE", idx.as_os_str())],
-        None,
-    );
+    let res = (|| -> Result<String> {
+        let env = [("GIT_INDEX_FILE", idx.as_os_str())];
+        let listing = pg(ctx, git_dir, &["ls-files", "-z", "-s"], &env, None)?;
+        let mut shas = vec![];
+        for rec in split_z(&listing) {
+            let text = String::from_utf8_lossy(rec);
+            let mut it = text.split(' ');
+            let (mode, sha) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+            if mode != "160000" && !sha.is_empty() {
+                shas.push(sha.to_string());
+            }
+        }
+        shas.sort();
+        shas.dedup();
+        let shas: Vec<&str> = shas.iter().map(String::as_str).collect();
+        copy_blobs(ctx, root, git_dir, &shas)?;
+        let out = pg(ctx, git_dir, &["write-tree"], &env, None)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    })();
     let _ = std::fs::remove_file(&idx);
-    Ok(String::from_utf8_lossy(&res?).trim().to_string())
+    res
 }
 
 fn synthetic_commit(ctx: &ExecContext, git_dir: &Path, tree: &str, parent: &str) -> Result<String> {
@@ -985,15 +1327,25 @@ pub fn capture_source(
     repo_dir: &Path,
     opts: &CaptureOptions,
 ) -> Result<SourceSnapshot> {
-    capture_worktree(ctx, repo_dir, opts, &store_of(ctx, opts)?)
+    if !opts.secret_files.is_empty() && opts.secret_key.len() < MIN_SECRET_KEY {
+        return Err(SourceError::SecretKeyTooShort {
+            len: opts.secret_key.len(),
+        }
+        .into());
+    }
+    capture_worktree(ctx, repo_dir, opts, &store_of(ctx, opts)?).map(|(snap, _)| snap)
 }
+
+/// The directories of a capture and what they looked like when it read them:
+/// the repository itself, then every submodule below it.
+type Seen = Vec<(PathBuf, Meta)>;
 
 fn capture_worktree(
     ctx: &ExecContext,
     repo_dir: &Path,
     opts: &CaptureOptions,
     store: &ObjectStore,
-) -> Result<SourceSnapshot> {
+) -> Result<(SourceSnapshot, Seen)> {
     let top = og_str(ctx, repo_dir, &["rev-parse", "--show-toplevel"])
         .context("not inside a git repository")?;
     let root = std::fs::canonicalize(top)?;
@@ -1006,8 +1358,13 @@ fn capture_worktree(
     let mut last = String::new();
     let attempts = opts.max_attempts.max(1);
     for attempt in 1..=attempts {
-        match one_pass(ctx, &root, opts, &o, store, &git_dir, attempt) {
-            Ok(p) => return finish(ctx, store, &root, &git_dir, opts, repo_id, cwd_relative, p),
+        match one_pass(ctx, &root, opts, &o, store, attempt) {
+            Ok(p) => {
+                let mut seen = vec![(root.clone(), p.sel.meta.clone())];
+                seen.extend(p.seen.iter().cloned());
+                let snap = finish(ctx, store, &root, &git_dir, opts, repo_id, cwd_relative, p)?;
+                return Ok((snap, seen));
+            }
             Err(e) => match e.downcast_ref::<Unstable>() {
                 Some(u) => last = u.0.clone(),
                 None => return Err(e),
@@ -1022,6 +1379,8 @@ struct Stable {
     read: Read,
     lfs: Vec<LfsRef>,
     submodules: Vec<(SubmoduleRef, String)>,
+    /// The submodules below, as they were read.
+    seen: Seen,
 }
 
 /// Read everything once, then look again: `Err(Unstable)` when it moved.
@@ -1031,13 +1390,12 @@ fn one_pass(
     opts: &CaptureOptions,
     o: &Opts,
     store: &ObjectStore,
-    git_dir: &Path,
     attempt: u32,
 ) -> Result<Stable> {
-    let _ = git_dir;
     let sel = select_worktree(ctx, root, o)?;
     // initialized submodules are captured whole, each with its own retries
     let mut submodules = vec![];
+    let mut seen: Seen = vec![];
     let mut gitlink_paths = BTreeSet::new();
     for (mode, sha, path) in sel.meta.tracked.iter().filter(|t| t.0 == 0o160000) {
         gitlink_paths.insert(path);
@@ -1048,8 +1406,9 @@ fn one_pass(
                 max_attempts: opts.max_attempts,
                 ..CaptureOptions::default()
             };
-            let snap = capture_worktree(ctx, &sub, &inner, store)
+            let (snap, sub_seen) = capture_worktree(ctx, &sub, &inner, store)
                 .with_context(|| format!("submodule {}", path.display()))?;
+            seen.extend(sub_seen);
             let m = &snap.manifest;
             let head_tree = og_str(ctx, &sub, &["rev-parse", "HEAD^{tree}"]).unwrap_or_default();
             let dirty = m.original_head.as_deref() != Some(sha.as_str())
@@ -1094,11 +1453,25 @@ fn one_pass(
             return Err(unstable(format!("{} changed", p.display())));
         }
     }
+    // and a submodule is as it was when its own capture settled: its HEAD,
+    // index and every file in it
+    let plain = build_opts(&CaptureOptions::default())?;
+    for (dir, was) in &seen {
+        let now = select_worktree(ctx, dir, &plain)?;
+        if &now.meta != was {
+            return Err(unstable(format!(
+                "submodule {}: {}",
+                dir.strip_prefix(root).unwrap_or(dir).display(),
+                was.diff(&now.meta)
+            )));
+        }
+    }
     Ok(Stable {
         sel,
         read,
         lfs,
         submodules,
+        seen,
     })
 }
 
@@ -1120,9 +1493,19 @@ fn finish(
         .iter()
         .map(|(s, g)| (s.path.clone(), g.clone()))
         .collect();
-    let worktree_tree = build_tree(ctx, store, git_dir, &p.read.entries, &gitlinks)?;
+    import_history(ctx, git_dir, root, &head)?;
+    let shas = blob_ids(
+        ctx,
+        store,
+        root,
+        git_dir,
+        &p.read.entries,
+        &p.sel.meta.tracked,
+        &p.lfs,
+    )?;
+    let worktree_tree = build_tree(ctx, store, git_dir, &p.read.entries, &shas, &gitlinks)?;
     let commit = synthetic_commit(ctx, git_dir, &worktree_tree, &head)?;
-    let itree = index_tree(ctx, store, git_dir, &p.sel.index_bytes)?;
+    let itree = index_tree(ctx, store, root, git_dir, &p.sel.index_bytes)?;
 
     let base = opts
         .base
@@ -1144,8 +1527,15 @@ fn finish(
         });
         bundle_files.push((path.clone(), *mode, bytes.clone()));
     }
+    for (_, path) in &p.sel.tracked_secrets {
+        warnings.push(format!(
+            "{} is tracked, so it is commit content and not a secret file",
+            path.display()
+        ));
+    }
     for (i, spec) in opts.secret_files.iter().enumerate() {
-        if p.read.secrets.iter().all(|s| s.0 != i) {
+        if p.read.secrets.iter().all(|s| s.0 != i) && p.sel.tracked_secrets.iter().all(|s| s.0 != i)
+        {
             if spec.required {
                 return Err(SourceError::RequiredSecretMissing {
                     glob: spec.glob.clone(),

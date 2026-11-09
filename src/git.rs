@@ -218,19 +218,37 @@ pub fn repo_slug(ctx: &ExecContext, dir: &Path) -> Option<String> {
 }
 
 pub fn add_worktree(ctx: &ExecContext, repo: &Path, path: &Path, sha: &str) -> Result<()> {
+    add_worktree_with(ctx, repo, path, sha, true)
+}
+
+/// A worktree at `sha` with nothing checked out and an empty index: the
+/// caller writes the files (and no smudge filter or line-ending conversion
+/// runs on them).
+pub fn add_worktree_no_checkout(
+    ctx: &ExecContext,
+    repo: &Path,
+    path: &Path,
+    sha: &str,
+) -> Result<()> {
+    add_worktree_with(ctx, repo, path, sha, false)
+}
+
+fn add_worktree_with(
+    ctx: &ExecContext,
+    repo: &Path,
+    path: &Path,
+    sha: &str,
+    checkout: bool,
+) -> Result<()> {
     worktree_admin(ctx, repo, || {
-        git(
-            ctx,
-            repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                "--quiet",
-                &path.to_string_lossy(),
-                sha,
-            ],
-        )
+        let mut args = vec!["worktree", "add", "--detach", "--quiet"];
+        if !checkout {
+            args.push("--no-checkout");
+        }
+        let p = path.to_string_lossy();
+        args.push(&p);
+        args.push(sha);
+        git(ctx, repo, &args)
     })
     .map(|_| ())
 }

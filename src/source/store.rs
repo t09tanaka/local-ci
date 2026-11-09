@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -142,6 +142,11 @@ impl ObjectStore {
         for d in ["objects", "manifests", "secrets", "git", "tmp"] {
             std::fs::create_dir_all(root.join(d))
                 .with_context(|| format!("cannot create the source store at {}", root.display()))?;
+        }
+        // secret bundles and half-written content: this user only
+        for d in ["secrets", "tmp"] {
+            std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("cannot restrict {}", root.join(d).display()))?;
         }
         Ok(ObjectStore { root })
     }

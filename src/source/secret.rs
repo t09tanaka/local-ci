@@ -34,7 +34,7 @@ pub fn secret_digest(key: &[u8], path: &RelPath, content: &[u8]) -> String {
     format!("hmac-sha256:{}", hex(&hmac_sha256(key, &msg)))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SecretFile {
     pub path: RelPath,
     pub mode: u32,
@@ -43,10 +43,23 @@ pub(crate) struct SecretFile {
 
 /// The content of the secret files of one source. Lives in a file of its own
 /// (0600), never in the object store or the manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretBundle {
     pub schema_version: u32,
     pub(crate) files: Vec<SecretFile>,
+}
+
+/// Names the files and never shows what is in them.
+impl std::fmt::Debug for SecretBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretBundle")
+            .field("schema_version", &self.schema_version)
+            .field(
+                "paths",
+                &self.paths().iter().map(|p| p.display()).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl SecretBundle {
@@ -103,5 +116,23 @@ mod tests {
             hex(&mac),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_names_the_files_and_not_their_content() {
+        let b = SecretBundle::new(vec![(
+            RelPath::new(".env"),
+            0o600,
+            b"hunter2-token".to_vec(),
+        )]);
+        let shown = format!("{b:?}");
+        assert!(shown.contains(".env"));
+        assert!(!shown.contains("hunter2"));
+        assert!(!shown.contains(&hex(b"hunter2-token")));
     }
 }

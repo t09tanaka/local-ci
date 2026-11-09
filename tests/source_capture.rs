@@ -611,6 +611,8 @@ fn a14_unpushed_commits_and_the_snapshot_reach_a_clone_that_never_saw_them() {
 
 // ---- secret files ---------------------------------------------------------
 
+const KEY: &[u8] = b"cluster-key-0123456789";
+
 fn spec(glob: &str, required: bool) -> SecretSpec {
     SecretSpec {
         glob: glob.into(),
@@ -626,7 +628,7 @@ fn secret_files_stay_out_of_the_store_the_manifest_and_the_bundle_of_objects() {
     let c = f.ctx();
     let mut o = opts();
     o.secret_files = vec![spec(".env", true)];
-    o.secret_key = b"cluster-key".to_vec();
+    o.secret_key = KEY.to_vec();
     let snap = capture_source(&c, &f.dir, &o).unwrap();
     let m = &snap.manifest;
     assert_eq!(m.secret_files.len(), 1);
@@ -675,7 +677,7 @@ fn secret_files_stay_out_of_the_store_the_manifest_and_the_bundle_of_objects() {
 
     // the key matters, the content matters
     let mut o2 = o.clone();
-    o2.secret_key = b"another-key".to_vec();
+    o2.secret_key = b"another-key-0123456789".to_vec();
     let m2 = capture_source(&c, &f.dir, &o2).unwrap().manifest;
     assert_ne!(m2.secret_files[0].hmac, m.secret_files[0].hmac);
     assert_ne!(m2.source_id, m.source_id);
@@ -684,7 +686,7 @@ fn secret_files_stay_out_of_the_store_the_manifest_and_the_bundle_of_objects() {
     let dest = f.home.join("ws");
     materialize_source(&c, m, &dest).unwrap();
     let bundle = SecretBundle::load(&bundle_path).unwrap();
-    materialize_secrets(m, &bundle, b"cluster-key", &dest).unwrap();
+    materialize_secrets(m, &bundle, KEY, &dest).unwrap();
     assert_eq!(std::fs::read_to_string(dest.join(".env")).unwrap(), secret);
     assert_eq!(
         std::fs::metadata(dest.join(".env")).unwrap().mode() & 0o777,
@@ -701,6 +703,7 @@ fn a_required_secret_that_is_missing_fails_the_capture_and_an_optional_one_warns
     let f = fixture();
     let c = f.ctx();
     let mut o = opts();
+    o.secret_key = KEY.to_vec();
     o.secret_files = vec![spec(".env.test", true)];
     let err = capture_source(&c, &f.dir, &o).unwrap_err();
     assert!(matches!(
@@ -719,6 +722,7 @@ fn a_secret_file_does_not_stop_a_clean_commit_from_matching() {
     std::fs::write(f.dir.join(".env"), "S=1\n").unwrap();
     let c = f.ctx();
     let mut o = opts();
+    o.secret_key = KEY.to_vec();
     o.secret_files = vec![spec(".env", false)];
     let m = capture_source(&c, &f.dir, &o).unwrap().manifest;
     let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
@@ -931,9 +935,9 @@ fn a14_an_lfs_pointer_is_replaced_by_its_payload() {
     let dest = f.home.join("ws");
     materialize_source(&c, &m, &dest).unwrap();
     assert_eq!(std::fs::read(dest.join("big.dat")).unwrap(), payload);
-    // not HEAD's content (the commit holds the pointer)
+    // the commit holds the pointer, as HEAD does: the tree is HEAD's
     let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
-    assert!(publishable(&c, &f.dir, &SourceInfo::of(&m), &head).is_err());
+    publishable(&c, &f.dir, &SourceInfo::of(&m), &head).unwrap();
 }
 
 #[test]
@@ -991,7 +995,8 @@ fn filters_run_once_by_git_and_never_again_on_captured_content() {
     let dest = f.home.join("ws");
     materialize_source(&c, &m, &dest).unwrap();
     assert_eq!(std::fs::read(dest.join("x.fk")).unwrap(), b"HELLO\n");
-    // and the synthetic commit holds those bytes, not a cleaned copy
+    // the synthetic commit holds what Git would have stored (the filter's
+    // clean output), not the bytes of the working file
     let exec = m.execution_commit.clone().unwrap();
     let private = std::fs::read_dir(f.home.join("sources/git"))
         .unwrap()
@@ -1001,8 +1006,14 @@ fn filters_run_once_by_git_and_never_again_on_captured_content() {
         .path();
     assert_eq!(
         git_out(&private, &["show", &format!("{exec}:x.fk")]),
-        "HELLO"
+        "hello"
     );
+    let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        m.worktree_tree.as_deref().unwrap(),
+        git_out(&f.dir, &["rev-parse", "HEAD^{tree}"])
+    );
+    publishable(&c, &f.dir, &SourceInfo::of(&m), &head).unwrap();
 }
 
 #[test]
@@ -1136,18 +1147,18 @@ fn a_secret_file_bundle_cannot_place_a_file_outside_the_workspace() {
     let c = f.ctx();
     let mut o = opts();
     o.secret_files = vec![spec(".env", true)];
-    o.secret_key = b"k".to_vec();
+    o.secret_key = KEY.to_vec();
     let m = capture_source(&c, &f.dir, &o).unwrap().manifest;
     let evil_path = RelPath::new("../escaped.env");
     let mut evil_m = m.clone();
     evil_m.secret_files = vec![SecretEntry {
-        hmac: secret_digest(b"k", &evil_path, b"S=1\n"),
+        hmac: secret_digest(KEY, &evil_path, b"S=1\n"),
         path: evil_path.clone(),
     }];
     let evil_bundle = SecretBundle::new(vec![(evil_path, 0o600, b"S=1\n".to_vec())]);
     let dest = f.home.join("outer/ws");
     std::fs::create_dir_all(&dest).unwrap();
-    let err = materialize_secrets(&evil_m, &evil_bundle, b"k", &dest).unwrap_err();
+    let err = materialize_secrets(&evil_m, &evil_bundle, KEY, &dest).unwrap_err();
     assert!(
         matches!(
             err.downcast_ref::<SourceError>(),
@@ -1156,4 +1167,582 @@ fn a_secret_file_bundle_cannot_place_a_file_outside_the_workspace() {
         "{err:#}"
     );
     assert!(!f.home.join("outer/escaped.env").exists());
+}
+
+// ---- what Git would store, and what a worker writes ------------------------
+
+fn private_repo_of(f_home: &Path) -> PathBuf {
+    std::fs::read_dir(f_home.join("sources/git"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
+const APPEND_SMUDGE: (&str, &str) = ("sed '/^#smudged$/d'", "cat; echo '#smudged'");
+
+struct World {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    work: PathBuf,
+    worker: PathBuf,
+    out: PathBuf,
+}
+
+/// A repository whose `.txt` files are LF in Git and CRLF on disk, with a
+/// filter that appends a line every time it smudges, a workflow that copies
+/// files out, and a clone (the worker) that has `main` only.
+fn world() -> World {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let worker = tmp.path().join("worker");
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    git(&work, &["config", "filter.appender.clean", APPEND_SMUDGE.0]);
+    git(
+        &work,
+        &["config", "filter.appender.smudge", APPEND_SMUDGE.1],
+    );
+    std::fs::write(
+        work.join(".gitattributes"),
+        "*.txt text eol=crlf\n*.sm filter=appender\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work.join(".github/workflows/ci.yml"),
+        format!(
+            "name: ci\non: pull_request\njobs:\n  check:\n    runs-on: ubuntu-latest\n    env:\n      OUT: {}\n    steps:\n      - run: sh copy.sh\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        work.join("copy.sh"),
+        "for f in x.txt y.txt z.txt s.sm new.txt; do cp \"$f\" \"$OUT/$f.out\" 2>/dev/null; done; true\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("x.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(work.join("z.txt"), "z\n").unwrap();
+    std::fs::write(work.join("s.sm"), "v\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-qm", "base"]);
+    git(
+        tmp.path(),
+        &["clone", "-q", work.to_str().unwrap(), "worker"],
+    );
+    git(
+        &worker,
+        &["config", "filter.appender.clean", APPEND_SMUDGE.0],
+    );
+    git(
+        &worker,
+        &["config", "filter.appender.smudge", APPEND_SMUDGE.1],
+    );
+    git(&work, &["checkout", "-qb", "feature"]);
+    std::fs::write(work.join("y.txt"), "y\n").unwrap();
+    git(&work, &["add", "y.txt"]);
+    git(&work, &["commit", "-qm", "feature"]);
+    World {
+        _tmp: tmp,
+        home,
+        work,
+        worker,
+        out,
+    }
+}
+
+/// Capture `w.work`, take the snapshot to the worker and run its workflow
+/// there over the captured bytes.
+fn run_in_worker(
+    c: &ExecContext,
+    w: &World,
+    m: &local_ci::source::SourceManifest,
+) -> local_ci::report::RunResult {
+    let bundle = export_objects(c, m).unwrap();
+    let exec = import_objects(c, &w.worker, &bundle, m).unwrap();
+    let o = local_ci::RunOptions {
+        target: local_ci::Target {
+            base: Some("main".into()),
+            sha: exec,
+            all: false,
+            include_disabled: true,
+            workflows_dirs: vec![],
+            workflows: vec![],
+            jobs: vec![],
+            dir: w.worker.clone(),
+        },
+        parallel: Some(1),
+        no_canirun: true,
+        no_portool: true,
+        containers: 1,
+        keep: false,
+        job_timeout: 5.0,
+        no_cache: true,
+        cache_dir: w.home.clone(),
+        source: Some(m.clone()),
+    };
+    let r = local_ci::run(c, o, &mut local_ci::Quiet).unwrap().result;
+    assert_eq!(r.state, "success", "{}", r.description);
+    r
+}
+
+fn crlf_checkout(w: &World) {
+    std::fs::write(w.work.join("x.txt"), "one\r\ntwo\r\n").unwrap();
+    std::fs::write(w.work.join("y.txt"), "y\r\n").unwrap();
+    std::fs::write(w.work.join("z.txt"), "z\r\n").unwrap();
+}
+
+#[test]
+fn a_clean_repository_with_converted_line_endings_is_head_and_posts_its_status() {
+    let w = world();
+    crlf_checkout(&w);
+    let c = ctx(&w.home);
+    let mut o = opts();
+    o.base = Some("main".into());
+    let m = capture_source(&c, &w.work, &o).unwrap().manifest;
+    let head = git_out(&w.work, &["rev-parse", "HEAD"]);
+    // CRLF on disk, LF in Git: the tree is HEAD's, so a status is allowed
+    assert_eq!(
+        m.worktree_tree.as_deref().unwrap(),
+        git_out(&w.work, &["rev-parse", "HEAD^{tree}"])
+    );
+    publishable(&c, &w.work, &SourceInfo::of(&m), &head).unwrap();
+
+    run_in_worker(&c, &w, &m);
+    let exec = m.execution_commit.clone().unwrap();
+    // a line-ending change is not a change: only the new file differs
+    assert_eq!(
+        git_out(&w.worker, &["diff", "--numstat", "main", &exec]),
+        "1\t0\ty.txt"
+    );
+    // and what the worker had to work with is the bytes of the original
+    assert_eq!(
+        std::fs::read(w.out.join("x.txt.out")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+
+    // the status goes to the commit that was tested, and says so
+    let bin = w.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = w.home.join("gh.log");
+    std::fs::write(
+        bin.join("gh"),
+        format!("#!/bin/sh\necho \"$@\" > {}\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let gc = ExecContext::new(
+        [
+            (
+                "PATH",
+                format!("{}:/usr/bin:/bin:/opt/homebrew/bin", bin.display()),
+            ),
+            ("HOME", w.home.display().to_string()),
+            ("LOCAL_CI_HOME", w.home.display().to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
+    let (state, short) = local_ci::status(&gc, &w.worker, &head, &w.home).unwrap();
+    assert_eq!(state, "success");
+    assert_eq!(short, &head[..7]);
+    assert_ne!(short, &exec[..7]);
+    let posted = std::fs::read_to_string(&log).unwrap();
+    assert!(posted.contains(&head), "{posted}");
+    assert!(!posted.contains(&exec), "{posted}");
+}
+
+#[test]
+fn the_workspace_of_a_run_holds_the_captured_bytes_and_no_conversion_runs_twice() {
+    let w = world();
+    // LF only in a file Git would make CRLF, an untracked one, a mixed one,
+    // and a file behind a filter whose smudge adds a line every time
+    std::fs::write(w.work.join("x.txt"), "LF only\nline2\n").unwrap();
+    std::fs::write(w.work.join("new.txt"), "n1\nn2\r\n").unwrap();
+    std::fs::write(w.work.join("z.txt"), "z1\nz2\r\n").unwrap();
+    std::fs::write(w.work.join("s.sm"), "v\nedit\n").unwrap();
+    let c = ctx(&w.home);
+    let mut o = opts();
+    o.base = Some("main".into());
+    let m = capture_source(&c, &w.work, &o).unwrap().manifest;
+    let exec = m.execution_commit.clone().unwrap();
+    run_in_worker(&c, &w, &m);
+
+    for (name, want) in [
+        ("x.txt", "LF only\nline2\n"),
+        ("new.txt", "n1\nn2\r\n"),
+        ("z.txt", "z1\nz2\r\n"),
+        ("s.sm", "v\nedit\n"),
+    ] {
+        assert_eq!(
+            std::fs::read(w.out.join(format!("{name}.out"))).unwrap(),
+            want.as_bytes(),
+            "{name}"
+        );
+    }
+    // Git holds the canonical form
+    assert_eq!(
+        git_out(&w.worker, &["show", &format!("{exec}:x.txt")]),
+        "LF only\nline2"
+    );
+    assert_eq!(
+        git_out(&w.worker, &["show", &format!("{exec}:s.sm")]),
+        "v\nedit"
+    );
+    // the test would catch a checkout: it converts both, differently
+    let naive = w._tmp.path().join("naive");
+    git(
+        &w.worker,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            naive.to_str().unwrap(),
+            &exec,
+        ],
+    );
+    assert_eq!(
+        std::fs::read(naive.join("x.txt")).unwrap(),
+        b"LF only\r\nline2\r\n"
+    );
+    assert_eq!(
+        std::fs::read(naive.join("s.sm")).unwrap(),
+        b"v\nedit\n#smudged\n"
+    );
+}
+
+#[test]
+fn a_workspace_materialized_from_the_manifest_is_byte_for_byte_the_original() {
+    let w = world();
+    std::fs::write(w.work.join("x.txt"), "LF only\r\nmixed\n").unwrap();
+    std::fs::write(w.work.join("s.sm"), "v\nedit\n").unwrap();
+    let c = ctx(&w.home);
+    let m = capture_source(&c, &w.work, &opts()).unwrap().manifest;
+    let dest = w.home.join("ws");
+    materialize_source(&c, &m, &dest).unwrap();
+    for f in ["x.txt", "s.sm", "z.txt", "y.txt"] {
+        assert_eq!(
+            std::fs::read(dest.join(f)).unwrap(),
+            std::fs::read(w.work.join(f)).unwrap(),
+            "{f}"
+        );
+    }
+}
+
+#[test]
+fn an_lfs_file_is_a_pointer_in_the_commit_and_the_payload_never_enters_the_bundle() {
+    let (f, oid, payload) = lfs_fixture(false, true);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let exec = m.execution_commit.clone().unwrap();
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}",
+        payload.len()
+    );
+    let private = private_repo_of(&f.home);
+    assert_eq!(
+        git_out(&private, &["show", &format!("{exec}:big.dat")]),
+        pointer
+    );
+
+    let bundle = export_objects(&c, &m).unwrap();
+    let fresh = f.home.join("fresh");
+    git(
+        f.dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    assert_eq!(
+        git_out(&fresh, &["show", &format!("{exec}:big.dat")]),
+        pointer
+    );
+    let pay = f.home.join("payload.bin");
+    std::fs::write(&pay, &payload).unwrap();
+    let payload_blob = git_out(
+        &fresh,
+        &["hash-object", "--no-filters", pay.to_str().unwrap()],
+    );
+    let has = Command::new("git")
+        .args(["cat-file", "-e", &payload_blob])
+        .current_dir(&fresh)
+        .status()
+        .unwrap()
+        .success();
+    assert!(!has, "the payload is in the bundle");
+
+    // the payload is what a workspace gets
+    let dest = f.home.join("ws");
+    materialize_source(&c, &m, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("big.dat")).unwrap(), payload);
+}
+
+#[test]
+fn a_secret_key_that_is_empty_or_short_is_refused() {
+    let f = fixture();
+    std::fs::write(f.dir.join(".env"), "S=1\n").unwrap();
+    let c = f.ctx();
+    for key in [&b""[..], b"short", b"fifteen-bytes!!"] {
+        let mut o = opts();
+        o.secret_files = vec![spec(".env", false)];
+        o.secret_key = key.to_vec();
+        let err = capture_source(&c, &f.dir, &o).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<SourceError>(),
+                Some(SourceError::SecretKeyTooShort { .. })
+            ),
+            "{err:#}"
+        );
+    }
+    // no secret files declared: no key needed
+    capture_source(&c, &f.dir, &opts()).unwrap();
+}
+
+#[test]
+fn a_tracked_file_that_matches_secret_files_is_commit_content_and_warns() {
+    let f = fixture();
+    std::fs::write(f.dir.join("tracked.env"), "T=1\n").unwrap();
+    git(&f.dir, &["add", "tracked.env"]);
+    git(&f.dir, &["commit", "-qm", "env"]);
+    std::fs::write(f.dir.join(".env"), "S=1\n").unwrap();
+    let c = f.ctx();
+    let mut o = opts();
+    o.secret_key = KEY.to_vec();
+    o.secret_files = vec![spec("*.env", true)];
+    let snap = capture_source(&c, &f.dir, &o).unwrap();
+    let m = &snap.manifest;
+    assert_eq!(
+        m.secret_files
+            .iter()
+            .map(|s| s.path.display())
+            .collect::<Vec<_>>(),
+        vec![".env".to_string()]
+    );
+    assert!(m
+        .object_manifest
+        .entries
+        .iter()
+        .any(|e| e.path.display() == "tracked.env"));
+    assert!(
+        snap.warnings
+            .iter()
+            .any(|w| w.contains("tracked.env") && w.contains("tracked")),
+        "{:?}",
+        snap.warnings
+    );
+    // it is in the tree, so the tree is still HEAD's
+    let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    publishable(&c, &f.dir, &SourceInfo::of(m), &head).unwrap();
+}
+
+#[test]
+fn a_manifest_that_is_not_verified_or_names_odd_ids_is_not_imported() {
+    let f = fixture();
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let bundle = export_objects(&c, &m).unwrap();
+    let fresh = f.home.join("fresh");
+    git(
+        f.dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+
+    let mut edited = m.clone();
+    edited.branch = Some("evil".into());
+    let err = import_objects(&c, &fresh, &bundle, &edited).unwrap_err();
+    assert!(format!("{err}").contains("digest"), "{err}");
+
+    let mut odd = m.clone();
+    odd.execution_commit = Some("--upload-pack=sh".into());
+    let odd = seal_manifest(odd);
+    let err = import_objects(&c, &fresh, &bundle, &odd).unwrap_err();
+    assert!(format!("{err}").contains("not a commit id"), "{err}");
+    assert!(export_objects(&c, &odd).is_err());
+
+    let mut odd = m.clone();
+    odd.source_id = "src-../../x".into();
+    assert!(import_objects(&c, &fresh, &bundle, &odd).is_err());
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+}
+
+#[test]
+fn the_store_keeps_secrets_and_scratch_files_to_its_owner_and_a_dot_git_file_is_refused() {
+    let f = fixture();
+    let c = f.ctx();
+    capture_source(&c, &f.dir, &opts()).unwrap();
+    for d in ["secrets", "tmp"] {
+        let mode = std::fs::metadata(f.home.join("sources").join(d))
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{d}");
+    }
+    let plain = f.home.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("a"), "a").unwrap();
+    std::fs::write(plain.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    let err = capture_directory(&c, &plain, &opts()).unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<SourceError>(),
+            Some(SourceError::UnsafePath { .. })
+        ),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn the_snapshot_survives_a_rewrite_and_a_gc_of_the_original() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let head = m.original_head.clone().unwrap();
+    let fresh = f.home.join("fresh");
+    git(
+        f.dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    git(
+        &f.dir,
+        &["commit", "--amend", "-qm", "rewritten", "--allow-empty"],
+    );
+    git(&f.dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&f.dir, &["gc", "-q", "--prune=now"]);
+    let gone = Command::new("git")
+        .args(["cat-file", "-e", &head])
+        .current_dir(&f.dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(!gone, "the old HEAD should be gone from the original");
+
+    let bundle = export_objects(&c, &m).unwrap();
+    let exec = import_objects(&c, &fresh, &bundle, &m).unwrap();
+    git(&fresh, &["checkout", "-q", "--detach", &exec]);
+    assert_eq!(
+        std::fs::read(fresh.join("untracked.txt")).unwrap(),
+        b"new\n"
+    );
+    git(&fresh, &["cat-file", "-e", &head]);
+}
+
+#[test]
+fn a_dirty_submodule_comes_along_in_the_bundle_and_a_worker_can_build_the_workspace() {
+    let f = with_submodule();
+    let c = f.ctx();
+    std::fs::write(f.dir.join("vendor/lib/lib.txt"), "lib, edited\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let sub = m.submodules[0].clone();
+    assert!(sub.dirty);
+    let sub_m = ObjectStore::open(f.home.join("sources"))
+        .unwrap()
+        .load_manifest(sub.source_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+
+    let tmp = f.dir.parent().unwrap().to_path_buf();
+    git(&tmp, &["clone", "-q", f.dir.to_str().unwrap(), "worker"]);
+    let worker = tmp.join("worker");
+    let bundle = export_objects(&c, &m).unwrap();
+    let exec = import_objects(&c, &worker, &bundle, &m).unwrap();
+    // the gitlink names a commit of the edited submodule, and it is here
+    let line = git_out(&worker, &["ls-tree", &exec, "vendor/lib"]);
+    let gitlink = line.split_whitespace().nth(2).unwrap().to_string();
+    assert_ne!(gitlink, sub.revision);
+    assert_eq!(Some(gitlink.clone()), sub_m.execution_commit);
+    git(
+        &worker,
+        &["cat-file", "-e", &format!("{gitlink}^{{commit}}")],
+    );
+    assert_eq!(
+        git_out(&worker, &["rev-parse", &format!("{gitlink}^{{tree}}")]),
+        sub_m.worktree_tree.clone().unwrap()
+    );
+
+    let wt = f.home.join("wt");
+    local_ci::source::add_worktree(
+        &c,
+        &ObjectStore::open(f.home.join("sources")).unwrap(),
+        &worker,
+        &wt,
+        &m,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(wt.join("vendor/lib/lib.txt")).unwrap(),
+        b"lib, edited\n"
+    );
+    assert_eq!(std::fs::read(wt.join("a.txt")).unwrap(), b"a\n");
+
+    // without the submodule's manifest the bundle would be incomplete: refuse
+    let mf = f
+        .home
+        .join("sources/manifests")
+        .join(format!("{}.json", sub.source_id.as_ref().unwrap()));
+    std::fs::remove_file(mf).unwrap();
+    assert!(export_objects(&c, &m).is_err());
+}
+
+#[test]
+fn a_change_inside_a_submodule_while_the_superproject_is_read_is_noticed() {
+    let f = with_submodule();
+    let c = f.ctx();
+    let file = f.dir.join("vendor/lib/lib.txt");
+    let calls = Arc::new(AtomicU32::new(0));
+    let n = calls.clone();
+    let mut o = opts();
+    o.hook = hook(move |s| {
+        if let Stage::AfterRead(attempt) = s {
+            n.fetch_add(1, Ordering::SeqCst);
+            if attempt == 1 {
+                std::fs::write(&file, "changed in the submodule\n").unwrap();
+            }
+        }
+        Ok(())
+    });
+    let m = capture_source(&c, &f.dir, &o).unwrap().manifest;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(m.submodules[0].dirty);
+    let dest = f.home.join("ws");
+    materialize_source(&c, &m, &dest).unwrap();
+    assert_eq!(
+        std::fs::read(dest.join("vendor/lib/lib.txt")).unwrap(),
+        b"changed in the submodule\n"
+    );
+
+    // and a submodule that never settles is SOURCE_BUSY
+    let f = with_submodule();
+    let file = f.dir.join("vendor/lib/lib.txt");
+    let err = busy_with(&f, move |n| {
+        std::fs::write(&file, format!("v{n}\n")).unwrap()
+    });
+    assert!(
+        matches!(
+            err.downcast_ref::<SourceError>(),
+            Some(SourceError::Busy { .. })
+        ),
+        "{err:#}"
+    );
 }
