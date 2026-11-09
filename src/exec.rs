@@ -1586,6 +1586,7 @@ impl<'a> Runner<'a> {
             ) {
                 Ok(r) => {
                     for o in r.outcomes {
+                        inputs.run_cancelled |= o.status == JobStatus::Cancelled;
                         inputs.needs.insert(o.job.clone(), o);
                     }
                     jobs.extend(r.jobs);
@@ -1688,12 +1689,22 @@ impl<'a> Runner<'a> {
         let mut outcomes = Vec::new();
         for id in &task.jobs {
             let job = self.plan.job(wi, id);
+            // `failure()` of a job: a job it needs, or one of theirs, failed
+            let ancestor_failed = job.needs.iter().any(|n| {
+                outcomes
+                    .iter()
+                    .find(|o: &&JobOutcome| &o.job == n)
+                    .or_else(|| inputs.needs.get(n))
+                    .is_some_and(JobOutcome::failed_or_ancestor_failed)
+            });
             let results = self.run_job(
                 ws,
                 w,
                 &sel.event,
                 job,
                 &needs_ctx,
+                ancestor_failed,
+                inputs.run_cancelled || self.ctx.cancel.is_cancelled(),
                 places.get(id).unwrap_or(&none),
                 locked,
                 only,
@@ -1710,8 +1721,13 @@ impl<'a> Runner<'a> {
                     status: JobStatus::Success,
                     outputs: Default::default(),
                     skipped: None,
+                    ancestor_failed: false,
                 }),
                 None => combine(id, parts),
+            };
+            let outcome = JobOutcome {
+                ancestor_failed,
+                ..outcome
             };
             needs_ctx.insert(id.clone(), task::ctx_of(&outcome));
             jobs.extend(results.into_iter().map(|r| r.0));
@@ -1734,6 +1750,10 @@ impl<'a> Runner<'a> {
         event: &str,
         job: &Job,
         needs: &Map<String, Value>,
+        // a job it needs, or one of theirs, failed
+        ancestor_failed: bool,
+        // the run was cancelled
+        run_cancelled: bool,
         // steps (by index) the task's setup already did
         prepared: &HashSet<usize>,
         // the unit holds the per-repository lock
@@ -1785,16 +1805,33 @@ impl<'a> Runner<'a> {
             .iter()
             .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
             .collect();
-        let result_of = |v: &Value| v["result"].as_str().unwrap_or("success").to_string();
-        let needs_status = if needs_of_job
+        // The status functions of a job, as on GitHub: `success()` when every
+        // job it needs succeeded (a skipped one does not count), `failure()`
+        // when one failed, or any job further up did, `cancelled()` when the
+        // run was cancelled.
+        let results: Vec<String> = needs_of_job
             .values()
-            .any(|v| matches!(result_of(v).as_str(), "failure" | "skipped"))
-        {
-            Status::Failure
-        } else if needs_of_job.values().any(|v| result_of(v) == "cancelled") {
-            Status::Cancelled
-        } else {
-            Status::Success
+            .map(|v| v["result"].as_str().unwrap_or("success").to_string())
+            .collect();
+        let any_result = |r: &str| results.iter().any(|x| x == r);
+        let needs_fns = expr::StatusFns {
+            success: results.iter().all(|r| r == "success"),
+            failure: ancestor_failed || any_result("failure"),
+            cancelled: run_cancelled,
+        };
+        // why a job that is not run by its `if:` is not run
+        let why_not = || {
+            if needs_fns.success || !expr::success_gated(job.cond.as_deref()) {
+                "if: false"
+            } else if any_result("failure") {
+                "needs failed"
+            } else if any_result("cancelled") {
+                "needs cancelled"
+            } else if any_result("skipped") {
+                "needs skipped"
+            } else {
+                "if: false"
+            }
         };
         let mut ctx_map = Map::new();
         ctx_map.insert("github".into(), gh.clone());
@@ -1858,7 +1895,7 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let run_it = {
-                let ctx = Ctx::new(&cm, needs_status);
+                let ctx = Ctx::with_fns(&cm, needs_fns);
                 expr::condition(job.cond.as_deref(), &ctx)
             };
             match run_it {
@@ -1866,14 +1903,7 @@ impl<'a> Runner<'a> {
                     todo.push((out.len(), cm, display));
                     out.push(None);
                 }
-                Ok(false) => out.push(Some(skip(
-                    display,
-                    if needs_status == Status::Failure {
-                        "needs failed".into()
-                    } else {
-                        "if: false".into()
-                    },
-                ))),
+                Ok(false) => out.push(Some(skip(display, why_not().into()))),
                 Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
             }
         }

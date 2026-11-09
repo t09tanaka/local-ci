@@ -464,7 +464,7 @@ fn tasks_run_one_by_one_in_checkouts_of_their_own_give_what_the_fixture_says() {
 
     // what each job came to, as the jobs after it saw it: needs.<id>.result,
     // its outputs, and why it did not run
-    let out = |job: &str, status, outputs: &[(&str, &str)], skipped: Option<&str>| {
+    let out_up = |job: &str, status, outputs: &[(&str, &str)], skipped: Option<&str>, up: bool| {
         (
             job.to_string(),
             JobOutcome {
@@ -476,17 +476,22 @@ fn tasks_run_one_by_one_in_checkouts_of_their_own_give_what_the_fixture_says() {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 skipped: skipped.map(String::from),
+                ancestor_failed: up,
             },
         )
     };
+    let out = |job: &str, status, outputs: &[(&str, &str)], skipped: Option<&str>| {
+        out_up(job, status, outputs, skipped, false)
+    };
+    // `up`: a job it needs, directly or not, failed
     use JobStatus::*;
     let want_needs: BTreeMap<String, JobOutcome> = [
         out("prep", Success, &[("v", "hello")], None),
         out("use", Success, &[], None),
         out("broken", Failure, &[], None),
-        out("after_broken", Skipped, &[], Some("needs failed")),
-        out("cleanup", Success, &[], None),
-        out("only_on_failure", Success, &[], None),
+        out_up("after_broken", Skipped, &[], Some("needs failed"), true),
+        out_up("cleanup", Success, &[], None, true),
+        out_up("only_on_failure", Success, &[], None, true),
         out("only_on_success", Skipped, &[], Some("if: false")),
         out("m", Success, &[("o", "3")], None),
         out("gather", Success, &[], None),
@@ -512,6 +517,7 @@ fn matrix_outputs_follow_the_matrix_whatever_order_the_variants_finish_in() {
         status: JobStatus::Success,
         outputs: [("o".to_string(), format!("v{i}"))].into(),
         skipped: None,
+        ancestor_failed: false,
     };
     let a = local_ci::aggregate_matrix(&node, &[part(0), part(1), part(2)]).unwrap();
     let b = local_ci::aggregate_matrix(&node, &[part(2), part(0), part(1)]).unwrap();
@@ -534,9 +540,11 @@ fn a_task_reads_needs_outputs_and_results_from_its_inputs() {
                 status,
                 outputs: [("v".to_string(), v.to_string())].into(),
                 skipped: None,
+                ancestor_failed: false,
             },
         )]
         .into(),
+        ..Default::default()
     };
     // the output the caller gives is the one the step sees
     let ok = lab
@@ -564,19 +572,15 @@ const RESULTS: &str = "  prep:\n    runs-on: x\n    steps:\n      - run: echo pr
 
 /// The inputs of a task that needs `prep`, which ended as `status`.
 fn prep_as(status: JobStatus) -> TaskInputs {
-    TaskInputs {
-        needs: [(
-            "prep".to_string(),
-            JobOutcome {
-                job: "prep".into(),
-                variant: None,
-                status,
-                outputs: BTreeMap::new(),
-                skipped: None,
-            },
-        )]
-        .into(),
-    }
+    let prep = JobOutcome {
+        job: "prep".into(),
+        variant: None,
+        status,
+        outputs: BTreeMap::new(),
+        skipped: None,
+        ancestor_failed: false,
+    };
+    TaskInputs::new([&prep], [&prep], false)
 }
 
 #[test]
@@ -647,10 +651,9 @@ fn a_job_cancelled_while_it_runs_is_cancelled_for_the_jobs_after_it() {
     assert!(slow.jobs[0].cancelled);
     assert_eq!(slow.outcomes[0].status, JobStatus::Cancelled);
 
-    // the jobs after it, in a context that is not cancelled
-    let inputs = TaskInputs {
-        needs: [("slow".to_string(), slow.outcomes[0].clone())].into(),
-    };
+    // the jobs after it: the run was cancelled, so cancelled() holds
+    let inputs = TaskInputs::new(&slow.outcomes, &slow.outcomes, false);
+    assert!(inputs.run_cancelled);
     let f = lab.run(&id("on_failure"), &inputs).unwrap();
     assert_eq!(f.outcomes[0].status, JobStatus::Skipped);
     assert_eq!(f.outcomes[0].skipped.as_deref(), Some("if: false"));
@@ -668,6 +671,7 @@ fn a_matrix_is_as_failed_as_its_worst_entry_then_as_cancelled() {
         status,
         outputs: BTreeMap::new(),
         skipped: None,
+        ancestor_failed: false,
     };
     use JobStatus::*;
     let of = |a, b, c| {
@@ -896,4 +900,295 @@ fn a_fresh_attempt_is_not_cancelled_with_the_one_it_came_from() {
     assert!(a.cancel.is_cancelled());
     assert!(!b.cancel.is_cancelled());
     assert_eq!(a.env(), b.env());
+}
+// ---- status functions and `needs` as GitHub reads them ----
+
+/// What a job came to: its status and why it did not run.
+type Came = (JobStatus, Option<String>);
+
+fn came(status: JobStatus, why: Option<&str>) -> Came {
+    (status, why.map(String::from))
+}
+
+impl Lab {
+    /// The tasks one by one, each given only the outcomes of the jobs it needs
+    /// directly (what a coordinator that placed them on other hosts would hand
+    /// over).
+    fn run_distributed(&mut self) -> BTreeMap<String, Came> {
+        let tasks = self.fp.tasks.clone();
+        let mut done: BTreeMap<String, JobOutcome> = BTreeMap::new();
+        let mut pending: BTreeMap<String, Vec<JobOutcome>> = BTreeMap::new();
+        let mut i = 0;
+        while i < tasks.len() {
+            let mut batch = vec![&tasks[i]];
+            while i + batch.len() < tasks.len()
+                && tasks[i].variant.is_some()
+                && tasks[i + batch.len()].variant.as_ref().map(|v| &v.group)
+                    == tasks[i].variant.as_ref().map(|v| &v.group)
+            {
+                batch.push(&tasks[i + batch.len()]);
+            }
+            i += batch.len();
+            for t in batch {
+                let direct: Vec<&JobOutcome> = tasks
+                    .iter()
+                    .filter(|d| t.depends_on.contains(&d.id))
+                    .flat_map(|d| d.jobs.iter())
+                    .filter(|j| !t.jobs.contains(j))
+                    .filter_map(|j| done.get(j))
+                    .collect();
+                let inputs = TaskInputs::new(direct, done.values(), false);
+                let r = self.run(&t.id, &inputs).unwrap();
+                for o in r.outcomes {
+                    match &t.variant {
+                        Some(v) => pending.entry(v.group.clone()).or_default().push(o),
+                        None => {
+                            done.insert(o.job.clone(), o);
+                        }
+                    }
+                }
+            }
+            for (group, parts) in std::mem::take(&mut pending) {
+                let node = self.fp.graph.node(&group).unwrap();
+                let whole = local_ci::aggregate_matrix(node, &parts).unwrap();
+                done.insert(whole.job.clone(), whole);
+            }
+        }
+        done.into_iter()
+            .map(|(k, o)| (k, (o.status, o.skipped)))
+            .collect()
+    }
+
+    /// The whole plan in one local run: how each job (a matrix as a whole,
+    /// from its entries) ended.
+    fn run_local(&self) -> BTreeMap<String, Came> {
+        let c = ctx(self.tmp.path());
+        let cache = self.tmp.path().join("local");
+        let wt = cache.join("wt/all");
+        local_ci::git::add_worktree(&c, &self.dir, &wt, &self.fp.source.sha).unwrap();
+        let ws = local_ci::exec::Workspace {
+            root: wt,
+            repo_root: self.dir.clone(),
+            run_dir: cache.join("runs/all"),
+            tools: cache.join("wt/all.tools"),
+            lock_file: cache.join("locks/all.lock"),
+        };
+        std::fs::create_dir_all(&ws.run_dir).unwrap();
+        std::fs::create_dir_all(cache.join("locks")).unwrap();
+        let opts = local_ci::exec::Opts {
+            parallel: 2,
+            canirun: None,
+            portool: None,
+            containers: 1,
+            job_timeout_min: 5.0,
+            keep: false,
+            trash: cache.join("trash"),
+        };
+        let r = local_ci::execute_plan(&c, &self.fp, &ws, opts).unwrap();
+        let mut parts: BTreeMap<String, Vec<JobOutcome>> = BTreeMap::new();
+        for j in r.units.iter().flat_map(|u| u.jobs.iter()) {
+            let (status, skipped) = match &j.outcome {
+                Outcome::Pass => (JobStatus::Success, None),
+                Outcome::Fail | Outcome::Error(_) => (JobStatus::Failure, None),
+                Outcome::Skip(why) => (JobStatus::Skipped, Some(why.clone())),
+            };
+            let variant = Some(parts.get(&j.job).map_or(0, Vec::len));
+            parts.entry(j.job.clone()).or_default().push(JobOutcome {
+                job: j.job.clone(),
+                variant,
+                status,
+                outputs: BTreeMap::new(),
+                skipped,
+                ancestor_failed: false,
+            });
+        }
+        parts
+            .into_iter()
+            .map(|(k, p)| {
+                let whole = if p.len() == 1 {
+                    p[0].clone()
+                } else {
+                    let node = self.fp.graph.node(&id(&k)).unwrap();
+                    local_ci::aggregate_matrix(node, &p).unwrap()
+                };
+                (k, (whole.status, whole.skipped))
+            })
+            .collect()
+    }
+}
+
+/// The jobs of `jobs` come to `want`, in a local run and task by task alike.
+fn check_both(jobs: &str, want: &[(&str, JobStatus, Option<&str>)]) {
+    let mut lab = Lab::new(jobs);
+    let want: BTreeMap<String, Came> = want
+        .iter()
+        .map(|(j, s, w)| (j.to_string(), came(*s, *w)))
+        .collect();
+    let pick = |got: BTreeMap<String, Came>| -> BTreeMap<String, Came> {
+        got.into_iter()
+            .filter(|(k, _)| want.contains_key(k))
+            .collect()
+    };
+    assert_eq!(pick(lab.run_distributed()), want, "task by task");
+    assert_eq!(pick(lab.run_local()), want, "local run");
+}
+
+fn step(job: &str, needs: &str, cond: &str, run: &str) -> String {
+    let needs = if needs.is_empty() {
+        String::new()
+    } else {
+        format!("    needs: [{needs}]\n")
+    };
+    let cond = if cond.is_empty() {
+        String::new()
+    } else {
+        format!("    if: {cond}\n")
+    };
+    format!("  {job}:\n{needs}{cond}    runs-on: x\n    steps:\n      - run: {run}\n")
+}
+
+#[test]
+fn a_failure_function_is_not_true_after_a_job_that_was_only_skipped() {
+    // p is skipped on a pull request; n needs it and asks failure(): nothing failed
+    let jobs = [
+        step("p", "", "github.event_name == 'push'", "echo p"),
+        step("n", "p", "failure()", "echo notify"),
+        step("d", "p", "", "echo d"),
+        step("al", "p", "always()", "echo al"),
+        step("ok", "p", "needs.p.result == 'skipped'", "echo ok"),
+    ]
+    .concat();
+    use JobStatus::*;
+    check_both(
+        &jobs,
+        &[
+            ("p", Skipped, Some("if: false")),
+            ("n", Skipped, Some("if: false")),
+            ("d", Skipped, Some("needs skipped")),
+            ("al", Success, None),
+            // an explicit condition without a status function is still gated by success()
+            ("ok", Skipped, Some("needs skipped")),
+        ],
+    );
+}
+
+#[test]
+fn failure_looks_through_a_skipped_job_to_the_failure_above_it() {
+    // a fails; b is skipped for it; c asks failure(): GitHub says true
+    let jobs = [
+        step("a", "", "", "exit 1"),
+        step("b", "a", "", "echo b"),
+        step("c", "b", "failure()", "echo c"),
+        step("d", "b", "", "echo d"),
+        step("e", "b", "success()", "echo e"),
+        step("f", "b", "always()", "echo f"),
+        step("g", "b", "cancelled()", "echo g"),
+        step("h", "a", "failure()", "echo h"),
+    ]
+    .concat();
+    use JobStatus::*;
+    check_both(
+        &jobs,
+        &[
+            ("a", Failure, None),
+            ("b", Skipped, Some("needs failed")),
+            ("c", Success, None),
+            ("d", Skipped, Some("needs skipped")),
+            ("e", Skipped, Some("needs skipped")),
+            ("f", Success, None),
+            ("g", Skipped, Some("if: false")),
+            ("h", Success, None),
+        ],
+    );
+}
+
+#[test]
+fn a_partly_failed_matrix_is_failed_for_the_jobs_after_it() {
+    let m = "  m:\n    runs-on: x\n    strategy:\n      fail-fast: false\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - run: test ${{ matrix.n }} != 2\n";
+    let jobs = [
+        m.to_string(),
+        step("after", "m", "", "echo after"),
+        step("on_fail", "m", "failure()", "echo f"),
+        step("on_ok", "m", "success()", "echo ok"),
+        step("then", "on_fail", "", "echo then"),
+        step("late", "after", "failure()", "echo late"),
+    ]
+    .concat();
+    use JobStatus::*;
+    check_both(
+        &jobs,
+        &[
+            ("m", Failure, None),
+            ("after", Skipped, Some("needs failed")),
+            ("on_fail", Success, None),
+            ("on_ok", Skipped, Some("needs failed")),
+            // on_fail ran, so it is a success for `then`, whatever failed above it
+            ("then", Success, None),
+            ("late", Success, None),
+        ],
+    );
+}
+
+#[test]
+fn cancelled_is_the_run_being_cancelled_and_failure_is_not_cancelled() {
+    let mut lab = Lab::new(
+        &[
+            step("a", "", "", "echo a"),
+            step("on_failure", "a", "failure()", "echo f"),
+            step("on_cancelled", "a", "cancelled()", "echo c"),
+            step("on_default", "a", "", "echo d"),
+            step("on_always", "a", "always()", "echo al"),
+        ]
+        .concat(),
+    );
+    let a = |status| JobOutcome {
+        job: "a".into(),
+        variant: None,
+        status,
+        outputs: BTreeMap::new(),
+        skipped: None,
+        ancestor_failed: false,
+    };
+    let run = |lab: &mut Lab, inputs: &TaskInputs, job: &str| {
+        let o = lab.run(&id(job), inputs).unwrap().outcomes.remove(0);
+        (o.status, o.skipped)
+    };
+    use JobStatus::*;
+    // a was cancelled and the run is cancelled
+    let cancelled = TaskInputs::new([&a(Cancelled)], [&a(Cancelled)], false);
+    assert!(cancelled.run_cancelled);
+    assert_eq!(
+        run(&mut lab, &cancelled, "on_failure"),
+        came(Skipped, Some("if: false"))
+    );
+    assert_eq!(
+        run(&mut lab, &cancelled, "on_cancelled"),
+        came(Success, None)
+    );
+    assert_eq!(
+        run(&mut lab, &cancelled, "on_default"),
+        came(Skipped, Some("needs cancelled"))
+    );
+    assert_eq!(run(&mut lab, &cancelled, "on_always"), came(Success, None));
+    // the run was cancelled while a had finished: cancelled() holds all the same
+    let late = TaskInputs::new([&a(Success)], [&a(Success)], true);
+    assert_eq!(run(&mut lab, &late, "on_cancelled"), came(Success, None));
+    assert_eq!(
+        run(&mut lab, &late, "on_failure"),
+        came(Skipped, Some("if: false"))
+    );
+    // a cancelled job alone, with the run not marked cancelled, is not the run being cancelled
+    let alone = TaskInputs {
+        needs: [("a".to_string(), a(Cancelled))].into(),
+        run_cancelled: false,
+    };
+    assert_eq!(
+        run(&mut lab, &alone, "on_cancelled"),
+        came(Skipped, Some("if: false"))
+    );
+    // an ancestor's failure arrives in the outcome of the job between
+    let mut b = a(Skipped);
+    b.ancestor_failed = true;
+    let through = TaskInputs::new([&b], [&b], false);
+    assert_eq!(run(&mut lab, &through, "on_failure"), came(Success, None));
 }

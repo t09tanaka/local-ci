@@ -65,6 +65,17 @@
   the keys with `[setup] ignore-env = ["DATABASE_URL"]` in `.local-ci.toml`;
   the install still runs with the first job's value. `local-ci plan` lists the
   setup it could not work out instead of leaving it out.
+- Job-level `success()`, `failure()`, `cancelled()` and `always()` and
+  `needs` now follow GitHub. A job without a status function is skipped unless
+  every job it needs succeeded; a skipped job does not count as a failure, so
+  `if: failure()` after a job that was only skipped no longer runs (it ran
+  before). `failure()` is true when a job it needs failed or any job above that
+  did, also through jobs that were skipped for it. `cancelled()` is true when
+  the run was cancelled, not when a job it needs was. A skipped job says why:
+  `needs failed`, `needs cancelled`, `needs skipped` or `if: false`. Library:
+  `JobOutcome` has `ancestor_failed`, `TaskInputs` has `run_cancelled` (both
+  default to false when missing), and `TaskInputs::new` builds the inputs of a
+  task from the outcomes finished so far.
 
 ## 0.7.0
 

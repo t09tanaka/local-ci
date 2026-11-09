@@ -64,6 +64,19 @@ pub struct JobOutcome {
     /// Why the job did not run (an `if:` that was false, `needs failed`,
     /// `fail-fast`, `cancelled`, ...).
     pub skipped: Option<String>,
+    /// A job this one needs, directly or through the jobs it needs, failed
+    /// (this job's own failure is `status`). This is what `failure()` of a job
+    /// asks, together with the status of the jobs it needs directly; carrying it
+    /// in each outcome lets a coordinator hand a task only the direct needs.
+    #[serde(default)]
+    pub ancestor_failed: bool,
+}
+
+impl JobOutcome {
+    /// This job, or a job it needs, failed.
+    pub fn failed_or_ancestor_failed(&self) -> bool {
+        self.status == JobStatus::Failure || self.ancestor_failed
+    }
 }
 
 /// What a task is given about the jobs it needs, by job id. Jobs of the same
@@ -71,9 +84,36 @@ pub struct JobOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskInputs {
     pub needs: BTreeMap<String, JobOutcome>,
+    /// The run was cancelled: what `cancelled()` answers in a job, whether or
+    /// not a job it needs was cancelled. A coordinator sets it for the tasks it
+    /// starts after the run was cancelled; [`TaskInputs::new`] sets it from the
+    /// outcomes it is given.
+    #[serde(default)]
+    pub run_cancelled: bool,
 }
 
 impl TaskInputs {
+    /// The inputs for a task that needs `needs`, from every job finished so far
+    /// (the task takes the jobs it needs by id and ignores the rest).
+    /// `cancel_requested`: the run was cancelled. The run also counts as
+    /// cancelled when any finished job was.
+    pub fn new<'a>(
+        needs: impl IntoIterator<Item = &'a JobOutcome>,
+        finished: impl IntoIterator<Item = &'a JobOutcome>,
+        cancel_requested: bool,
+    ) -> Self {
+        TaskInputs {
+            needs: needs
+                .into_iter()
+                .map(|o| (o.job.clone(), o.clone()))
+                .collect(),
+            run_cancelled: cancel_requested
+                || finished
+                    .into_iter()
+                    .any(|o| o.status == JobStatus::Cancelled),
+        }
+    }
+
     /// The `needs` context the expressions of a job are evaluated against.
     pub(crate) fn context(&self) -> Map<String, Value> {
         self.needs
@@ -126,6 +166,7 @@ pub(crate) fn outcome_of(
             Outcome::Skip(why) => Some(why.clone()),
             _ => None,
         },
+        ancestor_failed: false,
     }
 }
 
@@ -167,6 +208,7 @@ pub(crate) fn combine(job: &str, mut parts: Vec<JobOutcome>) -> JobOutcome {
         } else {
             skipped
         },
+        ancestor_failed: parts.iter().any(|p| p.ancestor_failed),
     }
 }
 

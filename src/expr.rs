@@ -16,16 +16,41 @@ pub enum Status {
     Cancelled,
 }
 
+/// What `success()`, `failure()` and `cancelled()` answer. A step is in one of
+/// the three ([`Status`]); a job may be in none (a job it needs was skipped:
+/// neither `success()` nor `failure()`), and `failure()` there also covers the
+/// failure of any ancestor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusFns {
+    pub success: bool,
+    pub failure: bool,
+    pub cancelled: bool,
+}
+
+impl From<Status> for StatusFns {
+    fn from(s: Status) -> Self {
+        StatusFns {
+            success: s == Status::Success,
+            failure: s == Status::Failure,
+            cancelled: s == Status::Cancelled,
+        }
+    }
+}
+
 pub struct Ctx<'a> {
     /// Top-level contexts: github, env, matrix, steps, needs, job, runner, inputs, vars, strategy.
     pub contexts: &'a Map<String, Value>,
-    pub status: Status,
+    pub status: StatusFns,
     /// Set when the expression touched `secrets.*`.
     pub used_secrets: Cell<bool>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(contexts: &'a Map<String, Value>, status: Status) -> Self {
+        Self::with_fns(contexts, status.into())
+    }
+
+    pub fn with_fns(contexts: &'a Map<String, Value>, status: StatusFns) -> Self {
         Ctx {
             contexts,
             status,
@@ -454,9 +479,9 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
     let a: Vec<Value> = args.iter().map(|e| eval(e, ctx)).collect::<Result<_>>()?;
     let s = |i: usize| a.get(i).map(to_string).unwrap_or_default();
     Ok(match name {
-        "success" => Value::Bool(ctx.status == Status::Success),
-        "failure" => Value::Bool(ctx.status == Status::Failure),
-        "cancelled" => Value::Bool(ctx.status == Status::Cancelled),
+        "success" => Value::Bool(ctx.status.success),
+        "failure" => Value::Bool(ctx.status.failure),
+        "cancelled" => Value::Bool(ctx.status.cancelled),
         "always" => Value::Bool(true),
         // Cache keys only; every cache step is skipped locally.
         "hashfiles" => Value::String(String::new()),
@@ -671,10 +696,20 @@ fn has_status_fn(src: &str) -> bool {
         .any(|f| l.contains(f))
 }
 
+/// Does an `if:` value leave a job to the default `success()` gate, so that it
+/// is skipped when a job it needs did not succeed? False if it calls
+/// `failure()`, `cancelled()` or `always()`.
+pub(crate) fn success_gated(raw: Option<&str>) -> bool {
+    let l = raw.unwrap_or("").to_ascii_lowercase();
+    !["failure(", "cancelled(", "always("]
+        .iter()
+        .any(|f| l.contains(f))
+}
+
 /// Evaluate an `if:` value (with or without `${{ }}`); `None` means the default `success()`.
 pub fn condition(raw: Option<&str>, ctx: &Ctx) -> Result<bool> {
     let raw = match raw {
-        None => return Ok(ctx.status == Status::Success),
+        None => return Ok(ctx.status.success),
         Some(r) => r.trim(),
     };
     let inner = match raw.strip_prefix("${{").and_then(|r| r.strip_suffix("}}")) {
@@ -683,13 +718,13 @@ pub fn condition(raw: Option<&str>, ctx: &Ctx) -> Result<bool> {
         _ => raw.to_string(),
     };
     if inner.is_empty() {
-        return Ok(ctx.status == Status::Success);
+        return Ok(ctx.status.success);
     }
     let v = truthy(&evaluate(&inner, ctx)?);
     if has_status_fn(&inner) {
         Ok(v)
     } else {
-        Ok(ctx.status == Status::Success && v)
+        Ok(ctx.status.success && v)
     }
 }
 
