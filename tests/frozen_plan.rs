@@ -96,7 +96,7 @@ fn a_frozen_plan_survives_json_and_keeps_its_digest() {
     // a changed plan no longer matches its digest
     let tampered = text.replace("echo hi", "echo bye");
     assert!(FrozenPlan::from_json(&tampered).is_err());
-    let newer = text.replace("\"schema_version\":1", "\"schema_version\":2");
+    let newer = text.replace("\"schema_version\":2", "\"schema_version\":3");
     assert!(FrozenPlan::from_json(&newer).is_err());
 }
 

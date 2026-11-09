@@ -10,6 +10,20 @@
   handle). Process and container tracking for cancelling moved from
   process-global statics into the context's `CancelHandle`, so concurrent runs
   do not stop each other. No change to the command line.
+- Library: a plan is cut into a job graph (`needs` as edges; a matrix as one
+  node per variant plus the node later jobs depend on) and tasks that can be
+  placed on a host: a job, or a matrix variant, each in a checkout of its own,
+  except jobs that write the same files, which stay one task with the reason
+  recorded. `execute_task` runs one task from the results and outputs of the
+  jobs it needs (`TaskInputs`) and returns a `TaskResult`; a matrix job's
+  outputs are merged in matrix order, not in the order the variants finish.
+  The plan carries its own wire types (`wire`, schema version 2) instead of the
+  engine's, and records the disabled-workflow list it was made with;
+  `build_frozen_plan_with` takes that list so planning needs no network.
+  `ExecContext` is no longer `Clone` (`fresh_attempt` makes a second one), and
+  the docker, compose and python commands run with the context's environment.
+  A workflow with a dependency cycle or a `needs` of a job that does not exist
+  is now an error at planning. No other change to the command line.
 
 ## 0.7.0
 

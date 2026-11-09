@@ -82,12 +82,13 @@ impl CancelHandle {
 
     /// Take down what this attempt still has up: compose projects, then
     /// containers.
-    pub(crate) fn remove_containers(&self) {
+    pub(crate) fn remove_containers(&self, ctx: &ExecContext) {
         let projects: Vec<String> = self.0.compose_projects.lock().unwrap().drain(..).collect();
-        crate::exec::compose_down(&projects);
+        crate::exec::compose_down(ctx, &projects);
         let names: Vec<String> = self.0.containers.lock().unwrap().drain(..).collect();
         if !names.is_empty() {
-            let _ = Command::new("docker")
+            let _ = ctx
+                .command("docker")
                 .arg("rm")
                 .arg("-f")
                 .args(&names)
@@ -99,7 +100,6 @@ impl CancelHandle {
 }
 
 /// The environment and the cancel handle of one attempt.
-#[derive(Clone)]
 pub struct ExecContext {
     env: BTreeMap<String, String>,
     /// Stops this attempt; see [`CancelHandle`].
@@ -115,6 +115,24 @@ impl ExecContext {
             env,
             cancel: CancelHandle::new(),
         }
+    }
+
+    /// The same environment with a handle of its own: for a second attempt
+    /// that must not be cancelled with this one. (Not `Clone`: a plain clone
+    /// would share the handle and so the cancellation.)
+    pub fn fresh_attempt(&self) -> Self {
+        ExecContext {
+            env: self.env.clone(),
+            cancel: CancelHandle::new(),
+        }
+    }
+
+    /// A command that sees exactly this context's environment (not the
+    /// process's).
+    pub(crate) fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut c = Command::new(program);
+        c.env_clear().envs(&self.env);
+        c
     }
 
     pub fn env(&self) -> &BTreeMap<String, String> {

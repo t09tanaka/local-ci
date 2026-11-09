@@ -252,7 +252,7 @@ pub fn written_files(wd: &str, run: &str) -> BTreeSet<String> {
 
 /// What a job writes that another job of the workflow might also write:
 /// build output directories (as `build:<dir>`) and files its scripts create.
-fn writes(w: &Workflow, j: &Job) -> BTreeSet<String> {
+pub(crate) fn writes(w: &Workflow, j: &Job) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for s in &j.steps {
         let Some(r) = s.run.as_deref() else { continue };

@@ -1,10 +1,12 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
 use crate::context::ExecContext;
+use crate::dag::ExecutionTask;
 use crate::expr::{self, Ctx, Status};
 use crate::frozen::FrozenPlan;
 use crate::matrix;
-use crate::plan::{self, Unit};
+use crate::plan::{self, Plan, Unit};
+use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, TaskResult};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -24,8 +26,9 @@ use std::time::{Duration, Instant};
 /// killed before it cleaned up left its database behind on the service's
 /// declared port, and later runs could not bind it. A container is named
 /// `local-ci-<pid>-<n>` by the run that started it.
-pub(crate) fn remove_orphan_containers() {
-    let Ok(out) = Command::new("docker")
+pub(crate) fn remove_orphan_containers(ctx: &ExecContext) {
+    let Ok(out) = ctx
+        .command("docker")
         .args([
             "ps",
             "-a",
@@ -45,7 +48,8 @@ pub(crate) fn remove_orphan_containers() {
         .map(String::from)
         .collect();
     if !names.is_empty() {
-        let _ = Command::new("docker")
+        let _ = ctx
+            .command("docker")
             .args(["rm", "-f"])
             .args(&names)
             .stdout(Stdio::null())
@@ -205,6 +209,8 @@ pub struct Workspace {
 pub struct Runner<'a> {
     pub ctx: &'a ExecContext,
     pub fp: &'a FrozenPlan,
+    /// The engine's view of the plan, worked out once from `fp`.
+    pub plan: Plan,
     pub repo_root: PathBuf,
     pub wt: PathBuf,
     pub run_dir: PathBuf,
@@ -216,6 +222,7 @@ pub struct Runner<'a> {
     seq: AtomicUsize,
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
+    docker_ok: OnceLock<Result<(), String>>,
 }
 
 fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
@@ -466,16 +473,18 @@ fn compose_globals(args: &str) -> &str {
 }
 
 /// `docker compose -p <name> down` for each project that still has containers.
-pub(crate) fn compose_down(projects: &[String]) {
+pub(crate) fn compose_down(ctx: &ExecContext, projects: &[String]) {
     for p in projects {
         let label = format!("label=com.docker.compose.project={p}");
-        let has = Command::new("docker")
+        let has = ctx
+            .command("docker")
             .args(["ps", "-aq", "--filter", &label])
             .output()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
         if has {
-            let _ = Command::new("docker")
+            let _ = ctx
+                .command("docker")
                 .args(["compose", "-p", p, "down", "--remove-orphans"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -748,6 +757,7 @@ impl<'a> Runner<'a> {
         Runner {
             ctx,
             fp,
+            plan: fp.to_plan(),
             repo_root: ws.repo_root.clone(),
             wt: ws.root.clone(),
             run_dir: ws.run_dir.clone(),
@@ -758,6 +768,7 @@ impl<'a> Runner<'a> {
             base_path,
             seq: AtomicUsize::new(0),
             synced: Mutex::new(HashSet::new()),
+            docker_ok: OnceLock::new(),
         }
     }
 
@@ -1113,7 +1124,7 @@ impl<'a> Runner<'a> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
         }
-        let wants_pip = self.fp.workflows.iter().any(|s| {
+        let wants_pip = self.plan.selected.iter().any(|s| {
             s.wf.jobs.iter().any(|j| {
                 j.steps.iter().any(|st| {
                     st.run
@@ -1123,7 +1134,9 @@ impl<'a> Runner<'a> {
             })
         });
         if wants_pip {
-            let ok = Command::new("python3")
+            let ok = self
+                .ctx
+                .command("python3")
                 .arg("-m")
                 .arg("venv")
                 .arg(self.tools.join("venv"))
@@ -1143,12 +1156,12 @@ impl<'a> Runner<'a> {
 
     pub fn run_setup(&self) -> Vec<StepResult> {
         let mut out = Vec::new();
-        for (i, s) in self.fp.setup.iter().enumerate() {
+        for (i, s) in self.plan.setup.iter().enumerate() {
             if !s.execute {
                 continue;
             }
-            let sel = &self.fp.workflows[s.wf];
-            let job = self.fp.job(s.wf, &s.job);
+            let sel = &self.plan.selected[s.wf];
+            let job = self.plan.job(s.wf, &s.job);
             let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &job.id);
             let mut env = self.base_env(&gh, &[]);
             for (k, v) in sel
@@ -1210,9 +1223,9 @@ impl<'a> Runner<'a> {
             cv: Condvar::new(),
         };
         let results: Mutex<Vec<(usize, UnitResult)>> = Mutex::new(Vec::new());
-        let isolate = self.fp.units.len() > 1;
+        let isolate = self.plan.units.len() > 1;
         std::thread::scope(|scope| {
-            for (i, u) in self.fp.units.iter().enumerate() {
+            for (i, u) in self.plan.units.iter().enumerate() {
                 let sem = &sem;
                 let results = &results;
                 scope.spawn(move || {
@@ -1229,9 +1242,9 @@ impl<'a> Runner<'a> {
                         parallel: t0.elapsed().as_secs_f64() - locked_at,
                     };
                     let r = if isolate && !self.ctx.cancel.is_cancelled() {
-                        self.run_unit_in_copy(i + 1, u, waited)
+                        self.run_unit_in_copy(i, u, waited)
                     } else {
-                        self.run_unit(u, waited, &self.wt)
+                        self.run_unit(i, u, waited, &self.wt)
                     };
                     sem.release();
                     drop(lock);
@@ -1244,7 +1257,7 @@ impl<'a> Runner<'a> {
         r.into_iter().map(|(_, u)| u).collect()
     }
 
-    fn lock(&self) -> Result<File> {
+    pub(crate) fn lock(&self) -> Result<File> {
         use fs2::FileExt;
         let f = OpenOptions::new()
             .create(true)
@@ -1271,7 +1284,7 @@ impl<'a> Runner<'a> {
             && (!self.isolated()
                 || u.jobs
                     .iter()
-                    .any(|id| !self.fp.job(u.wf, id).services.is_empty()))
+                    .any(|id| !self.plan.job(u.wf, id).services.is_empty()))
     }
 
     /// One of the `--containers` slots, shared by every `local-ci` run on the
@@ -1357,7 +1370,8 @@ impl<'a> Runner<'a> {
     /// Run the unit in its own copy of the worktree, as each GitHub job gets its
     /// own checkout: a unit that edits tracked files for a while (a negative
     /// control, a formatter) must not change what the units beside it read.
-    fn run_unit_in_copy(&self, n: usize, u: &Unit, waited: UnitWait) -> UnitResult {
+    fn run_unit_in_copy(&self, ui: usize, u: &Unit, waited: UnitWait) -> UnitResult {
+        let n = ui + 1;
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
@@ -1371,11 +1385,11 @@ impl<'a> Runner<'a> {
                 let copy_secs = t0.elapsed().as_secs_f64();
                 UnitResult {
                     copy_secs: Some(copy_secs),
-                    ..self.run_unit(u, waited, &ws)
+                    ..self.run_unit(ui, u, waited, &ws)
                 }
             }
             Err(e) => {
-                let w = &self.fp.workflows[u.wf].wf;
+                let w = &self.plan.selected[u.wf].wf;
                 let reason = format!("cannot copy the worktree: {e:#}");
                 let mut jobs: Vec<JobResult> = u
                     .jobs
@@ -1383,7 +1397,7 @@ impl<'a> Runner<'a> {
                     .map(|id| JobResult {
                         workflow: w.file.clone(),
                         job: id.clone(),
-                        display: self.fp.job(u.wf, id).name.clone().unwrap_or(id.clone()),
+                        display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
                         outcome: Outcome::Error(reason.clone()),
                         secs: 0.0,
                         steps: vec![],
@@ -1417,37 +1431,41 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn run_unit(&self, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
-        let sel = &self.fp.workflows[u.wf];
-        let w = &sel.wf;
-        let mut needs_ctx = Map::new();
-        let mut jobs = Vec::new();
+    fn run_unit(&self, ui: usize, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
+        let w = &self.plan.selected[u.wf].wf;
         let locked = self.unit_locked(u);
-        for id in &u.jobs {
-            let job = self.fp.job(u.wf, id);
-            let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked);
-            let failed = job_results
-                .iter()
-                .any(|r| r.0.outcome == Outcome::Fail || matches!(r.0.outcome, Outcome::Error(_)));
-            let all_skipped = !job_results.is_empty()
-                && job_results
-                    .iter()
-                    .all(|r| matches!(r.0.outcome, Outcome::Skip(_)));
-            let result = if failed {
-                "failure"
-            } else if all_skipped {
-                "skipped"
-            } else {
-                "success"
-            };
-            let mut outputs = Map::new();
-            for (_, o) in &job_results {
-                for (k, v) in o {
-                    outputs.insert(k.clone(), v.clone());
+        // The unit is run as its tasks, in the order the plan gives them, in
+        // the one workspace of the unit (a local run's shortcut: a task run
+        // elsewhere gets a checkout of its own). The variants of a matrix job
+        // are run together, as the job.
+        let mut inputs = TaskInputs::default();
+        let mut jobs = Vec::new();
+        for task in self.fp.tasks.iter().filter(|t| t.unit == ui) {
+            if task.variant.as_ref().is_some_and(|v| v.index > 0) {
+                continue;
+            }
+            match self.run_task(ws, task, &inputs, locked, true) {
+                Ok(r) => {
+                    for o in r.outcomes {
+                        inputs.needs.insert(o.job.clone(), o);
+                    }
+                    jobs.extend(r.jobs);
+                }
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    for id in &task.jobs {
+                        jobs.push(JobResult {
+                            workflow: w.file.clone(),
+                            job: id.clone(),
+                            display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
+                            outcome: Outcome::Error(reason.clone()),
+                            secs: 0.0,
+                            steps: vec![],
+                            time: None,
+                        });
+                    }
                 }
             }
-            needs_ctx.insert(id.clone(), json!({"result": result, "outputs": outputs}));
-            jobs.extend(job_results.drain(..).map(|r| r.0));
         }
         charge(&mut jobs, waited);
         UnitResult {
@@ -1459,7 +1477,83 @@ impl<'a> Runner<'a> {
         }
     }
 
+    /// Whether a task holds the per-repository lock while it runs (see
+    /// `unit_locked`).
+    pub(crate) fn task_locked(&self, t: &ExecutionTask) -> bool {
+        t.exclusive && (!self.isolated() || !t.services.is_empty())
+    }
+
+    /// Run the jobs of `task` in `ws`, in order, against the results `inputs`
+    /// holds for the jobs it needs. `locked`: the caller holds the repository
+    /// lock. `whole_matrix`: for a task that is one variant of a matrix job,
+    /// run all the variants (as one job) instead.
+    pub(crate) fn run_task(
+        &self,
+        ws: &Path,
+        task: &ExecutionTask,
+        inputs: &TaskInputs,
+        locked: bool,
+        whole_matrix: bool,
+    ) -> Result<TaskResult> {
+        let wi = self
+            .plan
+            .selected
+            .iter()
+            .position(|s| s.wf.file == task.workflow)
+            .with_context(|| format!("the plan has no workflow {}", task.workflow))?;
+        let sel = &self.plan.selected[wi];
+        let w = &sel.wf;
+        for id in &task.jobs {
+            let job = self.plan.job(wi, id);
+            if let Some(n) = job
+                .needs
+                .iter()
+                .find(|n| !task.jobs.contains(n) && !inputs.needs.contains_key(*n))
+            {
+                bail!(
+                    "task {} needs the result of job `{n}`; none was given",
+                    task.id
+                );
+            }
+        }
+        let only = match (&task.variant, whole_matrix) {
+            (Some(v), false) => Some(v.index),
+            _ => None,
+        };
+        let mut needs_ctx = inputs.context();
+        let mut jobs = Vec::new();
+        let mut outcomes = Vec::new();
+        for id in &task.jobs {
+            let job = self.plan.job(wi, id);
+            let results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked, only);
+            let parts: Vec<JobOutcome> = results
+                .iter()
+                .enumerate()
+                .map(|(i, (r, o))| outcome_of(id, only.or(Some(i)), r, o))
+                .collect();
+            let outcome = match only {
+                Some(_) => parts.into_iter().next().unwrap_or_else(|| JobOutcome {
+                    job: id.clone(),
+                    variant: only,
+                    status: JobStatus::Success,
+                    outputs: Default::default(),
+                    skipped: None,
+                }),
+                None => combine(id, parts),
+            };
+            needs_ctx.insert(id.clone(), task::ctx_of(&outcome));
+            jobs.extend(results.into_iter().map(|r| r.0));
+            outcomes.push(outcome);
+        }
+        Ok(TaskResult {
+            task: task.id.clone(),
+            jobs,
+            outcomes,
+        })
+    }
+
     /// One job, all its matrix combinations. Returns each combination's result and outputs.
+    #[allow(clippy::too_many_arguments)]
     fn run_job(
         &self,
         ws: &Path,
@@ -1469,6 +1563,8 @@ impl<'a> Runner<'a> {
         needs: &Map<String, Value>,
         // the unit holds the per-repository lock
         locked: bool,
+        // run only this entry of the matrix
+        only: Option<usize>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
         let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
@@ -1506,8 +1602,14 @@ impl<'a> Runner<'a> {
             .iter()
             .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
             .collect();
-        let needs_status = if needs_of_job.values().any(|v| v["result"] != "success") {
+        let result_of = |v: &Value| v["result"].as_str().unwrap_or("success").to_string();
+        let needs_status = if needs_of_job
+            .values()
+            .any(|v| matches!(result_of(v).as_str(), "failure" | "skipped"))
+        {
             Status::Failure
+        } else if needs_of_job.values().any(|v| result_of(v) == "cancelled") {
+            Status::Cancelled
         } else {
             Status::Success
         };
@@ -1547,7 +1649,7 @@ impl<'a> Runner<'a> {
         let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
         let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for combo in combos {
+        for (idx, combo) in combos.into_iter().enumerate() {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
             let mut display = {
@@ -1566,8 +1668,11 @@ impl<'a> Runner<'a> {
             };
             // a name over some of the matrix only: keep the entries (and their logs) apart
             if !seen.insert(display.clone()) {
-                display = format!("{display} #{}", out.len() + 1);
+                display = format!("{display} #{}", idx + 1);
                 seen.insert(display.clone());
+            }
+            if only.is_some_and(|o| o != idx) {
+                continue;
             }
             let run_it = {
                 let ctx = Ctx::new(&cm, needs_status);
@@ -1914,7 +2019,7 @@ impl<'a> Runner<'a> {
                 continue;
             };
             if let Some(k) = plan::step_key(w, job, s) {
-                if self.fp.is_setup(&k) {
+                if self.plan.is_setup(&k) {
                     push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
                     record(&mut steps_ctx, &s.id, "success", "success", Map::new());
                     continue;
@@ -2168,7 +2273,7 @@ impl<'a> Runner<'a> {
             }
         }
         self.stop_services(&names);
-        compose_down(&projects);
+        compose_down(self.ctx, &projects);
         self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
@@ -2216,7 +2321,7 @@ impl<'a> Runner<'a> {
                 .filter(|v| !v.is_empty())
         };
         let tool = |bin: &str, args: &[&str]| -> Option<String> {
-            let out = Command::new(bin).args(args).output().ok()?;
+            let out = self.ctx.command(bin).args(args).output().ok()?;
             let text = String::from_utf8_lossy(&out.stdout).to_string()
                 + &String::from_utf8_lossy(&out.stderr);
             out.status
@@ -2278,27 +2383,31 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn docker_ok() -> Result<(), String> {
-        static OK: OnceLock<Result<(), String>> = OnceLock::new();
-        OK.get_or_init(|| {
-            match Command::new("docker")
-                .args(["info", "--format", "{{.ServerVersion}}"])
-                .output()
-            {
-                Ok(o) if o.status.success() => Ok(()),
-                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or("docker info failed")
-                    .to_string()),
-                Err(e) => Err(format!("docker: {e}")),
-            }
-        })
-        .clone()
+    fn docker_ok(&self) -> Result<(), String> {
+        self.docker_ok
+            .get_or_init(|| {
+                match self
+                    .ctx
+                    .command("docker")
+                    .args(["info", "--format", "{{.ServerVersion}}"])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("docker info failed")
+                        .to_string()),
+                    Err(e) => Err(format!("docker: {e}")),
+                }
+            })
+            .clone()
     }
 
     fn docker(&self, args: &[&str], timeout: Duration) -> Result<String> {
-        let mut child = Command::new("docker")
+        let mut child = self
+            .ctx
+            .command("docker")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2337,7 +2446,8 @@ impl<'a> Runner<'a> {
         cm: &Map<String, Value>,
         names: &mut Vec<String>,
     ) -> Result<(Vec<PortMap>, Map<String, Value>)> {
-        Self::docker_ok().map_err(|e| anyhow!("docker is not available ({e})"))?;
+        self.docker_ok()
+            .map_err(|e| anyhow!("docker is not available ({e})"))?;
         let ctx = Ctx::new(cm, Status::Success);
         let mut maps = Vec::new();
         let mut sctx = Map::new();
@@ -2424,7 +2534,9 @@ impl<'a> Runner<'a> {
             let mut parts = state.split_whitespace();
             let (run, health) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             if run == "exited" || run == "dead" {
-                let logs = Command::new("docker")
+                let logs = self
+                    .ctx
+                    .command("docker")
                     .args(["logs", "--tail", "15", name])
                     .output()
                     .map(|o| {
@@ -2469,7 +2581,9 @@ impl<'a> Runner<'a> {
         if names.is_empty() {
             return;
         }
-        let _ = Command::new("docker")
+        let _ = self
+            .ctx
+            .command("docker")
             .arg("rm")
             .arg("-f")
             .args(names)

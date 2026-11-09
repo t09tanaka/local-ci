@@ -11,7 +11,10 @@
 //! results cache, the worktree and the saved result.
 
 use crate::context::ExecContext;
-use crate::frozen::{Filters, FrozenConfig, FrozenPlan, PlanParts, SourceRef};
+use crate::frozen::{
+    DisabledRecord, DisabledSource, DisabledWorkflow, Filters, FrozenConfig, FrozenPlan, PlanParts,
+    SourceRef,
+};
 use crate::{cache, config, exec, filter, git, plan, report, workflow};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -83,6 +86,8 @@ pub struct Repo {
     pub link_node_modules: bool,
     /// The directory output leaves off workflow paths (see [`report::Style`]).
     pub default_workflows_dir: String,
+    /// The disabled workflows the plan was made with, and where the list came from.
+    pub disabled: DisabledRecord,
 }
 
 /// Read the repository and work out what `t` triggers. Besides the plan it
@@ -90,6 +95,19 @@ pub struct Repo {
 pub fn resolve(
     ctx: &ExecContext,
     t: &Target,
+    obs: &mut dyn Observer,
+) -> Result<(Repo, plan::Plan)> {
+    resolve_with(ctx, t, None, obs)
+}
+
+/// [`resolve`], with the workflows GitHub does not run given by the caller:
+/// `Some(list)` is taken as is and nothing is asked of `gh` or the network;
+/// `None` asks `gh` (unless the target is `all` or `include_disabled`, which
+/// never ask).
+pub fn resolve_with(
+    ctx: &ExecContext,
+    t: &Target,
+    disabled_list: Option<Vec<DisabledWorkflow>>,
     obs: &mut dyn Observer,
 ) -> Result<(Repo, plan::Plan)> {
     let root = git::toplevel(&t.dir)?;
@@ -125,26 +143,38 @@ pub fn resolve(
     };
     // GitHub does not run workflows that are disabled there; neither does the default mode.
     let mut disabled_skips = Vec::new();
+    let mut record = DisabledRecord::not_checked();
     if !t.all && !t.include_disabled {
-        let disabled = disabled_workflows(ctx, &root);
-        wfs.retain(
-            |w| match disabled.iter().find(|(path, _)| path == &w.file) {
-                Some((_, state)) => {
-                    if t.workflows.is_empty()
-                        || t.workflows
-                            .iter()
-                            .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
-                    {
-                        disabled_skips.push((
-                            w.file.clone(),
-                            format!("{} on GitHub", state.replace('_', " ")),
-                        ));
-                    }
-                    false
-                }
-                None => true,
+        let (source, mut list) = match disabled_list {
+            Some(l) => (DisabledSource::Provided, l),
+            None => match disabled_workflows(ctx, &root) {
+                Some(l) => (DisabledSource::Github, l),
+                None => (DisabledSource::Unavailable, vec![]),
             },
-        );
+        };
+        list.sort();
+        list.dedup();
+        let disabled = list.clone();
+        record = DisabledRecord {
+            source,
+            workflows: list,
+        };
+        wfs.retain(|w| match disabled.iter().find(|d| d.path == w.file) {
+            Some(DisabledWorkflow { state, .. }) => {
+                if t.workflows.is_empty()
+                    || t.workflows
+                        .iter()
+                        .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
+                {
+                    disabled_skips.push((
+                        w.file.clone(),
+                        format!("{} on GitHub", state.replace('_', " ")),
+                    ));
+                }
+                false
+            }
+            None => true,
+        });
     }
     let mut p = plan::build(wfs, &ev, &t.workflows);
     p.skipped.extend(disabled_skips);
@@ -168,6 +198,7 @@ pub fn resolve(
             all: t.all,
             workflow_dirs,
             default_workflows_dir: config.default_workflows_dir().to_string(),
+            disabled: record,
             no_cache: config.no_cache,
             link_node_modules: config.link_node_modules,
         },
@@ -175,18 +206,11 @@ pub fn resolve(
     ))
 }
 
-/// Workflows that are not `active` on GitHub (`disabled_manually`, ...), as (path, state).
-/// Empty when gh or the network is not available.
-fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Vec<(String, String)> {
-    let Some(slug) = git::repo_slug(root) else {
-        return vec![];
-    };
-    if ctx.find_tool("gh").is_none() {
-        return vec![];
-    }
-    let Some(gh) = ctx.find_tool("gh") else {
-        return vec![];
-    };
+/// Workflows that are not `active` on GitHub (`disabled_manually`, ...).
+/// `None` when gh or the network is not available.
+fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Option<Vec<DisabledWorkflow>> {
+    let slug = git::repo_slug(root)?;
+    let gh = ctx.find_tool("gh")?;
     let child = std::process::Command::new(gh)
         .env_clear()
         .envs(ctx.env())
@@ -200,7 +224,7 @@ fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Vec<(String,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn();
-    let Ok(mut child) = child else { return vec![] };
+    let Ok(mut child) = child else { return None };
     let t0 = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -210,23 +234,27 @@ fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Vec<(String,
             }
             _ => {
                 let _ = child.kill();
-                return vec![];
+                return None;
             }
         }
     }
     let Ok(out) = child.wait_with_output() else {
-        return vec![];
+        return None;
     };
     if !out.status.success() {
-        return vec![];
+        return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            l.split_once('\t')
-                .map(|(p, s)| (p.to_string(), s.to_string()))
-        })
-        .collect()
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                l.split_once('\t').map(|(p, s)| DisabledWorkflow {
+                    path: p.to_string(),
+                    state: s.to_string(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Keep only the named jobs and the jobs they need.
@@ -348,7 +376,19 @@ pub fn build_frozen_plan(
     t: &Target,
     obs: &mut dyn Observer,
 ) -> Result<FrozenPlan> {
-    let (repo, p) = resolve(ctx, t, obs)?;
+    build_frozen_plan_with(ctx, t, None, obs)
+}
+
+/// [`build_frozen_plan`] with the disabled workflows given: `Some(list)` plans
+/// without asking `gh` or the network, so the plan depends on its inputs only;
+/// the list and its source are recorded in the plan.
+pub fn build_frozen_plan_with(
+    ctx: &ExecContext,
+    t: &Target,
+    disabled: Option<Vec<DisabledWorkflow>>,
+    obs: &mut dyn Observer,
+) -> Result<FrozenPlan> {
+    let (repo, p) = resolve_with(ctx, t, disabled, obs)?;
     freeze(&repo, p, t)
 }
 
@@ -374,6 +414,7 @@ fn freeze(repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
             workflows: t.workflows.clone(),
             jobs: t.jobs.clone(),
         },
+        disabled: repo.disabled.clone(),
         plan: p,
     })
 }
@@ -413,7 +454,7 @@ pub fn execute_plan(
         };
         Ok((setup, units))
     })();
-    ctx.cancel.remove_containers();
+    ctx.cancel.remove_containers(ctx);
     if !keep {
         runner.release_ports(&ws.root);
     }
@@ -439,6 +480,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let nothing_triggered = full.units.is_empty();
+    let full_plan = full.to_plan();
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
     store.prune(stamp);
@@ -454,11 +496,11 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             &full.config.workflow_dirs,
             &full.config.no_cache,
         ) {
-            Ok(inputs) => full
+            Ok(inputs) => full_plan
                 .units
                 .iter()
                 .map(|u| {
-                    let s = &full.workflows[u.wf];
+                    let s = &full_plan.selected[u.wf];
                     inputs.fingerprint(&s.wf, &s.event, u)
                 })
                 .collect(),
@@ -468,7 +510,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             }
         }
     };
-    let mut p = full.to_plan();
+    let mut p = full_plan;
     let mut reused = Vec::new();
     let mut to_run = Vec::new();
     let mut run_fps = Vec::new();
@@ -510,7 +552,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         std::fs::create_dir_all(cache.join("wt"))?;
         git::add_worktree(&root, &wt, sha)?;
         obs.executing();
-        exec::remove_orphan_containers();
+        exec::remove_orphan_containers(ctx);
         let canirun = if a.no_canirun {
             None
         } else {

@@ -7,15 +7,16 @@
 //! sorted, no whitespace), so the same decisions always give the same digest,
 //! wherever the repository was cloned.
 
-use crate::plan::{self, Plan, Selected, SetupStep, Unit};
-use crate::workflow::Job;
+use crate::dag::{self, ExecutionTask, JobGraph, ShardGroup};
+use crate::plan::Plan;
+use crate::wire::{JobSpec, SetupSpec, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bumped when the shape of a [`FrozenPlan`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// What the plan was made from: a commit and the ref it was compared with.
 /// (Snapshots of uncommitted work are added later.)
@@ -62,6 +63,49 @@ pub struct SkippedWorkflow {
     pub reason: String,
 }
 
+/// A workflow GitHub does not run, as the plan was told.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DisabledWorkflow {
+    /// Path relative to the repository root.
+    pub path: String,
+    /// `disabled_manually`, `disabled_inactivity`, ...
+    pub state: String,
+}
+
+/// Where the list of disabled workflows came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledSource {
+    /// Not asked: every workflow was taken into account (`--all` or
+    /// `--include-disabled`).
+    NotChecked,
+    /// The caller gave the list.
+    Provided,
+    /// `gh api` answered.
+    Github,
+    /// `gh` or the network was not there: nothing counts as disabled.
+    Unavailable,
+}
+
+/// The list of disabled workflows the plan was made with, and its source.
+/// Planning with the same record gives the same plan; the record is how a
+/// plan made with the network can be made again without it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisabledRecord {
+    pub source: DisabledSource,
+    /// Sorted by path.
+    pub workflows: Vec<DisabledWorkflow>,
+}
+
+impl DisabledRecord {
+    pub fn not_checked() -> Self {
+        DisabledRecord {
+            source: DisabledSource::NotChecked,
+            workflows: vec![],
+        }
+    }
+}
+
 /// A plan, fixed. Build one with [`crate::build_frozen_plan`]; run it with
 /// [`crate::execute_plan`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,10 +125,18 @@ pub struct FrozenPlan {
     pub config: FrozenConfig,
     pub filters: Filters,
     /// The workflows that were selected, with the event they run as.
-    pub workflows: Vec<Selected>,
+    pub workflows: Vec<WorkflowSpec>,
     pub skipped: Vec<SkippedWorkflow>,
-    pub units: Vec<Unit>,
-    pub setup: Vec<SetupStep>,
+    pub disabled: DisabledRecord,
+    /// How a local run groups, schedules and reports jobs.
+    pub units: Vec<UnitSpec>,
+    pub setup: Vec<SetupSpec>,
+    /// The jobs and what they wait for.
+    pub graph: JobGraph,
+    /// What can be placed on a host, in an order each task can run after the
+    /// ones before it.
+    pub tasks: Vec<ExecutionTask>,
+    pub shard_groups: Vec<ShardGroup>,
 }
 
 /// Everything a plan is made of except the two digests.
@@ -95,6 +147,7 @@ pub struct PlanParts {
     pub changed_files: Vec<String>,
     pub config: FrozenConfig,
     pub filters: Filters,
+    pub disabled: DisabledRecord,
     pub plan: Plan,
 }
 
@@ -129,6 +182,21 @@ impl FrozenPlan {
     /// Fix `parts` and compute the digests.
     pub fn new(parts: PlanParts) -> Result<Self> {
         let config_digest = sha256_of(&canonical_json(&serde_json::to_value(&parts.config)?));
+        let workflows: Vec<WorkflowSpec> = parts
+            .plan
+            .selected
+            .iter()
+            .map(WorkflowSpec::from_selected)
+            .collect();
+        let units: Vec<UnitSpec> = parts.plan.units.iter().map(UnitSpec::from_unit).collect();
+        let setup: Vec<SetupSpec> = parts.plan.setup.iter().map(SetupSpec::from_setup).collect();
+        let graph = dag::build_graph(&workflows, &units)?;
+        let (tasks, shard_groups) = dag::derive_tasks(
+            &parts.plan,
+            &workflows,
+            &units,
+            setup.iter().any(|s| s.execute),
+        );
         let mut fp = FrozenPlan {
             schema_version: SCHEMA_VERSION,
             digest: String::new(),
@@ -139,15 +207,19 @@ impl FrozenPlan {
             config_digest,
             config: parts.config,
             filters: parts.filters,
-            workflows: parts.plan.selected,
+            workflows,
             skipped: parts
                 .plan
                 .skipped
                 .into_iter()
                 .map(|(workflow, reason)| SkippedWorkflow { workflow, reason })
                 .collect(),
-            units: parts.plan.units,
-            setup: parts.plan.setup,
+            disabled: parts.disabled,
+            units,
+            setup,
+            graph,
+            tasks,
+            shard_groups,
         };
         fp.digest = fp.compute_digest()?;
         Ok(fp)
@@ -172,6 +244,9 @@ impl FrozenPlan {
         let want = sha256_of(&canonical_json(&serde_json::to_value(&self.config)?));
         if want != self.config_digest {
             bail!("plan config digest does not match its config");
+        }
+        if dag::build_graph(&self.workflows, &self.units)? != self.graph {
+            bail!("plan job graph does not match its jobs");
         }
         let want = self.compute_digest()?;
         if want != self.digest {
@@ -198,14 +273,18 @@ impl FrozenPlan {
     /// The selection part as a [`Plan`].
     pub fn to_plan(&self) -> Plan {
         Plan {
-            selected: self.workflows.clone(),
+            selected: self
+                .workflows
+                .iter()
+                .map(WorkflowSpec::to_selected)
+                .collect(),
             skipped: self
                 .skipped
                 .iter()
                 .map(|s| (s.workflow.clone(), s.reason.clone()))
                 .collect(),
-            units: self.units.clone(),
-            setup: self.setup.clone(),
+            units: self.units.iter().map(UnitSpec::to_unit).collect(),
+            setup: self.setup.iter().map(SetupSpec::to_setup).collect(),
         }
     }
 
@@ -219,22 +298,25 @@ impl FrozenPlan {
             changed_files: self.changed_files.clone(),
             config: self.config.clone(),
             filters: self.filters.clone(),
+            disabled: self.disabled.clone(),
             plan,
         })
     }
 
-    pub fn job(&self, wf: usize, id: &str) -> &Job {
-        self.workflows[wf]
-            .wf
-            .jobs
-            .iter()
-            .find(|j| j.id == id)
-            .expect("job in plan")
+    pub fn job(&self, wf: usize, id: &str) -> &JobSpec {
+        self.workflows[wf].job(id).expect("job in plan")
     }
 
-    pub fn is_setup(&self, k: &plan::StepKey) -> bool {
-        self.setup.iter().any(|s| &s.key == k)
+    pub fn task(&self, id: &str) -> Option<&ExecutionTask> {
+        self.tasks.iter().find(|t| t.id == id)
     }
+}
+
+/// The graph of the jobs the plan holds: `needs` as edges, a matrix as one
+/// node per variant plus the node later jobs depend on. Fails on a cycle or a
+/// `needs` that names no job of the plan.
+pub fn derive_job_dag(fp: &FrozenPlan) -> Result<JobGraph> {
+    dag::build_graph(&fp.workflows, &fp.units)
 }
 
 #[cfg(test)]

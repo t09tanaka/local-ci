@@ -1,0 +1,617 @@
+//! The job graph of a plan and the tasks it is run as.
+//!
+//! [`JobGraph`] is the workflow's jobs with their `needs` edges, a matrix
+//! expanded into one node per variant plus the node later jobs `needs`
+//! (the aggregation point). [`ExecutionTask`] is what can be placed on a host:
+//! by default one task per job and one per matrix variant, following the
+//! independent-job semantics of GitHub Actions (no files shared between jobs).
+//! Jobs that the engine's unit keeps together because they write the same
+//! files stay one task, and the task says why ([`GroupedReason`]).
+//!
+//! Nothing here runs anything; see [`crate::execute_task`].
+
+use crate::plan::{self, Plan};
+use crate::wire::{JobSpec, MatrixValue, UnitSpec, WorkflowSpec};
+use anyhow::{bail, Result};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
+
+/// `<workflow file>::<job id>`; a matrix variant adds `#<index>`.
+pub fn node_id(workflow: &str, job: &str) -> String {
+    format!("{workflow}::{job}")
+}
+
+fn variant_id(workflow: &str, job: &str, index: usize) -> String {
+    format!("{workflow}::{job}#{index}")
+}
+
+/// How the outputs of a matrix job's variants become the outputs of the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputAggregation {
+    /// In the order of the matrix, whatever the order the variants finished
+    /// in; for a name set by several variants the last one in matrix order
+    /// wins. (GitHub takes the variant that finished last, which no one can
+    /// plan for.)
+    MatrixOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeKind {
+    /// A job without a matrix.
+    Job,
+    /// A job whose matrix is an expression: its variants are known only when
+    /// the jobs it needs have finished, so the node is one task that expands
+    /// them when it runs.
+    DynamicMatrix { expression: String },
+    /// One variant of a matrix that is known at planning.
+    MatrixVariant {
+        /// The node later jobs depend on.
+        group: String,
+        index: usize,
+        values: Map<String, Value>,
+        label: String,
+    },
+    /// The point where a matrix job's variants meet: later jobs depend on
+    /// this node, and it is done when every variant is.
+    MatrixGroup {
+        variants: Vec<String>,
+        fail_fast: bool,
+        max_parallel: Option<usize>,
+        aggregation: OutputAggregation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobNode {
+    pub id: String,
+    /// The workflow file.
+    pub workflow: String,
+    pub job: String,
+    #[serde(flatten)]
+    pub kind: NodeKind,
+    /// Nodes that must be done first.
+    pub depends_on: Vec<String>,
+}
+
+/// The jobs of the plan as a DAG. `nodes` are in dependency order (a node
+/// comes after everything it depends on), otherwise in plan order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobGraph {
+    pub nodes: Vec<JobNode>,
+}
+
+impl JobGraph {
+    pub fn node(&self, id: &str) -> Option<&JobNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+}
+
+/// What a job's matrix is at planning.
+pub(crate) enum MatrixPlan {
+    None,
+    Dynamic(String),
+    Static(Vec<Map<String, Value>>),
+}
+
+pub(crate) fn matrix_plan(job: &JobSpec) -> MatrixPlan {
+    let Some(m) = &job.matrix else {
+        return MatrixPlan::None;
+    };
+    match m {
+        MatrixValue::Map(_) if !m.has_expression() => match crate::matrix::expand(&m.to_json()) {
+            // no variant at all is a job that runs nothing: keep it a plain job
+            Ok(c) if !c.is_empty() => MatrixPlan::Static(c),
+            Ok(_) => MatrixPlan::None,
+            Err(_) => MatrixPlan::Dynamic("matrix".into()),
+        },
+        MatrixValue::String(s) => MatrixPlan::Dynamic(s.clone()),
+        _ => MatrixPlan::Dynamic("matrix".into()),
+    }
+}
+
+/// The graph of the jobs `units` hold. Fails on a `needs` that names no job of
+/// the plan and on a cycle.
+pub fn build_graph(workflows: &[WorkflowSpec], units: &[UnitSpec]) -> Result<JobGraph> {
+    let mut nodes: Vec<JobNode> = Vec::new();
+    for (wi, w) in workflows.iter().enumerate() {
+        let planned: BTreeSet<&str> = units
+            .iter()
+            .filter(|u| u.workflow == wi)
+            .flat_map(|u| u.jobs.iter().map(String::as_str))
+            .collect();
+        for job in w.jobs.iter().filter(|j| planned.contains(j.id.as_str())) {
+            let mut deps = Vec::new();
+            for n in &job.needs {
+                if !planned.contains(n.as_str()) {
+                    bail!(
+                        "job `{}` of {} needs `{n}`, which is not a job of the plan",
+                        job.id,
+                        w.file
+                    );
+                }
+                deps.push(node_id(&w.file, n));
+            }
+            let id = node_id(&w.file, &job.id);
+            let mk = |id: String, kind: NodeKind, depends_on: Vec<String>| JobNode {
+                id,
+                workflow: w.file.clone(),
+                job: job.id.clone(),
+                kind,
+                depends_on,
+            };
+            match matrix_plan(job) {
+                MatrixPlan::None => nodes.push(mk(id, NodeKind::Job, deps)),
+                MatrixPlan::Dynamic(expression) => {
+                    nodes.push(mk(id, NodeKind::DynamicMatrix { expression }, deps))
+                }
+                MatrixPlan::Static(combos) => {
+                    let mut ids = Vec::new();
+                    for (i, c) in combos.into_iter().enumerate() {
+                        let vid = variant_id(&w.file, &job.id, i);
+                        ids.push(vid.clone());
+                        let label = crate::matrix::describe(&c);
+                        nodes.push(mk(
+                            vid,
+                            NodeKind::MatrixVariant {
+                                group: id.clone(),
+                                index: i,
+                                values: c,
+                                label,
+                            },
+                            deps.clone(),
+                        ));
+                    }
+                    nodes.push(mk(
+                        id,
+                        NodeKind::MatrixGroup {
+                            variants: ids.clone(),
+                            fail_fast: job.fail_fast,
+                            max_parallel: job.max_parallel,
+                            aggregation: OutputAggregation::MatrixOrder,
+                        },
+                        ids,
+                    ));
+                }
+            }
+        }
+    }
+    order(nodes)
+}
+
+/// Dependency order, keeping plan order where it allows; a cycle is an error.
+fn order(nodes: Vec<JobNode>) -> Result<JobGraph> {
+    let mut done: Vec<JobNode> = Vec::with_capacity(nodes.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rest = nodes;
+    while !rest.is_empty() {
+        let at = rest
+            .iter()
+            .position(|n| n.depends_on.iter().all(|d| seen.contains(d)));
+        match at {
+            Some(i) => {
+                let n = rest.remove(i);
+                seen.insert(n.id.clone());
+                done.push(n);
+            }
+            None => {
+                let names: Vec<String> = rest
+                    .iter()
+                    .filter(|n| !matches!(n.kind, NodeKind::MatrixVariant { .. }))
+                    .map(|n| n.id.clone())
+                    .collect();
+                bail!(
+                    "the jobs depend on each other in a cycle: {}",
+                    names.join(", ")
+                );
+            }
+        }
+    }
+    Ok(JobGraph { nodes: done })
+}
+
+// ---- tasks ----
+
+/// Why jobs that could run apart are one task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum GroupedReason {
+    /// They write the same files or build output, so they must not run at
+    /// the same time in one checkout, and splitting them would change what
+    /// they read.
+    SharedOutputs { files: Vec<String> },
+    /// Their shared files would put a job between two of them that depends on
+    /// the first and is needed by the second: the whole group stays together.
+    OrderAroundSharedOutputs,
+}
+
+/// Where a task's files live.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspacePolicy {
+    /// A checkout of the planned commit of its own; nothing is shared with
+    /// another task (files cross tasks only as artifacts, later).
+    pub own_checkout: bool,
+    /// The jobs of the task share that checkout.
+    pub shared_by_jobs: bool,
+    /// The installs hoisted into the plan's setup have to be done in it.
+    pub needs_hoisted_setup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskService {
+    pub job: String,
+    pub id: String,
+    pub image: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Times the task may be started for one run. A local run starts it once.
+    pub max_attempts: u32,
+}
+
+/// What the result of the task has to contain to be accepted (filled in by the
+/// checks of a later stage; for now what the jobs declare).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OutputVerification {
+    /// `<job>.<output>` for each output the jobs declare.
+    pub job_outputs: Vec<String>,
+    pub artifacts: Vec<String>,
+}
+
+/// An output of a job this task needs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NeedsOutput {
+    pub job: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskVariant {
+    /// The node of the matrix job.
+    pub group: String,
+    pub index: usize,
+    pub values: Map<String, Value>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionTask {
+    pub id: String,
+    /// The workflow file.
+    pub workflow: String,
+    /// The job ids, in the order they run.
+    pub jobs: Vec<String>,
+    /// The graph nodes the task runs.
+    pub nodes: Vec<String>,
+    /// The engine unit this came from (index into the plan's units).
+    pub unit: usize,
+    pub variant: Option<TaskVariant>,
+    /// The job's matrix is an expression: the task expands and runs it all.
+    pub dynamic_matrix: bool,
+    /// Tasks whose results (and outputs) are needed before this one starts.
+    pub depends_on: Vec<String>,
+    /// Outputs of jobs outside the task that its expressions read.
+    pub needs_outputs: Vec<NeedsOutput>,
+    /// Artifacts needed from other tasks (none are produced yet).
+    pub artifacts: Vec<String>,
+    pub workspace: WorkspacePolicy,
+    pub services: Vec<TaskService>,
+    pub exclusive: bool,
+    pub retry: RetryPolicy,
+    pub verification: OutputVerification,
+    pub grouped_reason: Option<GroupedReason>,
+}
+
+/// Why a task is not split into shards of one test run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotSplit {
+    /// No runner adapter can list and partition its tests yet.
+    NoRunnerAdapter,
+    /// Its jobs share a checkout.
+    SharedWorkspace,
+    /// It starts services that one shard cannot get a copy of.
+    HasServices,
+    /// It runs one variant of a matrix; the matrix is the split.
+    MatrixVariant,
+}
+
+/// A job (or the jobs of a task) that could become several shards, and the
+/// reasons it did not. Only the type and the reasons exist so far; nothing
+/// splits a task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardGroup {
+    pub id: String,
+    pub workflow: String,
+    pub source_jobs: Vec<String>,
+    /// The tasks the source is run as (one, while nothing is split).
+    pub shards: Vec<String>,
+    pub split: bool,
+    pub not_split: Vec<NotSplit>,
+    /// How shard results would be merged (none until a split exists).
+    pub aggregation: Option<OutputAggregation>,
+}
+
+fn needs_output_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"needs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)").unwrap()
+    })
+}
+
+fn needs_outputs_of(job: &JobSpec) -> Vec<NeedsOutput> {
+    let text = serde_json::to_string(job).unwrap_or_default();
+    let mut out = BTreeSet::new();
+    for c in needs_output_re().captures_iter(&text) {
+        out.insert(NeedsOutput {
+            job: c[1].to_string(),
+            name: c[2].to_string(),
+        });
+    }
+    out.into_iter().collect()
+}
+
+/// Cut the plan's units into tasks. `plan` is the engine's view (the file
+/// overlap is worked out on it); `specs` and `units` are the wire view of the
+/// same plan.
+pub(crate) fn derive_tasks(
+    plan: &Plan,
+    specs: &[WorkflowSpec],
+    units: &[UnitSpec],
+    has_setup: bool,
+) -> (Vec<ExecutionTask>, Vec<ShardGroup>) {
+    let mut tasks: Vec<ExecutionTask> = Vec::new();
+    for (ui, u) in units.iter().enumerate() {
+        let wf = &specs[u.workflow];
+        let w = &plan.selected[u.workflow].wf;
+        let pos: HashMap<&str, usize> = u
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| (j.as_str(), i))
+            .collect();
+        let writes: Vec<BTreeSet<String>> = u
+            .jobs
+            .iter()
+            .map(|id| {
+                let j = w.jobs.iter().find(|j| &j.id == id).expect("job in plan");
+                plan::writes(w, j)
+            })
+            .collect();
+        // components of jobs that share written files
+        let n = u.jobs.len();
+        let mut comp: Vec<usize> = (0..n).collect();
+        fn root(c: &[usize], mut i: usize) -> usize {
+            while c[i] != i {
+                i = c[i];
+            }
+            i
+        }
+        for a in 0..n {
+            for b in (a + 1)..n {
+                if !writes[a].is_disjoint(&writes[b]) {
+                    let (x, y) = (root(&comp, a), root(&comp, b));
+                    comp[x] = y;
+                }
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut seen_root: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let r = root(&comp, i);
+            match seen_root.iter().position(|x| *x == r) {
+                Some(g) => groups[g].push(i),
+                None => {
+                    seen_root.push(r);
+                    groups.push(vec![i]);
+                }
+            }
+        }
+        let mut merged = false;
+        if order_groups(wf, u, &groups, &pos).is_none() {
+            groups = vec![(0..n).collect()];
+            merged = true;
+        }
+        let ordered = order_groups(wf, u, &groups, &pos).expect("one group is acyclic");
+        for gi in ordered {
+            let g = &groups[gi];
+            let ids: Vec<String> = g.iter().map(|&i| u.jobs[i].clone()).collect();
+            let specs_of: Vec<&JobSpec> = ids
+                .iter()
+                .map(|id| wf.job(id).expect("job in plan"))
+                .collect();
+            let grouped_reason = (g.len() > 1).then(|| {
+                if merged {
+                    GroupedReason::OrderAroundSharedOutputs
+                } else {
+                    let mut count: BTreeMap<&String, usize> = BTreeMap::new();
+                    for &i in g {
+                        for f in &writes[i] {
+                            *count.entry(f).or_default() += 1;
+                        }
+                    }
+                    GroupedReason::SharedOutputs {
+                        files: count
+                            .into_iter()
+                            .filter(|(_, c)| *c > 1)
+                            .map(|(f, _)| f.clone())
+                            .collect(),
+                    }
+                }
+            });
+            let base = ExecutionTask {
+                id: String::new(),
+                workflow: wf.file.clone(),
+                jobs: ids.clone(),
+                nodes: vec![],
+                unit: ui,
+                variant: None,
+                dynamic_matrix: false,
+                depends_on: vec![],
+                needs_outputs: vec![],
+                artifacts: vec![],
+                workspace: WorkspacePolicy {
+                    own_checkout: true,
+                    shared_by_jobs: g.len() > 1,
+                    needs_hoisted_setup: has_setup,
+                },
+                services: specs_of
+                    .iter()
+                    .flat_map(|j| {
+                        j.services.iter().map(|s| TaskService {
+                            job: j.id.clone(),
+                            id: s.id.clone(),
+                            image: s.image.clone(),
+                        })
+                    })
+                    .collect(),
+                exclusive: g.iter().any(|&i| {
+                    let j = w.jobs.iter().find(|j| j.id == u.jobs[i]).unwrap();
+                    plan::is_exclusive(j)
+                }),
+                retry: RetryPolicy { max_attempts: 1 },
+                verification: OutputVerification {
+                    job_outputs: specs_of
+                        .iter()
+                        .flat_map(|j| j.outputs.iter().map(|(k, _)| format!("{}.{k}", j.id)))
+                        .collect(),
+                    artifacts: vec![],
+                },
+                grouped_reason,
+            };
+            let external: BTreeSet<&str> = specs_of
+                .iter()
+                .flat_map(|j| j.needs.iter().map(String::as_str))
+                .filter(|n| !ids.iter().any(|i| i == n))
+                .collect();
+            let needs_outputs: Vec<NeedsOutput> = specs_of
+                .iter()
+                .flat_map(|j| needs_outputs_of(j))
+                .filter(|o| external.contains(o.job.as_str()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let single = (g.len() == 1).then(|| specs_of[0]);
+            match single.map(|j| (j, matrix_plan(j))) {
+                Some((j, MatrixPlan::Static(combos))) => {
+                    for (i, c) in combos.into_iter().enumerate() {
+                        let id = variant_id(&wf.file, &j.id, i);
+                        tasks.push(ExecutionTask {
+                            id: id.clone(),
+                            nodes: vec![id],
+                            variant: Some(TaskVariant {
+                                group: node_id(&wf.file, &j.id),
+                                index: i,
+                                label: crate::matrix::describe(&c),
+                                values: c,
+                            }),
+                            needs_outputs: needs_outputs.clone(),
+                            ..base.clone()
+                        });
+                    }
+                }
+                other => {
+                    let dynamic = matches!(other, Some((_, MatrixPlan::Dynamic(_))));
+                    let id = format!("{}::{}", wf.file, ids.join("+"));
+                    tasks.push(ExecutionTask {
+                        id,
+                        nodes: ids.iter().map(|j| node_id(&wf.file, j)).collect(),
+                        dynamic_matrix: dynamic,
+                        needs_outputs,
+                        ..base
+                    });
+                }
+            }
+        }
+    }
+    // dependencies between tasks
+    let mut by_job: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for t in &tasks {
+        for j in &t.jobs {
+            by_job
+                .entry((t.workflow.clone(), j.clone()))
+                .or_default()
+                .push(t.id.clone());
+        }
+    }
+    for t in &mut tasks {
+        let wf = specs.iter().find(|w| w.file == t.workflow).unwrap();
+        let mut deps = BTreeSet::new();
+        for j in &t.jobs {
+            for n in &wf.job(j).unwrap().needs {
+                if t.jobs.contains(n) {
+                    continue;
+                }
+                if let Some(ids) = by_job.get(&(t.workflow.clone(), n.clone())) {
+                    deps.extend(ids.iter().cloned());
+                }
+            }
+        }
+        t.depends_on = deps.into_iter().collect();
+    }
+    let shard_groups = tasks
+        .iter()
+        .map(|t| {
+            let mut not_split = vec![NotSplit::NoRunnerAdapter];
+            if t.workspace.shared_by_jobs {
+                not_split.push(NotSplit::SharedWorkspace);
+            }
+            if !t.services.is_empty() {
+                not_split.push(NotSplit::HasServices);
+            }
+            if t.variant.is_some() {
+                not_split.push(NotSplit::MatrixVariant);
+            }
+            ShardGroup {
+                id: t.id.clone(),
+                workflow: t.workflow.clone(),
+                source_jobs: t.jobs.clone(),
+                shards: vec![t.id.clone()],
+                split: false,
+                not_split,
+                aggregation: None,
+            }
+        })
+        .collect();
+    (tasks, shard_groups)
+}
+
+/// The groups in an order where each comes after the groups it needs, the
+/// lowest first job first; `None` when they need each other in a cycle.
+fn order_groups(
+    wf: &WorkflowSpec,
+    u: &UnitSpec,
+    groups: &[Vec<usize>],
+    pos: &HashMap<&str, usize>,
+) -> Option<Vec<usize>> {
+    let group_of = |job: &str| {
+        groups
+            .iter()
+            .position(|g| g.iter().any(|&i| u.jobs[i] == job))
+    };
+    let deps: Vec<BTreeSet<usize>> = groups
+        .iter()
+        .enumerate()
+        .map(|(gi, g)| {
+            g.iter()
+                .flat_map(|&i| wf.job(&u.jobs[i]).unwrap().needs.iter())
+                .filter(|n| pos.contains_key(n.as_str()))
+                .filter_map(|n| group_of(n))
+                .filter(|d| *d != gi)
+                .collect()
+        })
+        .collect();
+    let mut done: Vec<usize> = Vec::new();
+    while done.len() < groups.len() {
+        let next = (0..groups.len())
+            .filter(|g| !done.contains(g) && deps[*g].iter().all(|d| done.contains(d)))
+            .min_by_key(|g| groups[*g][0])?;
+        done.push(next);
+    }
+    Some(done)
+}
