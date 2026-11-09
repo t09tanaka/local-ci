@@ -867,7 +867,12 @@ fn recipe_step(run: &str) -> RecipeStep {
 }
 
 /// The receipt of a setup that ran every step of `recipe` and made `artifact`.
-fn receipt_for(recipe: &SetupRecipe, key: &TemplateKey, artifact: &str) -> PreparedReceipt {
+fn receipt_for(
+    recipe: &SetupRecipe,
+    key: &TemplateKey,
+    built: &Path,
+    artifact: &str,
+) -> PreparedReceipt {
     PreparedReceipt {
         template_key: key.digest().into(),
         source: "src".into(),
@@ -882,7 +887,9 @@ fn receipt_for(recipe: &SetupRecipe, key: &TemplateKey, artifact: &str) -> Prepa
             .collect(),
         artifacts: vec![ArtifactDigest {
             path: artifact.into(),
-            digest: "d".into(),
+            digest: local_ci::tree::tree_digest(&built.join(artifact))
+                .unwrap()
+                .digest,
         }],
         notes: vec![],
     }
@@ -914,7 +921,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     let built_a = tmp.path().join("built-a");
     std::fs::create_dir_all(built_a.join("node_modules/a")).unwrap();
     std::fs::write(built_a.join("node_modules/a/index.js"), "a").unwrap();
-    let rec_a = receipt_for(&ra, &ka, "node_modules");
+    let rec_a = receipt_for(&ra, &ka, &built_a, "node_modules");
     let a = store.publish(&c1, &ka, &rec_a, &built_a).unwrap();
     let before = tree_digest(&a.tree());
 
@@ -999,7 +1006,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
         std::fs::create_dir_all(built_ab.join("node_modules/b")).unwrap();
         std::fs::write(built_ab.join("node_modules/a/index.js"), "a").unwrap();
         std::fs::write(built_ab.join("node_modules/b/index.js"), "b").unwrap();
-        let rec_ab = receipt_for(&rab, &kab, "node_modules");
+        let rec_ab = receipt_for(&rab, &kab, &built_ab, "node_modules");
         let ab = store.publish(&c2, &kab, &rec_ab, &built_ab).unwrap();
         (h.join().unwrap(), ab)
     });

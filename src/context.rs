@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Default)]
 struct CancelState {
@@ -104,6 +104,7 @@ pub struct ExecContext {
     env: BTreeMap<String, String>,
     /// Stops this attempt; see [`CancelHandle`].
     pub cancel: CancelHandle,
+    github_token: OnceLock<Option<String>>,
 }
 
 impl ExecContext {
@@ -114,6 +115,7 @@ impl ExecContext {
         ExecContext {
             env,
             cancel: CancelHandle::new(),
+            github_token: OnceLock::new(),
         }
     }
 
@@ -124,6 +126,7 @@ impl ExecContext {
         ExecContext {
             env: self.env.clone(),
             cancel: CancelHandle::new(),
+            github_token: OnceLock::new(),
         }
     }
 
@@ -134,6 +137,32 @@ impl ExecContext {
         let mut c = Command::new(program);
         c.env_clear().envs(&self.env);
         c
+    }
+
+    /// The GitHub token of the machine this runs on (`gh auth token`), for
+    /// steps that read `github.token` or `secrets.GITHUB_TOKEN`. Asked once,
+    /// and only when a step needs it; `None` when `gh` is missing or not
+    /// logged in.
+    pub fn github_token(&self) -> Option<&str> {
+        self.github_token
+            .get_or_init(|| {
+                let gh = self.find_tool("gh")?;
+                let out = self
+                    .command(gh)
+                    .args(["auth", "token"])
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok()?;
+                let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                (out.status.success() && !t.is_empty()).then_some(t)
+            })
+            .as_deref()
+    }
+
+    /// The token, if it has been asked for already (to mask it in output).
+    pub(crate) fn github_token_if_fetched(&self) -> Option<&str> {
+        self.github_token.get()?.as_deref()
     }
 
     pub fn env(&self) -> &BTreeMap<String, String> {

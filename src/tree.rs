@@ -57,8 +57,8 @@ enum Entry {
 /// put together in the listed order, so the result does not depend on how the
 /// work was shared out.
 pub fn tree_digest(path: &Path) -> Result<TreeDigest> {
-    let mut entries: Vec<(String, Entry)> = Vec::new();
-    list(path, "", &mut entries)?;
+    let mut entries: Vec<(Vec<u8>, Entry)> = Vec::new();
+    list(path, &[], &mut entries)?;
     let files: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -104,7 +104,7 @@ pub fn tree_digest(path: &Path) -> Result<TreeDigest> {
     for (i, (rel, e)) in entries.iter().enumerate() {
         // one line per entry; the fields cannot contain a NUL, and an escaped
         // name cannot contain a newline
-        let rel = rel.escape_default();
+        let rel = escape_name(rel);
         let line = match e {
             Entry::Dir => format!("{rel}\0d\0-\0-\n"),
             Entry::Symlink(t) => {
@@ -148,19 +148,34 @@ fn hash_file(path: &Path, buf: &mut [u8]) -> Result<(String, u64)> {
     Ok((hex(&h.finalize()), size))
 }
 
-fn list(path: &Path, rel: &str, out: &mut Vec<(String, Entry)>) -> Result<()> {
+/// A name as text with no newline, NUL or non-ASCII in it: valid UTF-8 as
+/// `escape_default` writes it, any other byte as `\xNN` (a backslash is
+/// written `\\`, so the two cannot be mistaken for each other).
+fn escape_name(name: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in name.utf8_chunks() {
+        out.extend(chunk.valid().chars().flat_map(char::escape_default));
+        for b in chunk.invalid() {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}
+
+fn list(path: &Path, rel: &[u8], out: &mut Vec<(Vec<u8>, Entry)>) -> Result<()> {
     let md =
         fs::symlink_metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
     let ft = md.file_type();
     if ft.is_symlink() {
+        use std::os::unix::ffi::OsStrExt;
         let target =
             fs::read_link(path).with_context(|| format!("cannot read {}", path.display()))?;
         out.push((
-            rel.to_string(),
-            Entry::Symlink(hex(target.to_string_lossy().as_bytes())),
+            rel.to_vec(),
+            Entry::Symlink(hex(target.as_os_str().as_bytes())),
         ));
     } else if ft.is_dir() {
-        out.push((rel.to_string(), Entry::Dir));
+        out.push((rel.to_vec(), Entry::Dir));
         let mut names: Vec<_> = fs::read_dir(path)
             .with_context(|| format!("cannot read {}", path.display()))?
             .map(|e| e.map(|e| e.file_name()))
@@ -171,25 +186,25 @@ fn list(path: &Path, rel: &str, out: &mut Vec<(String, Entry)>) -> Result<()> {
             a.as_bytes().cmp(b.as_bytes())
         });
         for name in names {
-            let n = name.to_string_lossy();
-            let child = if rel.is_empty() {
-                n.to_string()
-            } else {
-                format!("{rel}/{n}")
-            };
+            use std::os::unix::ffi::OsStrExt;
+            let mut child = rel.to_vec();
+            if !child.is_empty() {
+                child.push(b'/');
+            }
+            child.extend_from_slice(name.as_bytes());
             list(&path.join(&name), &child, out)?;
         }
     } else if ft.is_file() {
         use std::os::unix::fs::PermissionsExt;
         out.push((
-            rel.to_string(),
+            rel.to_vec(),
             Entry::File {
                 path: path.to_path_buf(),
                 exec: md.permissions().mode() & 0o111 != 0,
             },
         ));
     } else {
-        out.push((rel.to_string(), Entry::Other));
+        out.push((rel.to_vec(), Entry::Other));
     }
     Ok(())
 }
@@ -333,5 +348,28 @@ mod tests {
         );
         assert_eq!(d, again);
         assert_eq!(d.files, 10_000);
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_are_told_apart() {
+        // the escaping, where no filesystem is needed
+        assert_eq!(escape_name(b"a/b.txt"), "a/b.txt");
+        assert_eq!(escape_name("caf\u{e9}\n".as_bytes()), "caf\\u{e9}\\n");
+        assert_eq!(escape_name(b"a\xffb"), "a\\xffb");
+        assert_ne!(escape_name(b"a\xffb"), escape_name(b"a\xfeb"));
+        // a name written out as `\xff` is not the byte 0xff
+        assert_ne!(escape_name(b"a\xffb"), escape_name(b"a\\xffb"));
+        // two trees whose names differ only in invalid bytes, where the
+        // filesystem takes such names (APFS does not; then this is skipped)
+        use std::os::unix::ffi::OsStrExt;
+        let t = tempfile::tempdir().unwrap();
+        let mk = |dir: &str, name: &[u8]| -> bool {
+            let d = t.path().join(dir);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join(std::ffi::OsStr::from_bytes(name)), "x").is_ok()
+        };
+        if mk("p", b"a\xff") && mk("q", b"a\xfe") {
+            assert_ne!(digest(&t.path().join("p")), digest(&t.path().join("q")));
+        }
     }
 }

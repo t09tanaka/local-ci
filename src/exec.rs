@@ -248,19 +248,16 @@ fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pat).unwrap())
 }
 
-fn global_install(run: &str) -> bool {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^\s*(sudo\s|brew (install|upgrade|tap)\b|apt(-get)?\s|yum\s|dnf\s|apk add\b|choco\s|snap install\b)").is_match(run)
-}
-
-/// Steps that would change something outside this machine with your credentials.
-fn remote_effect(run: &str) -> bool {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?m)(^|[;&|(]\s*|\s)(git\s+push|gh\s+(api|release|pr|issue|workflow|run|repo|secret|variable|label|gist)\b|npm\s+publish|cargo\s+publish|dart\s+pub\s+publish|docker\s+(push|login)|aws\s|gcloud\s|kubectl\s|helm\s+(install|upgrade)|terraform\s+(apply|destroy)|serverless\s+deploy|sls\s+deploy|firebase\s+deploy|vercel\b|netlify\s+deploy|wrangler\s+(deploy|publish))",
-    )
-    .is_match(run)
+/// Replace `secret` in the file at `path` with `***`.
+fn mask_in_file(path: &Path, secret: &str) {
+    if secret.len() < 4 {
+        return;
+    }
+    if let Ok(text) = fs::read_to_string(path) {
+        if text.contains(secret) {
+            let _ = fs::write(path, text.replace(secret, "***"));
+        }
+    }
 }
 
 fn slug_of(s: &str) -> String {
@@ -1585,6 +1582,24 @@ impl<'a> Runner<'a> {
             .then(|| setup::ensure_workspace_id(ws).ok())
             .flatten();
         let origin = setup::workspace_id(&self.wt);
+        // The receipts are this run's own. In the setup workspace they are
+        // believed as they are. A copy is checked once, here, before any task
+        // wrote in it: what the setup made must be in it as the receipt says;
+        // after that the tasks of the unit trust the receipt even when one of
+        // them wrote next to what the install made. A copy that does not
+        // match has its receipts checked again by each task, and ignored.
+        let mut copy_checked: HashMap<String, bool> = HashMap::new();
+        if copy_id.is_some() {
+            if let Some((m, _)) = &self.receipts {
+                for t in self.fp.tasks.iter().filter(|t| t.unit == ui) {
+                    if let Some(r) = m.get(&t.id) {
+                        copy_checked
+                            .entry(t.id.clone())
+                            .or_insert_with(|| setup::verify_artifacts(r, ws, true).is_ok());
+                    }
+                }
+            }
+        }
         for task in self.fp.tasks.iter().filter(|t| t.unit == ui) {
             if task.variant.as_ref().is_some_and(|v| v.index > 0) {
                 continue;
@@ -1597,11 +1612,13 @@ impl<'a> Runner<'a> {
                     _ => (r.clone(), c),
                 })
             });
+            let verify = copy_id.is_some() && !copy_checked.get(&task.id).copied().unwrap_or(false);
             match self.run_task(
                 ws,
                 task,
                 &inputs,
                 receipt.as_ref().map(|(r, c)| (r, *c)),
+                verify,
                 locked,
                 true,
             ) {
@@ -1629,17 +1646,30 @@ impl<'a> Runner<'a> {
                         outcomes.push(o.clone());
                         inputs.needs.insert(id.clone(), o);
                     }
+                    // every entry of a matrix job failed, not one in its place
                     for id in &task.jobs {
-                        jobs.push(JobResult {
-                            workflow: w.file.clone(),
-                            job: id.clone(),
-                            display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
-                            outcome: Outcome::Error(reason.clone()),
-                            secs: 0.0,
-                            steps: vec![],
-                            cancelled: false,
-                            time: None,
-                        });
+                        let job = self.plan.job(u.wf, id);
+                        let base = job.name.clone().unwrap_or(id.clone());
+                        let displays: Vec<String> =
+                            match crate::dag::matrix_plan(self.fp.job(u.wf, id)) {
+                                crate::dag::MatrixPlan::Static(v) => v
+                                    .iter()
+                                    .map(|c| format!("{base} ({})", matrix::describe(c)))
+                                    .collect(),
+                                _ => vec![base],
+                            };
+                        for display in displays {
+                            jobs.push(JobResult {
+                                workflow: w.file.clone(),
+                                job: id.clone(),
+                                display,
+                                outcome: Outcome::Error(reason.clone()),
+                                secs: 0.0,
+                                steps: vec![],
+                                cancelled: false,
+                                time: None,
+                            });
+                        }
                     }
                 }
             }
@@ -1666,12 +1696,18 @@ impl<'a> Runner<'a> {
     /// holds for the jobs it needs. `locked`: the caller holds the repository
     /// lock. `whole_matrix`: for a task that is one variant of a matrix job,
     /// run all the variants (as one job) instead.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_task(
         &self,
         ws: &Path,
         task: &ExecutionTask,
         inputs: &TaskInputs,
         prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+        // whether to hash what the receipt describes before believing it: for
+        // a receipt that comes from outside, yes; for the run's own receipt
+        // in the workspace it was made for (or a copy checked when it was
+        // made), no
+        verify_contents: bool,
         locked: bool,
         whole_matrix: bool,
     ) -> Result<TaskResult> {
@@ -1712,6 +1748,7 @@ impl<'a> Runner<'a> {
                     setup::workspace_id(ws).as_deref(),
                     ws,
                     tctx,
+                    verify_contents,
                 ) {
                 Ok(p) => p,
                 Err(why) => {
@@ -2036,22 +2073,27 @@ impl<'a> Runner<'a> {
         out.into_iter().flatten().collect()
     }
 
+    /// Evaluate `pairs` into `into`. Says whether a secret that cannot be
+    /// supplied was read, and whether this machine's GitHub token was put in.
     fn eval_env(
+        host: &ExecContext,
         pairs: &[(String, String)],
         cm: &Map<String, Value>,
         into: &mut Map<String, Value>,
         maps: &[PortMap],
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         let mut secrets = false;
+        let mut token = false;
         for (k, v) in pairs {
             let mut ctx_map = cm.clone();
             ctx_map.insert("env".into(), Value::Object(into.clone()));
-            let ctx = Ctx::new(&ctx_map, Status::Success);
+            let ctx = Ctx::new(&ctx_map, Status::Success).with_token(host);
             let val = expr::interpolate(v, &ctx)?;
             secrets |= ctx.used_secrets.get();
+            token |= ctx.used_token.get();
             into.insert(k.clone(), Value::String(rewrite_env_value(k, &val, maps)));
         }
-        Ok(secrets)
+        Ok((secrets, token))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2130,8 +2172,8 @@ impl<'a> Runner<'a> {
 
         // workflow + job env
         let mut env_ctx = Map::new();
-        if let Err(e) = Self::eval_env(&w.env, &cm, &mut env_ctx, &maps)
-            .and_then(|_| Self::eval_env(&job.env, &cm, &mut env_ctx, &maps))
+        if let Err(e) = Self::eval_env(self.ctx, &w.env, &cm, &mut env_ctx, &maps)
+            .and_then(|_| Self::eval_env(self.ctx, &job.env, &cm, &mut env_ctx, &maps))
             .and_then(|_| {
                 if exclusive {
                     let fixed: Vec<u16> = env_ctx
@@ -2279,7 +2321,7 @@ impl<'a> Runner<'a> {
                 record(&mut steps_ctx, &s.id, "success", "success", Map::new());
                 continue;
             }
-            if remote_effect(run) {
+            if crate::script::remote_effect(run) {
                 push(
                     &mut steps,
                     Outcome::Skip("pushes, publishes or deploys".into()),
@@ -2290,7 +2332,9 @@ impl<'a> Runner<'a> {
                 record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
                 continue;
             }
-            if global_install(run) {
+            if crate::script::global_install(run, &|c| self.ctx.find_tool(c).is_some())
+                == crate::script::Install::Needed
+            {
                 push(
                     &mut steps,
                     Outcome::Skip("installs system packages".into()),
@@ -2302,7 +2346,7 @@ impl<'a> Runner<'a> {
                 continue;
             }
             // interpolate
-            let ctx = Ctx::new(&scm, status);
+            let ctx = Ctx::new(&scm, status).with_token(self.ctx);
             let script = expr::interpolate(run, &ctx);
             let mut env_now = step_env.clone();
             // An install that another job runs here with another shell or env
@@ -2316,8 +2360,8 @@ impl<'a> Runner<'a> {
                     Value::String(job.id.clone()),
                 );
             }
-            let env_res = Self::eval_env(&s.env, &scm, &mut env_now, &maps);
-            let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
+            let env_res = Self::eval_env(self.ctx, &s.env, &scm, &mut env_now, &maps);
+            let secrets = ctx.used_secrets.get() || matches!(env_res, Ok((true, _)));
             let (script, mut env_now) = match (script, env_res) {
                 (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
@@ -2462,6 +2506,9 @@ impl<'a> Runner<'a> {
                     queue += queued;
                     exit
                 });
+            if let Some(t) = self.ctx.github_token_if_fetched() {
+                mask_in_file(&log, t);
+            }
             let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
             let mut outputs = Map::new();
             for (k, v) in parse_file_command(&read("output")) {
@@ -3285,27 +3332,6 @@ mod tests {
         assert_eq!(orphan_owner("local-ci-lc1-x"), None);
         assert_eq!(orphan_owner("postgres"), None);
         assert!(alive(std::process::id() as i32));
-    }
-
-    #[test]
-    fn remote_effects() {
-        assert!(remote_effect("git push origin HEAD"));
-        assert!(remote_effect(
-            "npm run build && npm publish --access public"
-        ));
-        assert!(remote_effect("gh release upload v1 a.tgz"));
-        assert!(remote_effect("aws s3 sync dist s3://bucket"));
-        assert!(!remote_effect("git diff --exit-code"));
-        assert!(!remote_effect("npm run lint"));
-        assert!(!remote_effect("echo pushing"));
-    }
-
-    #[test]
-    fn system_installs() {
-        assert!(global_install("sudo apt-get install -y jq"));
-        assert!(global_install("echo hi\n  brew install x"));
-        assert!(!global_install("npm ci"));
-        assert!(!global_install("echo sudo"));
     }
 
     #[test]

@@ -296,7 +296,15 @@ pub fn execute_task(
         } else {
             None
         };
-        let r = runner.run_task(&ws.root, task, inputs, prepared, lock.is_some(), false);
+        let r = runner.run_task(
+            &ws.root,
+            task,
+            inputs,
+            prepared,
+            true,
+            lock.is_some(),
+            false,
+        );
         drop(lock);
         r
     })();

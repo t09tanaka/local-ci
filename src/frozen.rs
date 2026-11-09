@@ -69,6 +69,12 @@ pub struct Filters {
 pub struct SkippedWorkflow {
     pub workflow: String,
     pub reason: String,
+    /// The workflow was selected but cannot be run (a dependency cycle, a
+    /// `needs` of a job that does not exist, a matrix with keys that print
+    /// alike), as opposed to one the changes do not trigger. A run that left
+    /// one out is not a complete run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrunnable: bool,
 }
 
 /// A workflow GitHub does not run, as the plan was told.
@@ -175,6 +181,7 @@ fn drop_workflows(plan: &mut Plan, broken: &[(usize, String)]) {
             .collect()
     };
     for (i, why) in broken {
+        plan.unrunnable.push(plan.selected[*i].wf.file.clone());
         plan.skipped
             .push((plan.selected[*i].wf.file.clone(), why.clone()));
     }
@@ -249,6 +256,7 @@ impl FrozenPlan {
         }
         let graph = dag::build_graph(&workflows, &units)?;
         let (tasks, shard_groups) = dag::derive_tasks(&parts.plan, &workflows, &units);
+        let unrunnable = std::mem::take(&mut parts.plan.unrunnable);
         let mut fp = FrozenPlan {
             schema_version: SCHEMA_VERSION,
             digest: String::new(),
@@ -264,7 +272,11 @@ impl FrozenPlan {
                 .plan
                 .skipped
                 .into_iter()
-                .map(|(workflow, reason)| SkippedWorkflow { workflow, reason })
+                .map(|(workflow, reason)| SkippedWorkflow {
+                    unrunnable: unrunnable.contains(&workflow),
+                    workflow,
+                    reason,
+                })
                 .collect(),
             disabled: parts.disabled,
             units,
@@ -333,6 +345,12 @@ impl FrozenPlan {
                 .skipped
                 .iter()
                 .map(|s| (s.workflow.clone(), s.reason.clone()))
+                .collect(),
+            unrunnable: self
+                .skipped
+                .iter()
+                .filter(|s| s.unrunnable)
+                .map(|s| s.workflow.clone())
                 .collect(),
             units: self.units.iter().map(UnitSpec::to_unit).collect(),
             ignore_env: self.config.ignore_env.clone(),

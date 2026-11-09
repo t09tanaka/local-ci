@@ -101,6 +101,12 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
         invalid: vec![],
         incomplete: r.not_covered.clone(),
     };
+    // a workflow that could not be run at all was not checked
+    c.incomplete
+        .extend(fp.skipped.iter().filter(|s| s.unrunnable).map(|s| {
+            let name = crate::report::short(&fp.config.default_workflows_dir, &s.workflow);
+            format!("{name} (not run): {}", s.reason)
+        }));
     // which result stands for which unit of the plan
     let mut got: Vec<Vec<&UnitResult>> = vec![vec![]; fp.units.len()];
     for (i, ru) in r.units.iter().enumerate() {
@@ -136,10 +142,10 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
     }
     c.verdict = if c.has_problems() {
         Verdict::Invalid
-    } else if fp.units.is_empty() {
-        Verdict::NoWork
     } else if !c.incomplete.is_empty() {
         Verdict::Incomplete
+    } else if fp.units.is_empty() {
+        Verdict::NoWork
     } else {
         Verdict::Complete
     };

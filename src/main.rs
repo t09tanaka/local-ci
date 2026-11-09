@@ -223,6 +223,8 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
             // run with nothing to do always had
             "success" | "no_work" => 0,
             "failure" => 1,
+            // checked what it could, and left out what local-ci cannot reproduce
+            "incomplete" => 3,
             _ => 2,
         }
     })

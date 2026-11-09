@@ -205,6 +205,7 @@ impl SetupRecipe {
         workspace: Option<&str>,
         root: &Path,
         tctx: &TemplateContext,
+        contents: bool,
     ) -> Result<HashMap<String, HashSet<usize>>, String> {
         let mut out: HashMap<String, HashSet<usize>> = HashMap::new();
         if receipt.steps.is_empty() {
@@ -220,29 +221,12 @@ impl SetupRecipe {
             return Err("its template key is not the key of this task's recipe here".into());
         }
         // The id outlives what the workspace held (`git clean -fdx` leaves the
-        // git dir alone), and a tree with the right names may hold other
-        // contents: believe the install only for the tree it made.
-        for a in &receipt.artifacts {
-            let at = root.join(&a.path);
-            if at.symlink_metadata().is_err() {
-                return Err(format!(
-                    "`{}`, which the setup made, is no longer in the workspace",
-                    a.path
-                ));
-            }
-            match crate::tree::tree_digest(&at) {
-                Ok(d) if d.digest == a.digest => {}
-                Ok(_) => {
-                    return Err(format!(
-                        "`{}` is no longer what the setup made (its tree digest differs)",
-                        a.path
-                    ))
-                }
-                Err(e) => {
-                    return Err(format!("`{}` cannot be checked: {e:#}", a.path));
-                }
-            }
-        }
+        // git dir alone), so look for what the install made before believing
+        // it. A receipt that comes from elsewhere is believed only for the
+        // tree it describes; one the run that set up this workspace passes to
+        // its own tasks is not hashed again, as the tasks that ran before may
+        // have written next to what the install made.
+        verify_artifacts(receipt, root, contents)?;
         for s in self.steps.iter().filter(|s| receipt.covers(&s.id)) {
             for a in &s.at {
                 out.entry(a.job.clone()).or_default().insert(a.index);
@@ -250,6 +234,38 @@ impl SetupRecipe {
         }
         Ok(out)
     }
+}
+
+/// What a receipt says the setup made is in `root`: every artifact is there
+/// and, with `contents`, is the tree the receipt has the digest of.
+pub(crate) fn verify_artifacts(
+    receipt: &PreparedReceipt,
+    root: &Path,
+    contents: bool,
+) -> Result<(), String> {
+    for a in &receipt.artifacts {
+        let at = root.join(&a.path);
+        if at.symlink_metadata().is_err() {
+            return Err(format!(
+                "`{}`, which the setup made, is no longer in the workspace",
+                a.path
+            ));
+        }
+        if !contents {
+            continue;
+        }
+        match crate::tree::tree_digest(&at) {
+            Ok(d) if d.digest == a.digest => {}
+            Ok(_) => {
+                return Err(format!(
+                    "`{}` is no longer what the setup made (its tree digest differs)",
+                    a.path
+                ))
+            }
+            Err(e) => return Err(format!("`{}` cannot be checked: {e:#}", a.path)),
+        }
+    }
+    Ok(())
 }
 
 /// Whether a prepared tree may be used by another run.
@@ -624,6 +640,13 @@ fn ignored_differences(
         .collect()
 }
 
+/// The first 8 hex digits of a value's SHA-256: enough to tell two values
+/// apart, and no way to read one (it may hold a credential).
+fn fingerprint(value: &str) -> String {
+    let d = sha256_of(value);
+    format!("sha256:{}", &d["sha256:".len()..][..8])
+}
+
 /// One line on the `ignore-env` values a shared install ran with, when another
 /// job that shares it has other ones: which job's which env, with which value.
 pub(crate) fn ignored_env_note(s: &RecipeStep) -> Option<String> {
@@ -635,7 +658,7 @@ pub(crate) fn ignored_env_note(s: &RecipeStep) -> Option<String> {
             "no ignore-env entry".to_string()
         } else {
             m.iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| format!("{k}={}", fingerprint(v)))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -649,7 +672,7 @@ pub(crate) fn ignored_env_note(s: &RecipeStep) -> Option<String> {
                 d.workflow,
                 d.job,
                 match &d.value {
-                    Some(v) => format!("{}={v}", d.name),
+                    Some(v) => format!("{}={}", d.name, fingerprint(v)),
                     None => format!("{} unset", d.name),
                 }
             )

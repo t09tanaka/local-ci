@@ -554,7 +554,7 @@ fn a_receipt_is_believed_only_for_the_tree_the_setup_made() {
 
 #[test]
 fn ignore_env_values_that_differ_between_jobs_are_recorded() {
-    let jobs = "  a:\n    runs-on: x\n    env:\n      DB_URL: one\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n  b:\n    runs-on: x\n    env:\n      DB_URL: two\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n";
+    let jobs = "  a:\n    runs-on: x\n    env:\n      DB_URL: one-secret\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n  b:\n    runs-on: x\n    env:\n      DB_URL: two-secret\n    steps:\n      - run: sh install.sh\n      - run: test -f installed.marker\n";
     let (tmp, dir) = lab(&[
         (W1, wf("x/**", jobs)),
         (
@@ -571,9 +571,15 @@ fn ignore_env_values_that_differ_between_jobs_are_recorded() {
     assert_eq!(r.setup.len(), 2, "{:?}", r.setup);
     let note = r.setup[0].note.as_deref().expect("a note on the install");
     assert!(note.contains("ignore-env"), "{note}");
-    assert!(note.contains("DB_URL=one"), "{note}");
+    // the name and a fingerprint of the value, never the value
+    assert!(note.contains("DB_URL=sha256:5939fc78"), "{note}");
     assert!(note.contains("one.yml › a"), "{note}");
-    assert!(note.contains("one.yml › b: DB_URL=two"), "{note}");
+    assert!(
+        note.contains("one.yml › b: DB_URL=sha256:7997011b"),
+        "{note}"
+    );
+    assert!(!note.contains("secret"), "{note}");
+    assert!(!r.warnings.iter().any(|w| w.contains("secret")));
     assert!(r.warnings.iter().any(|w| w == note), "{:?}", r.warnings);
 
     // and in the receipt of the setup
@@ -595,10 +601,17 @@ fn ignore_env_values_that_differ_between_jobs_are_recorded() {
     )
     .unwrap();
     assert_eq!(done.receipt.notes.len(), 2, "{:?}", done.receipt.notes);
-    assert!(done.receipt.notes[0].text.contains("DB_URL=two"));
+    assert!(done.receipt.notes[0]
+        .text
+        .contains("DB_URL=sha256:7997011b"));
+    assert!(done
+        .receipt
+        .notes
+        .iter()
+        .all(|n| !n.text.contains("secret")));
 
     // jobs that agree leave no note
-    let same = jobs.replace("two", "one");
+    let same = jobs.replace("two-secret", "one-secret");
     let (tmp, dir) = lab(&[
         (W1, wf("x/**", &same)),
         (
@@ -609,4 +622,210 @@ fn ignore_env_values_that_differ_between_jobs_are_recorded() {
     let r = execute(&tmp, &dir, &plan(&tmp, &dir), "env3");
     assert_eq!(r.setup.len(), 2);
     assert!(r.setup.iter().all(|s| s.note.is_none()));
+}
+
+// ---- an install is believed in its own run, without hashing it again ----
+
+const CACHE_JOBS: &str = "  a:\n    runs-on: x\n    steps:\n      - run: sh node.sh\n      - run: mkdir -p node_modules/.cache && echo x > node_modules/.cache/t\n  b:\n    runs-on: x\n    needs: a\n    steps:\n      - run: sh node.sh\n      - run: test -f node_modules/.cache/t\n";
+
+#[test]
+fn a_job_that_writes_in_node_modules_does_not_make_the_next_job_install_again() {
+    let (tmp, dir) = lab(&[(W1, wf("x/**", CACHE_JOBS))]);
+    let fp = plan(&tmp, &dir);
+    let r = execute(&tmp, &dir, &fp, "cachewrite");
+    assert_eq!(r.state, "success", "{}", r.description);
+    let b = r.units[0].jobs.iter().find(|j| j.job == "b").unwrap();
+    assert_eq!(b.steps[0].outcome, Outcome::Skip("setup".into()), "{b:?}");
+    assert_eq!(b.steps[1].outcome, Outcome::Pass);
+}
+
+#[test]
+fn a_receipt_from_outside_is_checked_again_before_it_is_used() {
+    let (tmp, dir) = lab(&[(W1, wf("x/**", NODE_JOB))]);
+    let fp = plan(&tmp, &dir);
+    // something wrote next to what the install made after the receipt was made
+    let (ws, _, done) = setup_in(&tmp, &dir, &fp, "late-write");
+    std::fs::create_dir_all(ws.root.join("node_modules/.cache")).unwrap();
+    std::fs::write(ws.root.join("node_modules/.cache/t"), "x").unwrap();
+    let r = task_with(&tmp, &fp, &ws, &done.receipt);
+    assert!(r.receipt_ignored.is_some(), "{r:?}");
+    assert_eq!(r.jobs[0].steps[0].outcome, Outcome::Pass);
+}
+
+#[test]
+fn a_copy_of_a_template_is_checked_when_it_is_made() {
+    use local_ci::template::TemplateStore;
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, dir) = lab(&[(W1, wf("x/**", NODE_JOB))]);
+    let fp = plan(&tmp, &dir);
+    let (ws, recipe, done) = setup_in(&tmp, &dir, &fp, "builder");
+    assert!(done.ok());
+    let key = recipe.template_key(&TemplateContext::local(&fp, "run-1"));
+    let c = ctx(tmp.path());
+    let store = TemplateStore::new(tmp.path().join("templates"));
+    let tpl = store.publish(&c, &key, &done.receipt, &ws.root).unwrap();
+    // a copy right after it was made is what the receipt describes
+    let ok = tmp.path().join("copy-ok");
+    let receipt = tpl.materialize(&c, &ok).unwrap();
+    assert_eq!(receipt.steps, done.receipt.steps);
+    // a template that was changed after it was sealed is not copied
+    let file = tpl.tree().join("node_modules/p/b.js");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&file, "TWO").unwrap();
+    let bad = tmp.path().join("copy-bad");
+    assert!(tpl.materialize(&c, &bad).is_err());
+    assert!(!bad.exists());
+}
+
+// ---- a matrix job whose task cannot be run ----
+
+#[test]
+fn a_matrix_job_whose_task_cannot_be_run_fails_every_entry_without_a_missing_note() {
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - run: echo a\n  b:\n    runs-on: x\n    needs: a\n    strategy:\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.n }}\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let mut fp = plan(&tmp, &dir);
+    // b's variants are tried before a, which they need
+    let first_b = fp
+        .tasks
+        .iter()
+        .position(|t| t.jobs == ["b"])
+        .expect("a task of b");
+    let ia = fp.tasks.iter().position(|t| t.jobs == ["a"]).unwrap();
+    fp.tasks.swap(ia, first_b);
+    let r = execute(&tmp, &dir, &fp, "matrix-err");
+    let b: Vec<_> = r.units[0].jobs.iter().filter(|j| j.job == "b").collect();
+    assert_eq!(b.len(), 3, "{b:?}");
+    assert!(b.iter().all(|j| matches!(j.outcome, Outcome::Error(_))));
+    assert!(
+        r.completeness.missing.is_empty(),
+        "{:?}",
+        r.completeness.missing
+    );
+    assert_eq!(r.state, "error");
+}
+
+// ---- a workflow that could not be run is not a pass ----
+
+#[test]
+fn a_workflow_that_cannot_be_run_makes_the_run_incomplete() {
+    let cyc = "  a:\n    runs-on: x\n    needs: b\n    steps:\n      - run: echo a\n  b:\n    runs-on: x\n    needs: a\n    steps:\n      - run: echo b\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", cyc)), (W2, wf("y/**", PLAIN))]);
+    let fp = plan(&tmp, &dir);
+    assert!(fp.skipped.iter().any(|s| s.unrunnable), "{:?}", fp.skipped);
+    let r = execute(&tmp, &dir, &fp, "cycle");
+    assert_eq!(r.completeness.verdict, Verdict::Incomplete);
+    assert_eq!(r.state, "incomplete", "{}", r.description);
+    assert!(
+        r.completeness
+            .incomplete
+            .iter()
+            .any(|i| i.contains("one.yml (not run)")),
+        "{:?}",
+        r.completeness.incomplete
+    );
+    assert!(r.description.contains("one.yml"), "{}", r.description);
+
+    // when that is the only workflow, nothing ran, and that is not `no_work`
+    let (tmp, dir) = lab(&[(W1, wf("x/**", cyc))]);
+    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "cycle2");
+    assert_eq!(r.state, "incomplete", "{}", r.description);
+
+    // a workflow the changes do not trigger is not a gap
+    let (tmp, dir) = lab(&[(W1, wf("nothing/**", PLAIN)), (W2, wf("y/**", PLAIN))]);
+    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "untriggered");
+    assert_eq!(r.state, "success", "{}", r.description);
+}
+
+// ---- the machine's GitHub token ----
+
+fn ctx_with_gh(home: &Path, token: Option<&str>) -> ExecContext {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = match token {
+        Some(t) => format!("#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo {t}\n"),
+        None => "#!/bin/sh\nexit 1\n".to_string(),
+    };
+    std::fs::write(bin.join("gh"), script).unwrap();
+    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    ExecContext::new(
+        [
+            (
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/local/bin", bin.display()),
+            ),
+            ("HOME", home.to_string_lossy().into_owned()),
+            (
+                "LOCAL_CI_HOME",
+                home.join("cache").to_string_lossy().into_owned(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    )
+}
+
+const TOKEN_JOB: &str = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: test \"$GH_TOKEN\" = ghs_faketoken123 && echo \"token ${{ github.token }}\"\n";
+
+#[test]
+fn the_machines_github_token_is_supplied_and_masked_in_the_log() {
+    let (tmp, dir) = lab(&[(W1, wf("x/**", TOKEN_JOB))]);
+    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "token");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "success", "{}", r.description);
+    let step = &r.units[0].jobs[0].steps[0];
+    assert_eq!(step.outcome, Outcome::Pass);
+    let log = std::fs::read_to_string(step.log.as_ref().unwrap()).unwrap();
+    assert!(log.contains("token ***"), "{log}");
+    assert!(!log.contains("ghs_faketoken123"), "{log}");
+
+    // no token on this machine: skipped as before, and the run is incomplete
+    let (tmp, dir) = lab(&[(W1, wf("x/**", TOKEN_JOB))]);
+    let c = ctx_with_gh(tmp.path(), None);
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "notoken");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "incomplete", "{}", r.description);
+
+    // other secrets are never supplied
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - run: echo ${{ secrets.OTHER }}\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "other");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "incomplete");
+}
+
+// ---- what reads and what writes outside this machine ----
+
+#[test]
+fn reading_commands_run_and_writing_ones_are_left_out() {
+    let step = |run: &str| format!("      - run: {run}\n");
+    let jobs = format!(
+        "  a:\n    runs-on: x\n    steps:\n{}{}{}{}",
+        step("git push --dry-run origin HEAD || true"),
+        step("echo using aws sdk"),
+        step("grep -q installed install.sh"),
+        step("sudo -n true || true"),
+    );
+    let (tmp, dir) = lab(&[(W1, wf("x/**", &jobs))]);
+    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "reads");
+    assert_eq!(
+        r.state, "success",
+        "{} {:?}",
+        r.description, r.units[0].jobs[0].steps
+    );
+
+    let jobs = format!(
+        "  a:\n    runs-on: x\n    steps:\n{}",
+        step("git push origin main"),
+    );
+    let (tmp, dir) = lab(&[(W1, wf("x/**", &jobs))]);
+    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "writes");
+    assert_eq!(r.state, "incomplete");
+    assert!(r.description.contains("not covered"), "{}", r.description);
 }

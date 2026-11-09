@@ -292,7 +292,7 @@ pub fn assemble(
         state,
         &result.units,
         result.completeness.verdict == Verdict::NoWork,
-        result.not_covered.len(),
+        &result.completeness.incomplete,
         result.completeness.problems().len(),
         dir,
     );
@@ -303,7 +303,7 @@ pub fn description(
     state: &str,
     units: &[UnitResult],
     no_work: bool,
-    not_covered: usize,
+    not_covered: &[String],
     problems: usize,
     dir: &str,
 ) -> String {
@@ -317,8 +317,20 @@ pub fn description(
         "{state}: pass {} / fail {} / error {} / skip {}",
         c.pass, c.fail, c.error, c.skip
     );
-    if not_covered > 0 {
-        d.push_str(&format!(", {not_covered} not covered"));
+    if !not_covered.is_empty() {
+        d.push_str(&format!(", {} not covered", not_covered.len()));
+        // the first two names, so the status says what was left out
+        let names: Vec<String> = not_covered
+            .iter()
+            .take(2)
+            .map(|e| {
+                let n = e.split(": ").next().unwrap_or(e);
+                let n = n.rsplit(" › ").next().unwrap_or(n);
+                n.chars().take(24).collect()
+            })
+            .collect();
+        d.push_str(&format!(" ({}", names.join(", ")));
+        d.push_str(if not_covered.len() > 2 { ", ...)" } else { ")" });
     }
     if problems > 0 {
         d.push_str(&format!(", {problems} result problems"));
@@ -438,7 +450,7 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
     if !problems.is_empty() {
         println!("INCOMPLETE RESULT  {}", problems.join("; "));
     }
-    if !r.not_covered.is_empty() {
+    if !r.completeness.incomplete.is_empty() {
         println!(
             "not covered{}: {}",
             if r.state == "incomplete" {
@@ -446,7 +458,7 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
             } else {
                 ""
             },
-            r.not_covered.join("; ")
+            r.completeness.incomplete.join("; ")
         );
     }
     if !r.warnings.is_empty() {
@@ -570,13 +582,17 @@ mod tests {
             "success",
             &u(vec![Outcome::Pass]),
             false,
-            2,
+            &[
+                "ci.yml › deploy › Push image: pushes, publishes or deploys".into(),
+                "ci.yml › deploy › Install jq: installs system packages".into(),
+                "x".into(),
+            ],
             0,
             ".github/workflows",
         );
         assert_eq!(
             d,
-            "ci.yml: success: pass 1 / fail 0 / error 0 / skip 0, 2 not covered"
+            "ci.yml: success: pass 1 / fail 0 / error 0 / skip 0, 3 not covered (Push image, Install jq, ...)"
         );
         assert!(d.len() <= 140);
     }

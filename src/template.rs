@@ -108,7 +108,10 @@ impl PreparedTemplate {
     /// `dest` is made a workspace of its own (it gets an id, see
     /// [`crate::setup::workspace_id`]) and the receipt returned is the
     /// template's, bound to it: [`crate::execute_task`] given that receipt in
-    /// `dest` skips the steps the template prepared. A tree copied by any other
+    /// `dest` skips the steps the template prepared (it checks the tree again
+    /// before it believes the receipt, as the receipt may be used later, after
+    /// something wrote in `dest`). The copy is checked against the receipt
+    /// right after it is made; a template that does not match is an error. A tree copied by any other
     /// means has no such receipt and prepares everything itself.
     pub fn materialize(&self, ctx: &ExecContext, dest: &Path) -> Result<PreparedReceipt> {
         if dest.exists() {
@@ -116,6 +119,12 @@ impl PreparedTemplate {
         }
         copy_tree(ctx, &self.tree(), dest)?;
         make_writable(dest)?;
+        // Nobody has written in the copy yet: it must hold what the receipt
+        // says the setup made.
+        if let Err(why) = crate::setup::verify_artifacts(&self.receipt, dest, true) {
+            let _ = remove_tree(dest);
+            bail!("the copy of the template differs from what its receipt describes: {why}");
+        }
         let id = crate::setup::ensure_workspace_id(dest)?;
         Ok(self.receipt.rebound(&id))
     }

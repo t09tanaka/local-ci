@@ -148,7 +148,7 @@ fn runs_jobs_with_dynamic_matrix() {
     let out = stdout(&o);
     // the report-upload step is an action local-ci cannot reproduce: nothing
     // failed, but the run is not a pass
-    assert_eq!(o.status.code(), Some(2), "{out}");
+    assert_eq!(o.status.code(), Some(3), "{out}");
     assert!(out.contains("result: incomplete"), "{out}");
     for line in [
         "PASS   ci.yml › lint",

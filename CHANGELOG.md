@@ -113,9 +113,14 @@
   - A run that skipped what local-ci cannot reproduce (a step that uses an
     action it does not know, a `secrets` step, an install of system
     packages, a push or deploy, `upload-artifact` / `download-artifact`) has
-    the state `incomplete` and exits 2 (it used to be a `success` with a
-    "not covered" note and exit 0). Its commit status is `error`, never
-    `success`; `local-ci status` does the same. `checkout`, `cache` and the
+    the state `incomplete` and exits 3 (it used to be a `success` with a
+    "not covered" note and exit 0; exit 2 stays for `error`). Its commit
+    status is `error`, never `success`, and its description names the first
+    steps that were left out; `local-ci status` does the same. A workflow that
+    was selected but cannot be run (a dependency cycle, a `needs` of a job that
+    does not exist, a matrix with keys that print alike) makes the run
+    `incomplete` too, with the reason under `completeness.incomplete`; a
+    workflow the changes simply do not trigger does not. `checkout`, `cache` and the
     setup actions are not gaps.
   - A task that cannot be run (not a step that fails: the task itself)
     counts as a failure for the jobs that need it. Before, those jobs saw a
@@ -131,7 +136,45 @@
 - When jobs that share one install have other values of an `ignore-env`
   variable, the install ran with the values of the first. The setup step's
   note, the run's warnings and the receipt's `notes` now say which job's
-  value it ran with and which other jobs differ.
+  value it ran with and which other jobs differ. Values are shown as a name and the first 8 hex
+  digits of the value's SHA-256, never the value (it may hold a credential).
+- What is left out is decided from the commands a `run:` script runs, not from
+  words in it. The script is cut into simple commands (at `;`, `&&`, `||`,
+  `|`, `&` and newlines; comments and heredoc bodies are dropped; `bash -c`
+  scripts are read too), the command is found past `sudo`, `env`, `command`
+  and the like, and its subcommand decides. `git push --dry-run`,
+  `echo using aws sdk`, `grep x vercel.json`, `kubectl kustomize`,
+  `gh pr list`, `aws sts get-caller-identity` and `sudo -n true` are run;
+  `git push`, `npm publish`, `gh pr merge|create|comment|edit`,
+  `gh api -X POST`, `aws s3 cp|sync|rm` to a bucket, `aws ... deploy`,
+  `kubectl apply|delete|create|replace|patch|rollout`, `vercel`/`netlify`
+  deploys and installs of system packages (`sudo apt-get install`, `brew
+  install`) are left out. A `brew install` of formulae that are on the PATH
+  already is run.
+- A step that reads `github.token` or `secrets.GITHUB_TOKEN` is run with this
+  machine's token (`gh auth token`, asked once, only when a step needs it) and
+  the value is masked in the step's log; without a token it is skipped as
+  before (`incomplete`). Other secrets are still never supplied.
+- A receipt is believed without hashing the tree again in the workspace the
+  run's own setup made, and in a unit's copy of it (checked once, when the copy
+  is made, before any task wrote in it), so a job that writes next to the
+  install (`node_modules/.cache`) does not make the next job install again. A
+  receipt that comes from elsewhere (`execute_task`) is checked right before it
+  is used, and `PreparedTemplate::materialize` checks the copy it made against
+  the receipt (an altered template is an error). The tree digest takes file
+  names and link targets as bytes, so names that are not UTF-8 are told apart.
+- A task that cannot be run fails every entry of a matrix job (with the
+  reason), not one entry in its place, so the result no longer also lists the
+  other entries as missing.
+- Library, breaking: `report::assemble` no longer takes the `no_work` flag and
+  takes the whole plan; `report::warnings` and `report::description` have new
+  signatures (`description` takes the list of what was left out, not a count);
+  `UnitResult` has `unit` and `outcomes`; `RunResult` has `completeness`;
+  `PreparedReceipt` has `notes`; `SkippedWorkflow` has `unrunnable`;
+  `TaskResult` has `artifacts`; `status()` returns the state a commit status
+  can have (`success`, `failure` or `error`), not the run's state; `Ctx` of
+  `expr` has `with_token` and `used_token`; `ExecContext::github_token`. The
+  exit code of an `incomplete` run is 3.
 
 ## 0.7.0
 

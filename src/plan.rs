@@ -53,6 +53,10 @@ pub struct StepKey {
 pub struct Plan {
     pub selected: Vec<Selected>,
     pub skipped: Vec<(String, String)>,
+    /// The files of those in `skipped` that were selected but cannot be run
+    /// (a dependency cycle, a `needs` of nothing, a matrix with keys that
+    /// print alike), as opposed to the ones the changes do not trigger.
+    pub unrunnable: Vec<String>,
     pub units: Vec<Unit>,
     /// Names of `env:` entries that do not decide what an install does
     /// (`ignore-env` of `.local-ci.toml`); they are left out of step keys.

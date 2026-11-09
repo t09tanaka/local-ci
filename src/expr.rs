@@ -41,8 +41,14 @@ pub struct Ctx<'a> {
     /// Top-level contexts: github, env, matrix, steps, needs, job, runner, inputs, vars, strategy.
     pub contexts: &'a Map<String, Value>,
     pub status: StatusFns,
-    /// Set when the expression touched `secrets.*`.
+    /// Set when the expression touched `secrets.*` (or `github.token`) and no
+    /// value could be supplied.
     pub used_secrets: Cell<bool>,
+    /// Where the value of `github.token` / `secrets.GITHUB_TOKEN` comes from,
+    /// when this host can supply it.
+    token_from: Option<&'a crate::context::ExecContext>,
+    /// Set when the token's value was put into the expression's result.
+    pub used_token: Cell<bool>,
 }
 
 impl<'a> Ctx<'a> {
@@ -55,7 +61,23 @@ impl<'a> Ctx<'a> {
             contexts,
             status,
             used_secrets: Cell::new(false),
+            token_from: None,
+            used_token: Cell::new(false),
         }
+    }
+
+    /// Supply the value of `github.token` and `secrets.GITHUB_TOKEN` from
+    /// `ctx` (this machine's `gh auth token`) instead of flagging them as
+    /// secrets. Other secrets stay flagged.
+    pub fn with_token(mut self, ctx: &'a crate::context::ExecContext) -> Self {
+        self.token_from = Some(ctx);
+        self
+    }
+
+    fn token(&self) -> Option<String> {
+        let t = self.token_from?.github_token()?;
+        self.used_token.set(true);
+        Some(t.to_string())
     }
 }
 
@@ -433,13 +455,22 @@ fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
             }
         }
         Ast::Prop(b, k) => {
-            let base = eval(b, ctx)?;
             let key = eval(k, ctx)?;
-            // `github.token` is a credential, like `secrets.GITHUB_TOKEN`
-            if matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("github"))
-                && to_string(&key).eq_ignore_ascii_case("token")
-            {
-                ctx.used_secrets.set(true);
+            let name = to_string(&key);
+            // `secrets.GITHUB_TOKEN` and `github.token` are the same credential
+            let secrets = matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("secrets"));
+            let github = matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("github"));
+            if secrets && name.eq_ignore_ascii_case("GITHUB_TOKEN") {
+                if let Some(t) = ctx.token() {
+                    return Ok(Value::String(t));
+                }
+            }
+            let base = eval(b, ctx)?;
+            if github && name.eq_ignore_ascii_case("token") {
+                match ctx.token() {
+                    Some(t) => return Ok(Value::String(t)),
+                    None => ctx.used_secrets.set(true),
+                }
             }
             get_prop(&base, &key)
         }

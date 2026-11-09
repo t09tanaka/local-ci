@@ -19,6 +19,7 @@ pub mod plan;
 pub mod portool;
 pub mod report;
 mod run;
+mod script;
 pub mod setup;
 pub mod source;
 pub mod task;
