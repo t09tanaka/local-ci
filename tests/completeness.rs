@@ -121,7 +121,7 @@ fn workspace(tmp: &tempfile::TempDir, dir: &Path, fp: &FrozenPlan, name: &str) -
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt").join(name);
-    local_ci::git::add_worktree(&ctx(tmp.path()), dir, &wt, &fp.source.sha).unwrap();
+    local_ci::git::add_worktree(&ctx(tmp.path()), dir, &wt, &fp.source.execution_commit).unwrap();
     let ws = Workspace {
         root: wt,
         repo_root: dir.to_path_buf(),
@@ -285,6 +285,7 @@ fn run_opts(dir: &Path, cache: &Path) -> RunOptions {
         job_timeout: 5.0,
         no_cache: false,
         cache_dir: cache.to_path_buf(),
+        source: None,
     }
 }
 
