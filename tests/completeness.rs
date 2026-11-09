@@ -800,6 +800,54 @@ fn the_machines_github_token_is_supplied_and_masked_in_the_log() {
     assert_eq!(r.state, "incomplete");
 }
 
+fn tree_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            tree_files(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+#[test]
+fn the_token_is_never_written_to_a_file_of_the_run() {
+    // the script itself checks, while it runs, that it holds no token and
+    // that only its owner can read it
+    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: |\n          ! grep -q ghs_faketoken123 \"$0\"\n          test \"$(ls -l \"$0\" | cut -c1-10)\" = -rw-------\n          test \"$GH_TOKEN\" = ghs_faketoken123\n          echo \"viewer ${{ github.token }}\"\n      - env:\n          T: ${{ format('x-{0}', secrets.GITHUB_TOKEN) }}\n        run: ! grep -q ghs_faketoken123 \"$0\" && test \"$T\" = x-ghs_faketoken123\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "nodisk");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(
+        r.state, "success",
+        "{} {:?}",
+        r.description, r.units[0].jobs[0].steps
+    );
+    let mut files = Vec::new();
+    tree_files(tmp.path(), &mut files);
+    let mut seen = 0;
+    for f in files {
+        // the fake `gh` and the workflow under test name the value themselves
+        if f.starts_with(tmp.path().join("fakebin"))
+            || f.to_string_lossy().contains("/wt/")
+            || f.to_string_lossy().contains("/.github/workflows/")
+        {
+            continue;
+        }
+        let b = std::fs::read(&f).unwrap();
+        seen += 1;
+        assert!(
+            !String::from_utf8_lossy(&b).contains("ghs_faketoken123"),
+            "token in {}",
+            f.display()
+        );
+    }
+    assert!(seen > 3);
+}
+
 // ---- what reads and what writes outside this machine ----
 
 #[test]

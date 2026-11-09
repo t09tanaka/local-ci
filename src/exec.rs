@@ -962,9 +962,9 @@ impl<'a> Runner<'a> {
             let mark = shlex::try_quote(&turn.to_string_lossy())
                 .map(|q| format!(": > {q} 2>/dev/null || true; "))
                 .unwrap_or_default();
-            fs::write(&file, format!("{mark}{script}"))?;
+            write_private(&file, &format!("{mark}{script}"))?;
         } else {
-            fs::write(&file, script)?;
+            write_private(&file, script)?;
         }
         let f = file.to_string_lossy().into_owned();
         let mut argv: Vec<String> = match shell.map(str::trim) {
@@ -2362,6 +2362,11 @@ impl<'a> Runner<'a> {
             }
             let env_res = Self::eval_env(self.ctx, &s.env, &scm, &mut env_now, &maps);
             let secrets = ctx.used_secrets.get() || matches!(env_res, Ok((true, _)));
+            let shell_now = s
+                .shell
+                .as_deref()
+                .or(job.shell.as_deref())
+                .or(w.shell.as_deref());
             let (script, mut env_now) = match (script, env_res) {
                 (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
@@ -2414,6 +2419,14 @@ impl<'a> Runner<'a> {
             } else {
                 rewrite_ports(&script, &maps)
             };
+            // The token is never written into the script: it becomes a
+            // reference to an environment variable only the process gets.
+            // Another shell cannot be given a reference that is safe in
+            // every place it may stand, so such a step is skipped.
+            let token_in_script = script.contains(expr::TOKEN_MARK);
+            let sh_like = matches!(shell_now.map(str::trim), None | Some("bash") | Some("sh"));
+            let secrets = secrets || (token_in_script && !sh_like);
+            let script = script.replace(expr::TOKEN_MARK, &format!("${{{}}}", expr::TOKEN_ENV));
             if secrets {
                 push(
                     &mut steps,
@@ -2464,8 +2477,19 @@ impl<'a> Runner<'a> {
                     projects.push(p);
                 }
             }
+            let real_token = self.ctx.github_token().unwrap_or_default();
             for (k, v) in &env_now {
-                env.push((k.clone(), expr::to_string(v)));
+                env.push((
+                    k.clone(),
+                    expr::to_string(v).replace(expr::TOKEN_MARK, real_token),
+                ));
+            }
+            if token_in_script
+                || env_now
+                    .values()
+                    .any(|v| expr::to_string(v).contains(expr::TOKEN_MARK))
+            {
+                env.push((expr::TOKEN_ENV.into(), real_token.to_string()));
             }
             let log = self.log_path(&w.file, &display, n + 1, &label);
             let remaining = job_timeout.saturating_sub(t0.elapsed());
@@ -2912,6 +2936,20 @@ impl<'a> Runner<'a> {
 }
 
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
+/// Write a file only its owner can read: step scripts may hold values that
+/// must not be shared.
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    f.write_all(content.as_bytes())
+}
+
 fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(match v {
         Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,

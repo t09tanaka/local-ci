@@ -37,6 +37,12 @@ impl From<Status> for StatusFns {
     }
 }
 
+/// Stands for this machine's GitHub token inside an evaluated expression.
+pub const TOKEN_MARK: &str = "\u{e000}local-ci-github-token\u{e001}";
+
+/// The environment variable that carries the token to a step's process.
+pub const TOKEN_ENV: &str = "LOCAL_CI_GITHUB_TOKEN";
+
 pub struct Ctx<'a> {
     /// Top-level contexts: github, env, matrix, steps, needs, job, runner, inputs, vars, strategy.
     pub contexts: &'a Map<String, Value>,
@@ -47,7 +53,7 @@ pub struct Ctx<'a> {
     /// Where the value of `github.token` / `secrets.GITHUB_TOKEN` comes from,
     /// when this host can supply it.
     token_from: Option<&'a crate::context::ExecContext>,
-    /// Set when the token's value was put into the expression's result.
+    /// Set when the token's mark was put into the expression's result.
     pub used_token: Cell<bool>,
 }
 
@@ -68,16 +74,19 @@ impl<'a> Ctx<'a> {
 
     /// Supply the value of `github.token` and `secrets.GITHUB_TOKEN` from
     /// `ctx` (this machine's `gh auth token`) instead of flagging them as
-    /// secrets. Other secrets stay flagged.
+    /// secrets. Other secrets stay flagged. The value itself never enters an
+    /// expression's result: it is [`TOKEN_MARK`], which the caller turns into
+    /// a reference to an environment variable (scripts) or the value itself
+    /// (the child's environment only), so the token is never written to disk.
     pub fn with_token(mut self, ctx: &'a crate::context::ExecContext) -> Self {
         self.token_from = Some(ctx);
         self
     }
 
     fn token(&self) -> Option<String> {
-        let t = self.token_from?.github_token()?;
+        self.token_from?.github_token()?;
         self.used_token.set(true);
-        Some(t.to_string())
+        Some(TOKEN_MARK.to_string())
     }
 }
 

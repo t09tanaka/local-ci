@@ -154,7 +154,10 @@
 - A step that reads `github.token` or `secrets.GITHUB_TOKEN` is run with this
   machine's token (`gh auth token`, asked once, only when a step needs it) and
   the value is masked in the step's log; without a token it is skipped as
-  before (`incomplete`). Other secrets are still never supplied.
+  before (`incomplete`). The value is never written to a file of the run: a
+  script holds a reference to `$LOCAL_CI_GITHUB_TOKEN` (set only in the step's
+  process, as is a `GH_TOKEN: ${{ github.token }}` env), and a step in another
+  shell than bash/sh that uses it is skipped. Step scripts are mode 0600. Other secrets are still never supplied.
 - A receipt is believed without hashing the tree again in the workspace the
   run's own setup made, and in a unit's copy of it (checked once, when the copy
   is made, before any task wrote in it), so a job that writes next to the
