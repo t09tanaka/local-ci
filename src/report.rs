@@ -221,18 +221,18 @@ pub fn warnings(setup: &[StepResult], units: &[UnitResult]) -> Vec<String> {
         .filter_map(|s| s.note.clone())
         .filter(|n| n.starts_with("ignore-env"))
         .collect();
-    out.extend(
-        units
-            .iter()
-            .flat_map(|u| &u.jobs)
-            .flat_map(|j| &j.steps)
-            .filter_map(|s| {
-                s.note
-                    .as_ref()
-                    .filter(|n| n.starts_with("wants "))
-                    .map(|n| format!("{}: {n}", s.label))
-            }),
-    );
+    // a step's note may hold several, told apart by "; "
+    for j in units.iter().flat_map(|u| &u.jobs) {
+        for st in &j.steps {
+            for n in st.note.iter().flat_map(|n| n.split("; ")) {
+                if n.starts_with("wants ") {
+                    out.push(format!("{}: {n}", st.label));
+                } else if n.starts_with("job output ") {
+                    out.push(format!("{}: {n}", j.job));
+                }
+            }
+        }
+    }
     out.sort();
     out.dedup();
     out

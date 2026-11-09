@@ -244,6 +244,11 @@ pub struct Runner<'a> {
     docker_ok: OnceLock<Result<(), String>>,
 }
 
+/// The descriptor a script holding the token is read from, and how a shell is
+/// told to read it.
+const PIPE_FD: i32 = 3;
+const PIPE_SCRIPT: &str = "/dev/fd/3";
+
 fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pat).unwrap())
 }
@@ -903,9 +908,20 @@ impl<'a> Runner<'a> {
         ]
     }
 
+    /// `text` with this machine's GitHub token, if it was asked for, replaced
+    /// by `***`: for what is recorded.
+    fn hide_token(&self, text: String) -> String {
+        match self.ctx.github_token_if_fetched() {
+            Some(t) if t.len() >= 4 => text.replace(t, "***"),
+            _ => text,
+        }
+    }
+
     /// Run one shell step. Output goes to `log`; returns how it ended and how
     /// long canirun kept it waiting for its turn. When canirun's ledger lock
     /// times out the command never started, so it is tried again, a few times.
+    /// A `piped` script holds the GitHub token: it is not written to a file but
+    /// handed to the shell over a pipe (see `shell_once`).
     #[allow(clippy::too_many_arguments)]
     fn shell(
         &self,
@@ -916,12 +932,14 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        piped: bool,
     ) -> Result<(Exit, Duration)> {
         let mut attempt = 0;
         let mut queued = Duration::ZERO;
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
-            let (r, q) = self.shell_once(cwd, script, shell, env, timeout, log, key.clone())?;
+            let (r, q) =
+                self.shell_once(cwd, script, shell, env, timeout, log, key.clone(), piped)?;
             queued += q;
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
@@ -946,6 +964,7 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        piped: bool,
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let file = self.tools.join(format!("scripts/step-{n}.sh"));
@@ -958,15 +977,24 @@ impl<'a> Runner<'a> {
         let turn = self.tools.join(format!("scripts/step-{n}.turn"));
         let queued = self.opts.canirun.is_some() && key.is_some();
         let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
-        if marked {
+        let body = if marked {
             let mark = shlex::try_quote(&turn.to_string_lossy())
                 .map(|q| format!(": > {q} 2>/dev/null || true; "))
                 .unwrap_or_default();
-            write_private(&file, &format!("{mark}{script}"))?;
+            format!("{mark}{script}")
         } else {
-            write_private(&file, script)?;
-        }
-        let f = file.to_string_lossy().into_owned();
+            script.to_string()
+        };
+        // A script that holds the token never reaches a file: the shell reads
+        // it from file descriptor 3, the read end of a pipe (so the argument
+        // list shows `/dev/fd/3` and nothing else), and canirun passes the
+        // descriptor on to its child.
+        let f = if piped {
+            PIPE_SCRIPT.to_string()
+        } else {
+            write_private(&file, &body)?;
+            file.to_string_lossy().into_owned()
+        };
         let mut argv: Vec<String> = match shell.map(str::trim) {
             None | Some("bash") => vec![
                 "bash".into(),
@@ -1016,9 +1044,42 @@ impl<'a> Runner<'a> {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        let pipe = if piped {
+            let (r, w) = std::io::pipe()?;
+            let rfd = std::os::fd::AsRawFd::as_raw_fd(&r);
+            // SAFETY: only dup2 and fcntl, which are async-signal-safe, run
+            // between fork and exec. dup2 clears close-on-exec on the copy.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if rfd == PIPE_FD {
+                        let fl = libc::fcntl(rfd, libc::F_GETFD);
+                        if fl < 0 || libc::fcntl(rfd, libc::F_SETFD, fl & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(rfd, PIPE_FD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Some((r, w))
+        } else {
+            None
+        };
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
+        if let Some((r, mut w)) = pipe {
+            // the child has its own copy
+            drop(r);
+            // A thread writes, so that a script larger than the pipe does not
+            // block here. It is not waited for: it ends when the shell closes
+            // the pipe or has read it all.
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let _ = std::io::Write::write_all(&mut w, body.as_bytes());
+            });
+        }
         let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
         self.ctx.cancel.track_pgid(pid);
@@ -1071,7 +1132,9 @@ impl<'a> Runner<'a> {
             std::thread::sleep(Duration::from_millis(200));
         };
         self.ctx.cancel.untrack_pgid(pid);
-        let _ = fs::remove_file(&file);
+        if !piped {
+            let _ = fs::remove_file(&file);
+        }
         // Waiting for its turn: until the script touched `turn`, or the first
         // line of output that is not canirun's own, or, when neither came
         // (canirun gave up, the step was stopped, a silent step of another
@@ -1288,6 +1351,7 @@ impl<'a> Runner<'a> {
                     Some(Duration::from_secs(1800)),
                     &log,
                     Some(format!("local-ci setup {label}")),
+                    false,
                 )
                 .map(|(exit, _)| exit);
             let (outcome, exit) = match res {
@@ -2074,26 +2138,24 @@ impl<'a> Runner<'a> {
     }
 
     /// Evaluate `pairs` into `into`. Says whether a secret that cannot be
-    /// supplied was read, and whether this machine's GitHub token was put in.
+    /// supplied was read.
     fn eval_env(
         host: &ExecContext,
         pairs: &[(String, String)],
         cm: &Map<String, Value>,
         into: &mut Map<String, Value>,
         maps: &[PortMap],
-    ) -> Result<(bool, bool)> {
+    ) -> Result<bool> {
         let mut secrets = false;
-        let mut token = false;
         for (k, v) in pairs {
             let mut ctx_map = cm.clone();
             ctx_map.insert("env".into(), Value::Object(into.clone()));
             let ctx = Ctx::new(&ctx_map, Status::Success).with_token(host);
             let val = expr::interpolate(v, &ctx)?;
             secrets |= ctx.used_secrets.get();
-            token |= ctx.used_token.get();
             into.insert(k.clone(), Value::String(rewrite_env_value(k, &val, maps)));
         }
-        Ok((secrets, token))
+        Ok(secrets)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2231,6 +2293,8 @@ impl<'a> Runner<'a> {
             } else {
                 raw_label
             };
+            // a label comes to result.json: the token does not
+            let label = self.hide_token(label);
             let st0 = Instant::now();
             let push = |steps: &mut Vec<StepResult>,
                         outcome: Outcome,
@@ -2261,7 +2325,10 @@ impl<'a> Runner<'a> {
                 step_env.insert(k.clone(), Value::String(v.clone()));
             }
             scm.insert("env".into(), Value::Object(step_env.clone()));
-            let go = expr::condition(s.cond.as_deref(), &Ctx::new(&scm, status));
+            let go = expr::condition(
+                s.cond.as_deref(),
+                &Ctx::new(&scm, status).with_token(self.ctx),
+            );
             match go {
                 Ok(true) => {}
                 Ok(false) => {
@@ -2361,12 +2428,7 @@ impl<'a> Runner<'a> {
                 );
             }
             let env_res = Self::eval_env(self.ctx, &s.env, &scm, &mut env_now, &maps);
-            let secrets = ctx.used_secrets.get() || matches!(env_res, Ok((true, _)));
-            let shell_now = s
-                .shell
-                .as_deref()
-                .or(job.shell.as_deref())
-                .or(w.shell.as_deref());
+            let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
             let (script, mut env_now) = match (script, env_res) {
                 (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
@@ -2419,16 +2481,12 @@ impl<'a> Runner<'a> {
             } else {
                 rewrite_ports(&script, &maps)
             };
-            // The token is never written into the script: it becomes a
-            // reference to an environment variable only the process gets.
-            // Another shell cannot be given a reference that is safe in
-            // every place it may stand, so such a step is skipped.
-            let token_in_script = script.contains(expr::TOKEN_MARK);
-            let sh_like = matches!(shell_now.map(str::trim), None | Some("bash") | Some("sh"));
-            let secrets = secrets
-                || (token_in_script && !sh_like)
-                || crate::script::token_may_be_literal(&script, expr::TOKEN_MARK);
-            let script = script.replace(expr::TOKEN_MARK, &format!("${{{}}}", expr::TOKEN_ENV));
+            // A script or env that holds the token is run with the script
+            // handed over a pipe, never written to a file.
+            let token = self.ctx.github_token_if_fetched().filter(|t| !t.is_empty());
+            let piped = token.is_some_and(|t| {
+                script.contains(t) || env_now.values().any(|v| expr::to_string(v).contains(t))
+            });
             if secrets {
                 push(
                     &mut steps,
@@ -2488,19 +2546,8 @@ impl<'a> Runner<'a> {
                     projects.push(p);
                 }
             }
-            let real_token = self.ctx.github_token().unwrap_or_default();
             for (k, v) in &env_now {
-                env.push((
-                    k.clone(),
-                    expr::to_string(v).replace(expr::TOKEN_MARK, real_token),
-                ));
-            }
-            if token_in_script
-                || env_now
-                    .values()
-                    .any(|v| expr::to_string(v).contains(expr::TOKEN_MARK))
-            {
-                env.push((expr::TOKEN_ENV.into(), real_token.to_string()));
+                env.push((k.clone(), expr::to_string(v)));
             }
             let log = self.log_path(&w.file, &display, n + 1, &label);
             let remaining = job_timeout.saturating_sub(t0.elapsed());
@@ -2536,6 +2583,7 @@ impl<'a> Runner<'a> {
                     Some(timeout),
                     &log,
                     Some(key),
+                    piped,
                 )
                 .map(|(exit, queued)| {
                     queue += queued;
@@ -2546,14 +2594,11 @@ impl<'a> Runner<'a> {
             }
             let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
             let mut outputs = Map::new();
-            // an output is read by later steps and written to result.json: the
-            // token does not go there
-            let hide = |v: String| match self.ctx.github_token_if_fetched() {
-                Some(t) if t.len() >= 4 => v.replace(t, "***"),
-                _ => v,
-            };
+            // Later steps of the job get the value, as on GitHub; it is in
+            // memory only (the files are gone below). What leaves the job
+            // is checked at the job's outputs.
             for (k, v) in parse_file_command(&read("output")) {
-                outputs.insert(k, Value::String(hide(v)));
+                outputs.insert(k, Value::String(v));
             }
             extra_env.extend(parse_file_command(&read("env")));
             extra_path.extend(
@@ -2637,13 +2682,36 @@ impl<'a> Runner<'a> {
         let mut ocm = cm.clone();
         ocm.insert("steps".into(), Value::Object(steps_ctx));
         let octx = Ctx::new(&ocm, Status::Success);
+        let mut dropped = Vec::new();
         for (k, v) in &job.outputs {
             if let Ok(val) = expr::interpolate(v, &octx) {
-                let val = match self.ctx.github_token_if_fetched() {
-                    Some(t) if t.len() >= 4 => val.replace(t, "***"),
-                    _ => val,
-                };
+                // GitHub does not pass a job output that holds a secret on
+                // to the jobs that need it, and nor does this
+                if self
+                    .ctx
+                    .github_token_if_fetched()
+                    .is_some_and(|t| !t.is_empty() && val.contains(t))
+                {
+                    dropped.push(k.clone());
+                    // empty, which is what a name nobody set expands to; the
+                    // key stays, because a plan expects the job to have set it
+                    outputs.insert(k.clone(), Value::String(String::new()));
+                    continue;
+                }
                 outputs.insert(k.clone(), Value::String(val));
+            }
+        }
+        if !dropped.is_empty() {
+            let note = format!(
+                "job output {} holds the GitHub token: not passed on",
+                dropped.join(", ")
+            );
+            // on the last step: a result has as many steps as the plan has
+            if let Some(last) = steps.last_mut() {
+                last.note = Some(match last.note.take() {
+                    Some(n) => format!("{n}; {note}"),
+                    None => note,
+                });
             }
         }
         let outcome = if failed {
@@ -2673,7 +2741,7 @@ impl<'a> Runner<'a> {
         cm: &Map<String, Value>,
     ) -> (Outcome, Option<String>) {
         let name = uses.split('@').next().unwrap_or(uses).to_ascii_lowercase();
-        let ctx = Ctx::new(cm, Status::Success);
+        let ctx = Ctx::new(cm, Status::Success).with_token(self.ctx);
         let with = |k: &str| {
             s.with
                 .iter()

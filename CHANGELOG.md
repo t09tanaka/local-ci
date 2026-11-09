@@ -157,19 +157,26 @@
   install`) are left out. A `brew install` of formulae that are on the PATH
   already is run.
 - A step that reads `github.token` or `secrets.GITHUB_TOKEN` is run with this
-  machine's token (`gh auth token`, asked once, only when a step needs it) and
-  the value is masked in the step's log; without a token it is skipped as
-  before (`incomplete`). The value is never written to a file of the run: a
-  script holds a reference to `$LOCAL_CI_GITHUB_TOKEN` (set only in the step's
-  process, as is a `GH_TOKEN: ${{ github.token }}` env), and a step in another
-  shell than bash/sh that uses it is skipped. A reference the shell would not
-  expand (inside `'...'`, `$'...'`, after a backslash, in the body of a quoted
-  heredoc, or a part of one left by `format()`/`substring()`) would reach the
-  command as literal text, so that step is skipped too (`incomplete`). The
-  value is also replaced by `***` in step and job outputs before they are
-  recorded, and the files behind `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`
-  and `GITHUB_STEP_SUMMARY` are private (directory 0700, files 0600). Step
-  scripts are mode 0600. Other secrets are still never supplied.
+  machine's token (`gh auth token`, asked once, only when a step needs it);
+  without a token it is skipped as before (`incomplete`). As on GitHub, the
+  value is the result of the expression, put into the script text (and into
+  `env`, `if:` and `with:`) wherever the expression stands, so no reading of
+  the shell's quoting is involved. The value is never written to a file of the
+  run: a step whose script or env holds it (also through a step output or
+  `GITHUB_ENV`) is handed its script over a pipe, file descriptor 3, and the
+  shell is started with `/dev/fd/3` (`bash --noprofile --norc -eo pipefail
+  /dev/fd/3`, `python3 /dev/fd/3`, a custom shell with `{0}` the same), so
+  neither a file nor the argument list shows it. canirun passes the descriptor
+  on to its child, so such a step is still queued by canirun. Other steps are
+  written to a file as before (mode 0600). The value is replaced by `***` in
+  step logs and labels. A later step of the job gets a step output's real
+  value (in memory only); a job output that holds the token is not passed on
+  to the jobs that need it, as on GitHub: it is recorded as empty (the name
+  stays, since a plan expects the job to set it) and the run's warnings name
+  it. The files behind `GITHUB_ENV`, `GITHUB_OUTPUT`,
+  `GITHUB_PATH` and `GITHUB_STEP_SUMMARY` are private (directory 0700, files
+  0600) and removed when the step ends. Other secrets are still never
+  supplied.
 - A receipt is believed without hashing the tree again in the workspace the
   run's own setup made, and in a unit's copy of it (checked once, when the copy
   is made, before any task wrote in it), so a job that writes next to the
@@ -188,7 +195,7 @@
   `PreparedReceipt` has `notes`; `SkippedWorkflow` has `unrunnable`;
   `TaskResult` has `artifacts`; `status()` returns the state a commit status
   can have (`success`, `failure` or `error`), not the run's state; `Ctx` of
-  `expr` has `with_token` and `used_token`; `ExecContext::github_token`. The
+  `expr` has `with_token`; `ExecContext::github_token`. The
   exit code of an `incomplete` run is 3.
 
 ## 0.7.0

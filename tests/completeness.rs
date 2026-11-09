@@ -807,13 +807,79 @@ fn tree_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+const TOKEN: &str = "ghs_faketoken123";
+
+/// The whole tree of a test's tempdir that is the run's: everything but the
+/// fake `gh` and the checkout under test, which name the value themselves.
+fn run_files(tmp: &tempfile::TempDir, worktree: &str) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    tree_files(tmp.path(), &mut files);
+    let wt = tmp.path().join("lab/wt").join(worktree);
+    files
+        .into_iter()
+        .filter(|f| {
+            !f.starts_with(tmp.path().join("fakebin"))
+                && !f.starts_with(&wt)
+                && !f.starts_with(tmp.path().join("work"))
+        })
+        .collect()
+}
+
+fn assert_no_token_in(tmp: &tempfile::TempDir, worktree: &str) -> usize {
+    let files = run_files(tmp, worktree);
+    for f in &files {
+        let b = std::fs::read(f).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&b).contains(TOKEN),
+            "token in {}",
+            f.display()
+        );
+        // a file name is a place too
+        assert!(!f.to_string_lossy().contains(TOKEN), "{}", f.display());
+    }
+    files.len()
+}
+
 #[test]
 fn the_token_is_never_written_to_a_file_of_the_run() {
-    // the script itself checks, while it runs, that it holds no token and
-    // that only its owner can read it
-    let jobs = "  a:\n    runs-on: x\n    outputs:\n      o: ${{ steps.s1.outputs.t }}\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: |\n          ! grep -q ghs_faketoken123 \"$0\"\n          test \"$(ls -l \"$0\" | cut -c1-10)\" = -rw-------\n          test \"$GH_TOKEN\" = ghs_faketoken123\n          echo \"viewer ${{ github.token }}\"\n      - env:\n          T: ${{ format('x-{0}', secrets.GITHUB_TOKEN) }}\n        run: ! grep -q ghs_faketoken123 \"$0\" && test \"$T\" = x-ghs_faketoken123\n      - id: s1\n        run: echo \"t=$GH_TOKEN\" >> \"$GITHUB_OUTPUT\"\n      - run: ! grep -q ghs_faketoken123 \"$0\"\n        env:\n          SEEN: ${{ steps.s1.outputs.t }}\n";
+    // the steps check, while they run, that the scripts directory holds no
+    // token and that the shell reads its script from a pipe; the token still
+    // reaches them in the script, in env, through a step output and through
+    // GITHUB_ENV
+    let jobs = r#"  a:
+    runs-on: x
+    outputs:
+      o: ${{ steps.s1.outputs.t }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - run: |
+          scripts="$(dirname "$GITHUB_ENV")/../../scripts"
+          test "$0" = /dev/fd/3
+          ! grep -rq ghs_faketoken123 "$scripts"
+          test "$GH_TOKEN" = ghs_faketoken123
+          test "${{ github.token }}" = ghs_faketoken123
+          echo "viewer ${{ github.token }}"
+      - env:
+          T: ${{ format('x-{0}', secrets.GITHUB_TOKEN) }}
+        run: test "$0" = /dev/fd/3 && test "$T" = x-ghs_faketoken123
+      - id: s1
+        run: echo "t=$GH_TOKEN" >> "$GITHUB_OUTPUT"
+      - env:
+          SEEN: ${{ steps.s1.outputs.t }}
+        run: |
+          test "$0" = /dev/fd/3
+          test "$SEEN" = ghs_faketoken123
+          test "${{ steps.s1.outputs.t }}" = ghs_faketoken123
+          echo "seen $SEEN"
+      - run: echo "FROM_FILE=$GH_TOKEN" >> "$GITHUB_ENV"
+      - run: |
+          test "$0" = /dev/fd/3
+          test "$FROM_FILE" = ghs_faketoken123
+          echo "env $FROM_FILE"
+"#;
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
-    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
     let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
     let ws = workspace(&tmp, &dir, &fp, "nodisk");
     let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
@@ -822,26 +888,170 @@ fn the_token_is_never_written_to_a_file_of_the_run() {
         "{} {:?}",
         r.description, r.units[0].jobs[0].steps
     );
-    let mut files = Vec::new();
-    tree_files(tmp.path(), &mut files);
-    let mut seen = 0;
-    for f in files {
-        // the fake `gh` and the workflow under test name the value themselves
-        if f.starts_with(tmp.path().join("fakebin"))
-            || f.to_string_lossy().contains("/wt/")
-            || f.to_string_lossy().contains("/.github/workflows/")
-        {
-            continue;
-        }
-        let b = std::fs::read(&f).unwrap();
-        seen += 1;
-        assert!(
-            !String::from_utf8_lossy(&b).contains("ghs_faketoken123"),
-            "token in {}",
-            f.display()
-        );
+    // the value reached the later steps, and is `***` in what was recorded
+    let logs: Vec<String> = r.units[0].jobs[0]
+        .steps
+        .iter()
+        .map(|s| std::fs::read_to_string(s.log.as_ref().unwrap()).unwrap())
+        .collect();
+    assert!(logs[0].contains("viewer ***"), "{}", logs[0]);
+    assert!(logs[3].contains("seen ***"), "{}", logs[3]);
+    assert!(logs[5].contains("env ***"), "{}", logs[5]);
+    // not in what the run returns (the result.json of a run is this), and not
+    // in any file the run left (scripts, logs, GITHUB_* files, state)
+    assert!(!serde_json::to_string(&r).unwrap().contains(TOKEN));
+    assert!(!format!("{r:?}").contains(TOKEN));
+    assert!(assert_no_token_in(&tmp, "nodisk") > 3);
+}
+
+/// The text of the log of a step that ran `script` (`github.token` is
+/// `ghs_faketoken123`), and what plain bash prints for the same script with
+/// the value written into it, where the value is `***`.
+fn through_the_shell_and_the_reference(script: &str, name: &str) -> (String, String) {
+    let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, name);
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "success", "{script:?}: {}", r.description);
+    let step = &r.units[0].jobs[0].steps[0];
+    assert_eq!(step.outcome, Outcome::Pass, "{script:?}");
+    let log = std::fs::read_to_string(step.log.as_ref().unwrap()).unwrap();
+    assert_no_token_in(&tmp, name);
+
+    let plain = tempfile::tempdir().unwrap();
+    let file = plain.path().join("reference.sh");
+    std::fs::write(&file, script.replace("${{ github.token }}", TOKEN)).unwrap();
+    let out = Command::new("bash")
+        .args(["--noprofile", "--norc", "-eo", "pipefail"])
+        .arg(&file)
+        .current_dir(plain.path())
+        .output()
+        .unwrap();
+    let want = String::from_utf8_lossy(&out.stdout).replace(TOKEN, "***");
+    (log, want)
+}
+
+#[test]
+fn the_token_is_in_the_script_as_an_expression_is_expanded() {
+    // GitHub puts the value into the text before the shell sees it, wherever
+    // it stands; so does local-ci. Every one of these was once told wrongly
+    // by a reading of the shell's quoting.
+    let cases = [
+        "cat <<< \"here ${{ github.token }}\"",
+        "echo $((1 << 2))\necho shifted ${{ github.token }}",
+        "echo $((1 << 2)) <<< x\ncat <<< ${{ github.token }}",
+        "cat <<EOF\n$(echo 'q')\nunquoted ${{ github.token }}\nEOF",
+        "cat <<EOF\n$(echo 'q') \\${{ github.token }}\nback\\\\slash\nEOF",
+        "echo \"a `echo 'b'` ${{ github.token }}\"",
+        "echo $'esc \\${{ github.token }}'",
+        "echo $'a ${{ github.token }}'",
+        "cat <<'EOF'\nquoted ${{ github.token }}\nEOF",
+        "cat <<'EOF'\nx\nEOF \necho ${{ github.token }}",
+        "printf '%s\\n' 'Authorization: token ${{ github.token }}'",
+        "echo 'single ${{ github.token }}'",
+        "echo \\${{ github.token }}",
+        "echo \"x $(echo '${{ github.token }}')\"",
+        "echo \"dq ${{ github.token }}\"\necho bare ${{ github.token }}\necho 'a' ${{ github.token }} 'b'",
+        "echo ${X:-${{ github.token }}}",
+    ];
+    for (n, script) in cases.iter().enumerate() {
+        let (log, want) = through_the_shell_and_the_reference(script, &format!("expr{n}"));
+        assert_eq!(log, want, "{script:?}");
+        assert!(!log.contains("LOCAL_CI_GITHUB_TOKEN"), "{log}");
     }
-    assert!(seen > 3);
+}
+
+#[test]
+fn a_step_of_another_shell_gets_the_token_too() {
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - shell: python\n        run: |\n          import sys\n          assert sys.argv[0] == '/dev/fd/3', sys.argv\n          print('py ${{ github.token }}')\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "py");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "success", "{}", r.description);
+    let log = std::fs::read_to_string(r.units[0].jobs[0].steps[0].log.as_ref().unwrap()).unwrap();
+    assert!(log.contains("py ***"), "{log}");
+    assert_no_token_in(&tmp, "py");
+}
+
+#[test]
+fn a_script_larger_than_a_pipe_is_not_held_up() {
+    let mut script = String::new();
+    for _ in 0..16384 {
+        script.push_str(&format!("# {}\n", "x".repeat(62)));
+    }
+    assert!(script.len() >= 1 << 20);
+    script.push_str("echo \"big ${{ github.token }}\"");
+    let (log, want) = through_the_shell_and_the_reference(&script, "big");
+    assert_eq!(log, want);
+    assert!(log.contains("big ***"));
+}
+
+#[test]
+fn the_argument_list_does_not_show_the_token() {
+    // `ps` shows what the shell was started with
+    let script = "ps -o args= -p $$\necho \"${{ github.token }}\" > /dev/null";
+    let (log, _) = through_the_shell_and_the_reference(script, "argv");
+    assert_eq!(
+        log.trim(),
+        "bash --noprofile --norc -eo pipefail /dev/fd/3",
+        "{log}"
+    );
+}
+
+#[test]
+fn the_pipe_reaches_a_step_that_canirun_starts() {
+    let Some(canirun) = ["/usr/local/bin", "/opt/homebrew/bin"]
+        .iter()
+        .map(|d| Path::new(d).join("canirun"))
+        .chain(std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo/bin/canirun")))
+        .find(|p| p.is_file())
+    else {
+        eprintln!("canirun is not installed: not checked");
+        return;
+    };
+    let script = "test \"$0\" = /dev/fd/3\necho \"via canirun ${{ github.token }}\"";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "canirun");
+    let mut o = opts(&tmp.path().join("lab"));
+    o.canirun = Some(canirun);
+    let r = local_ci::execute_plan(&c, &fp, &ws, o).unwrap();
+    assert_eq!(
+        r.state, "success",
+        "{} {:?}",
+        r.description, r.units[0].jobs[0].steps
+    );
+    let log = std::fs::read_to_string(r.units[0].jobs[0].steps[0].log.as_ref().unwrap()).unwrap();
+    assert!(log.contains("via canirun ***"), "{log}");
+    assert_no_token_in(&tmp, "canirun");
+}
+
+#[test]
+fn a_job_output_that_holds_the_token_is_not_passed_on() {
+    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    outputs:\n      o: ${{ steps.s1.outputs.t }}\n      p: v-${{ steps.s1.outputs.t }}\n      q: ${{ steps.s1.outputs.plain }}\n    steps:\n      - id: s1\n        run: |\n          echo \"t=$GH_TOKEN\" >> \"$GITHUB_OUTPUT\"\n          echo plain=fine >> \"$GITHUB_OUTPUT\"\n  b:\n    runs-on: x\n    needs: a\n    steps:\n      - run: echo \"got [${{ needs.a.outputs.o }}] [${{ needs.a.outputs.p }}] [${{ needs.a.outputs.q }}]\"\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "outs");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    assert_eq!(r.state, "success", "{} {:?}", r.description, r.units);
+    let all: Vec<_> = r.units.iter().flat_map(|u| &u.jobs).collect();
+    let b = all.iter().find(|j| j.job == "b").unwrap();
+    let log = std::fs::read_to_string(b.steps[0].log.as_ref().unwrap()).unwrap();
+    assert!(log.contains("got [] [] [fine]"), "{log}");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.starts_with("a: job output o, p holds the GitHub token")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(!serde_json::to_string(&r).unwrap().contains(TOKEN));
+    assert_no_token_in(&tmp, "outs");
 }
 
 // ---- what reads and what writes outside this machine ----
@@ -886,59 +1096,24 @@ fn one_step_job(script: &str) -> String {
 }
 
 #[test]
-fn a_token_the_shell_would_not_expand_stops_the_step() {
-    // in single quotes and quoted heredocs the reference would be printed as
-    // the text `${LOCAL_CI_GITHUB_TOKEN}`: the step is left out instead
-    for (n, script) in [
-        "cat <<'EOF2'\nt ${{ github.token }}\nEOF2",
-        "curl -H 'Authorization: token ${{ github.token }}' http://127.0.0.1:9/",
-        "jq -n '{t: \"${{ github.token }}\"}'",
-        "python -c 'print(\"${{ github.token }}\")'",
-        "node -e 'console.log(\"${{ github.token }}\")'",
-        "echo $'t ${{ github.token }}'",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
-        let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
-        let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
-        let ws = workspace(&tmp, &dir, &fp, &format!("lit{n}"));
-        let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
-        assert_eq!(r.state, "incomplete", "{script:?}: {}", r.description);
-        let step = &r.units[0].jobs[0].steps[0];
-        assert_eq!(
-            step.outcome,
-            Outcome::Skip("uses secrets".into()),
-            "{script:?}"
-        );
-    }
-}
-
-#[test]
-fn a_token_the_shell_expands_is_supplied() {
-    let script = "echo \"dq ${{ github.token }}\"\necho bare ${{ github.token }}\ncat <<EOF\nhd ${{ github.token }}\nEOF\necho 'a' ${{ github.token }} 'b'";
+fn the_files_a_step_writes_to_are_private() {
+    let script = "for f in \"$GITHUB_ENV\" \"$GITHUB_OUTPUT\" \"$GITHUB_PATH\" \"$GITHUB_STEP_SUMMARY\"; do\n  test \"$(ls -l \"$f\" | cut -c1-10)\" = -rw------- || exit 1\ndone\ntest \"$(ls -ld \"$(dirname \"$GITHUB_ENV\")\" | cut -c1-10)\" = drwx------";
     let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
-    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
-    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
-    let ws = workspace(&tmp, &dir, &fp, "expanded");
-    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
-    assert_eq!(r.state, "success", "{}", r.description);
-    let step = &r.units[0].jobs[0].steps[0];
-    let log = std::fs::read_to_string(step.log.as_ref().unwrap()).unwrap();
-    for w in ["dq ***", "bare ***", "hd ***", "a *** b"] {
-        assert!(log.contains(w), "{w}: {log}");
-    }
-    assert!(!log.contains("LOCAL_CI_GITHUB_TOKEN"), "{log}");
+    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "private");
+    assert_eq!(
+        r.state, "success",
+        "{} {:?}",
+        r.description, r.units[0].jobs[0].steps
+    );
 }
 
 #[test]
 fn the_token_is_not_kept_in_the_outputs_of_a_task() {
-    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    outputs:\n      o: ${{ steps.s1.outputs.t }}\n      p: v-${{ steps.s1.outputs.t }}\n    steps:\n      - id: s1\n        run: echo \"t=$GH_TOKEN\" >> \"$GITHUB_OUTPUT\"\n";
+    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    outputs:\n      o: ${{ steps.s1.outputs.t }}\n      p: v-${{ steps.s1.outputs.t }}\n      q: ${{ steps.s1.outputs.k }}\n    steps:\n      - id: s1\n        run: |\n          echo \"t=$GH_TOKEN\" >> \"$GITHUB_OUTPUT\"\n          echo k=kept >> \"$GITHUB_OUTPUT\"\n";
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
-    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let c = ctx_with_gh(tmp.path(), Some(TOKEN));
     let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
-    let ws = workspace(&tmp, &dir, &fp, "outs");
+    let ws = workspace(&tmp, &dir, &fp, "taskouts");
     let task = &fp.tasks[0];
     let r = local_ci::execute_task(
         &c,
@@ -951,21 +1126,9 @@ fn the_token_is_not_kept_in_the_outputs_of_a_task() {
     )
     .unwrap();
     let o = &r.outcomes[0].outputs;
-    assert_eq!(o.get("o").map(String::as_str), Some("***"), "{o:?}");
-    assert_eq!(o.get("p").map(String::as_str), Some("v-***"), "{o:?}");
-    assert!(!format!("{r:?}").contains("ghs_faketoken123"));
-}
-
-#[test]
-fn the_files_a_step_writes_to_are_private() {
-    use std::os::unix::fs::PermissionsExt;
-    let script = "for f in \"$GITHUB_ENV\" \"$GITHUB_OUTPUT\" \"$GITHUB_PATH\" \"$GITHUB_STEP_SUMMARY\"; do\n  test \"$(ls -l \"$f\" | cut -c1-10)\" = -rw------- || exit 1\ndone\ntest \"$(ls -ld \"$(dirname \"$GITHUB_ENV\")\" | cut -c1-10)\" = drwx------";
-    let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
-    let r = execute(&tmp, &dir, &plan(&tmp, &dir), "private");
-    assert_eq!(
-        r.state, "success",
-        "{} {:?}",
-        r.description, r.units[0].jobs[0].steps
-    );
-    let _ = std::fs::Permissions::from_mode(0o600);
+    // withheld: the name stays, empty
+    assert_eq!(o.get("o").map(String::as_str), Some(""), "{o:?}");
+    assert_eq!(o.get("p").map(String::as_str), Some(""), "{o:?}");
+    assert_eq!(o.get("q").map(String::as_str), Some("kept"), "{o:?}");
+    assert!(!format!("{r:?}").contains(TOKEN));
 }
