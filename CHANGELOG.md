@@ -176,9 +176,11 @@
   open the script twice and cannot be told to close fd 3, so a step of one
   whose script holds the token is not run: it is an `error` that says to use
   bash, sh or python (a custom shell is still run when only its `env` holds the
-  token). The pipe is a FIFO opened with `O_CLOEXEC`, whose name is removed
-  at once, not `pipe()` plus a later `fcntl` (two calls on macOS), so no command
-  started by another thread can inherit an end; its writer thread ends with the
+  token). On macOS the pipe is a FIFO opened with `O_CLOEXEC`, whose name is
+  removed at once, not `pipe()` plus a later `fcntl` (two calls there), so no
+  command started by another thread can inherit an end; elsewhere it is
+  `std::io::pipe()` (one `pipe2(O_CLOEXEC)` call), as a FIFO would make
+  `/dev/fd/3` block on Linux once the writer has finished. Its writer thread ends with the
   step even if a process that outlived the step holds the read end. canirun
   passes the descriptor on to its child, so such a step is still queued by
   canirun. The notes and errors of `uses:` steps and of `if:` are

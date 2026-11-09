@@ -796,6 +796,28 @@ fn the_machines_github_token_is_supplied_and_masked_in_the_log() {
     assert_eq!(r.state, "incomplete");
 }
 
+/// The script of a step that holds the token is written to a pipe by a thread,
+/// and a small one is all written, and the write end closed, before the shell
+/// has started. The shell must still be able to open `/dev/fd/3` (on Linux that
+/// reopens the pipe through /proc, and a FIFO would block there for ever). A
+/// `bash` that waits a second before it starts makes that certain.
+#[test]
+fn a_small_script_whose_writer_is_gone_before_the_shell_starts_still_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let jobs = "  a:\n    runs-on: x\n    env:\n      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - timeout-minutes: 0.5\n        run: test \"$GH_TOKEN\" = ghs_faketoken123\n";
+    let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
+    let c = ctx_with_gh(tmp.path(), Some("ghs_faketoken123"));
+    let bash = tmp.path().join("fakebin/bash");
+    std::fs::write(&bash, "#!/bin/sh\nsleep 1\nexec /bin/bash \"$@\"\n").unwrap();
+    std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
+    let ws = workspace(&tmp, &dir, &fp, "slowshell");
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts(&tmp.path().join("lab"))).unwrap();
+    let step = &r.units[0].jobs[0].steps[0];
+    assert_eq!(step.outcome, Outcome::Pass, "{}", r.description);
+    assert_eq!(r.state, "success", "{}", r.description);
+}
+
 fn tree_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     for e in std::fs::read_dir(dir).unwrap().flatten() {
         let p = e.path();
@@ -920,6 +942,13 @@ fn through_the_shell_and_the_reference(script: &str, name: &str) -> (String, Str
     let step = &r.units[0].jobs[0].steps[0];
     assert_eq!(step.outcome, Outcome::Pass, "{script:?}");
     let log = std::fs::read_to_string(step.log.as_ref().unwrap()).unwrap();
+    // the log has stderr too; the reference below reads stdout only, and a
+    // newer bash warns (with the script's name, here /dev/fd/3) about a
+    // here-document that the file ends in
+    let log: String = log
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with("/dev/fd/3: "))
+        .collect();
     assert_no_token_in(&tmp, name);
 
     let plain = tempfile::tempdir().unwrap();

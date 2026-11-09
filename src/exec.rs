@@ -3065,16 +3065,21 @@ impl<'a> Runner<'a> {
     }
 }
 
-/// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
-/// Write a file only its owner can read: step scripts may hold values that
-/// must not be shared.
 /// A pipe for a script that holds the token, made so that neither end is ever
-/// open without close-on-exec: `pipe()` and the `fcntl` that sets the flag are
-/// two calls on macOS (`std::io::pipe` makes them so), and a command started
-/// by another thread in between would inherit the write end (or the read end,
-/// with the rest of the script). A FIFO is opened with `O_CLOEXEC` in the call
-/// itself, on both systems, and its name is removed as soon as both ends are
-/// open. The write end is non-blocking (see `write_until_stopped`).
+/// open without close-on-exec, so that no command started by another thread
+/// can inherit an end (the write end, or the read end with the rest of the
+/// script). The write end is non-blocking (see `write_until_stopped`); the
+/// read end blocks, as the shell reads with plain blocking reads.
+///
+/// macOS: `std::io::pipe` is `pipe()` and then `fcntl(FD_CLOEXEC)`, two calls
+/// with a window between them, so a FIFO is used: it is opened with
+/// `O_CLOEXEC` in the call itself, and its name is removed as soon as both
+/// ends are open. A FIFO is not used elsewhere: on Linux, opening
+/// `/dev/fd/3` opens the FIFO again through `/proc/self/fd/3`, and a blocking
+/// `O_RDONLY` open of a FIFO waits for a writer; a small script is written
+/// and the write end closed before the shell starts, so the shell would wait
+/// for ever.
+#[cfg(target_os = "macos")]
 fn script_pipe(path: &Path) -> Result<(File, File)> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -3122,6 +3127,27 @@ fn script_pipe(path: &Path) -> Result<(File, File)> {
     }
 }
 
+/// Linux and the other unixes: an anonymous pipe. The standard library makes
+/// it with `pipe2(O_CLOEXEC)` on Linux, the BSDs and the like (one call, so
+/// there is no window; see `library/std/src/sys/pal/unix/pipe.rs` in the
+/// Rust source, and `strace -e trace=pipe2` on a program that calls
+/// `std::io::pipe`).
+#[cfg(not(target_os = "macos"))]
+fn script_pipe(_path: &Path) -> Result<(File, File)> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let (r, w) = std::io::pipe().context("cannot make the script pipe")?;
+    let w = File::from(OwnedFd::from(w));
+    // SAFETY: fcntl on a descriptor `w` owns. The write end is its own open
+    // file description, so this does not touch the read end.
+    unsafe {
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot set up the script pipe");
+        }
+    }
+    Ok((File::from(OwnedFd::from(r)), w))
+}
+
 /// Write `data` to the non-blocking `w`, until it is all written, the other
 /// end is closed, or `stop` is set (the step is over). A reader that outlives
 /// its step (a background process that kept the descriptor) cannot keep this
@@ -3141,6 +3167,8 @@ fn write_until_stopped(mut w: File, data: &[u8], stop: &AtomicBool) {
     }
 }
 
+/// Write a file only its owner can read: step scripts may hold values that
+/// must not be shared.
 fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = OpenOptions::new()
@@ -3153,6 +3181,7 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     f.write_all(content.as_bytes())
 }
 
+/// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
 fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(match v {
         Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
@@ -3198,7 +3227,14 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn the_script_pipe_is_never_open_across_an_exec_and_leaves_no_name() {
+    // What this checks: the ends of the pipe carry close-on-exec, the write end is
+    // non-blocking and the read end blocks, no name is left behind, and what is
+    // written can be read back. It does NOT check that no other thread's exec can
+    // inherit an end: that window (between `pipe()` and `fcntl` on macOS) cannot
+    // be hit from a test, so it is closed by construction (a FIFO opened with
+    // `O_CLOEXEC` on macOS, `pipe2(O_CLOEXEC)` through std elsewhere) and reviewed
+    // in `script_pipe`, not tested.
+    fn the_script_pipe_has_cloexec_a_nonblocking_writer_and_no_name_left() {
         use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.fifo");
