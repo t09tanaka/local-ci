@@ -84,6 +84,8 @@ pub struct Repo {
     pub no_cache: Vec<String>,
     /// `link-node-modules` of `.local-ci.toml`.
     pub link_node_modules: bool,
+    /// `[setup] ignore-env` of `.local-ci.toml`.
+    pub ignore_env: Vec<String>,
     /// The directory output leaves off workflow paths (see [`report::Style`]).
     pub default_workflows_dir: String,
     /// The disabled workflows the plan was made with, and where the list came from.
@@ -202,6 +204,7 @@ pub fn resolve_with(
             disabled: record,
             no_cache: config.no_cache,
             link_node_modules: config.link_node_modules,
+            ignore_env: config.ignore_env,
         },
         p,
     ))
@@ -405,6 +408,7 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
             default_workflows_dir: repo.default_workflows_dir.clone(),
             no_cache: repo.no_cache.clone(),
             link_node_modules: repo.link_node_modules,
+            ignore_env: repo.ignore_env.clone(),
         },
         filters: Filters {
             all: t.all,

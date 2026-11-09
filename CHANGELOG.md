@@ -43,7 +43,9 @@
   reused, and `TemplateStore` keeps finished templates read-only and hands out
   copies. git, cp, portool and the version probes now start with the context's
   environment too. A receipt is believed only in the workspace it was made in
-  (`execute_setup` keeps an id in the workspace's own git dir, outside the working tree, recorded with the workspace's path; a copy is another workspace and has no id until it is prepared itself),
+  (`execute_setup` keeps an id in the workspace's own git dir, outside the working tree, recorded with the workspace's path; a copy made by any other means is another workspace and has no id until it is prepared itself;
+  what local-ci derives itself is bound explicitly: a unit's copy gets an id of its own and the setup's receipts are rebound to it, and `PreparedTemplate::materialize` gives `dest` an id and returns the template's receipt bound to it),
+  only while the top-level entries the setup made are still in the workspace,
   for the same commit and under the template key the task's recipe has with
   the `TemplateContext` given to `execute_task`; otherwise the task does its
   setup itself and `TaskResult::receipt_ignored` says why. A local run changes
@@ -56,8 +58,13 @@
   directory with another env or shell is not hoisted either, so each job gets
   the result of its own install; setup uses the resolved shell and env
   (workflow, job, step) instead of the step's own only; a step that comes up
-  again after others in a job runs again. `local-ci plan` lists the setup it
-  could not work out instead of leaving it out.
+  again after others in a job runs again; `shell: bash` and no shell are the
+  same shell. A job that differs in any `env:` value (job env included) no
+  longer shares an install with the others, so its install is not hoisted: job
+  env that differs without mattering (`DATABASE_URL`, `CI`) can be left out of
+  the keys with `[setup] ignore-env = ["DATABASE_URL"]` in `.local-ci.toml`;
+  the install still runs with the first job's value. `local-ci plan` lists the
+  setup it could not work out instead of leaving it out.
 
 ## 0.7.0
 

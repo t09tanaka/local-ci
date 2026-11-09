@@ -4,7 +4,7 @@
 //! A template is made once under its [`TemplateKey`] and never changed: it is
 //! made read-only, the store never replaces one, and a consumer gets a copy of
 //! its own ([`PreparedTemplate::materialize`], a copy-on-write clone where the
-//! filesystem has one), never a link into it. Requirements the key does not
+//! filesystem has one, with a receipt bound to the copy), never a link into it. Requirements the key does not
 //! hold (A+B for a template made for A) are another key and another template.
 
 use crate::context::ExecContext;
@@ -104,12 +104,20 @@ impl PreparedTemplate {
     /// A copy of the tree at `dest` (which must not exist), writable and
     /// sharing nothing with the template. The copy is a clone where the
     /// filesystem has clones.
-    pub fn materialize(&self, ctx: &ExecContext, dest: &Path) -> Result<()> {
+    ///
+    /// `dest` is made a workspace of its own (it gets an id, see
+    /// [`crate::setup::workspace_id`]) and the receipt returned is the
+    /// template's, bound to it: [`crate::execute_task`] given that receipt in
+    /// `dest` skips the steps the template prepared. A tree copied by any other
+    /// means has no such receipt and prepares everything itself.
+    pub fn materialize(&self, ctx: &ExecContext, dest: &Path) -> Result<PreparedReceipt> {
         if dest.exists() {
             bail!("{} exists", dest.display());
         }
         copy_tree(ctx, &self.tree(), dest)?;
-        make_writable(dest)
+        make_writable(dest)?;
+        let id = crate::setup::ensure_workspace_id(dest)?;
+        Ok(self.receipt.rebound(&id))
     }
 
     /// Delete the template.

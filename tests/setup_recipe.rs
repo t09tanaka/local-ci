@@ -5,8 +5,8 @@
 
 use local_ci::exec::{Opts, Outcome, Workspace};
 use local_ci::setup::{
-    derive_setup_recipe, Freshness, PreparedReceipt, RecipeStep, ReuseScope, SecretDigest,
-    SetupRecipe, TemplateContext,
+    derive_setup_recipe, ArtifactDigest, Freshness, PreparedHow, PreparedReceipt, PreparedStep,
+    RecipeStep, ReuseScope, SecretDigest, SetupRecipe, TemplateContext, TemplateKey,
 };
 use local_ci::template::TemplateStore;
 use local_ci::{ExecContext, FrozenPlan, Quiet, Target, TaskInputs, TaskResult};
@@ -315,8 +315,14 @@ fn the_workspace_id_is_not_a_file_in_the_working_tree_and_a_copy_does_not_inheri
         .status()
         .unwrap();
     assert!(cp.success());
-    assert_eq!(local_ci::setup::workspace_id(&copy), None);
+    assert_ne!(local_ci::setup::workspace_id(&copy), Some(id.clone()));
     assert_eq!(local_ci::setup::workspace_id(&ws.root), Some(id));
+    // and asking for its id does not take the original's away
+    local_ci::setup::workspace_id(&copy);
+    assert_eq!(
+        local_ci::setup::workspace_id(&ws.root).as_deref(),
+        Some(done.receipt.workspace.as_str())
+    );
 }
 
 // ---- A15 ----
@@ -429,6 +435,7 @@ fn a_receipt_skips_only_the_steps_it_names() {
     let mut receipt = done.receipt.clone();
     receipt.steps.truncate(1);
     assert_eq!(receipt.steps[0].id, recipe.steps[0].id);
+    receipt.artifacts.retain(|a| a.path == "installed.marker");
     std::fs::remove_file(ws.root.join("two.marker")).unwrap();
     let r = place.task(&ws, &id("a"), Some(&receipt));
     let o = outcomes(&r);
@@ -844,10 +851,32 @@ fn recipe_step(run: &str) -> RecipeStep {
         shell: None,
         env: vec![],
         unresolved_env: vec![],
+        ignored_env: vec![],
         label: run.into(),
         workflow: F.into(),
         job: "a".into(),
         at: vec![],
+    }
+}
+
+/// The receipt of a setup that ran every step of `recipe` and made `artifact`.
+fn receipt_for(recipe: &SetupRecipe, key: &TemplateKey, artifact: &str) -> PreparedReceipt {
+    PreparedReceipt {
+        template_key: key.digest().into(),
+        source: "src".into(),
+        workspace: "builder".into(),
+        steps: recipe
+            .steps
+            .iter()
+            .map(|s| PreparedStep {
+                id: s.id.clone(),
+                how: PreparedHow::Ran,
+            })
+            .collect(),
+        artifacts: vec![ArtifactDigest {
+            path: artifact.into(),
+            digest: "d".into(),
+        }],
     }
 }
 
@@ -877,13 +906,19 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     let built_a = tmp.path().join("built-a");
     std::fs::create_dir_all(built_a.join("node_modules/a")).unwrap();
     std::fs::write(built_a.join("node_modules/a/index.js"), "a").unwrap();
-    let rec_a = PreparedReceipt::empty(ka.digest(), "src");
+    let rec_a = receipt_for(&ra, &ka, "node_modules");
     let a = store.publish(&c1, &ka, &rec_a, &built_a).unwrap();
     let before = tree_digest(&a.tree());
 
     // A is in use by one consumer when A+B is built
     let use1 = tmp.path().join("use1");
-    a.materialize(&c1, &use1).unwrap();
+    let rec_use1 = a.materialize(&c1, &use1).unwrap();
+    assert_eq!(
+        rec_use1.workspace,
+        local_ci::setup::workspace_id(&use1).unwrap()
+    );
+    assert_ne!(rec_use1.workspace, rec_a.workspace);
+    assert_eq!(rec_use1.steps, rec_a.steps);
 
     // the template cannot be written, and a second publish of the same key
     // does not replace it
@@ -906,7 +941,8 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
 
     // c2's consumer exists before anything is cancelled
     let use2 = tmp.path().join("use2");
-    a.materialize(&c2, &use2).unwrap();
+    let rec_use2 = a.materialize(&c2, &use2).unwrap();
+    assert_ne!(rec_use1.workspace, rec_use2.workspace);
     let use2_before = tree_digest(&use2);
 
     // a process of c1 is writing in use1 (a copy of A) ...
@@ -933,7 +969,15 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     let log = use1.join("writer.log");
     let result = std::thread::scope(|scope| {
         let h = scope.spawn(|| {
-            local_ci::execute_task(&c1, &fp, &id("w"), &TaskInputs::default(), None, &ws, opts)
+            local_ci::execute_task(
+                &c1,
+                &fp,
+                &id("w"),
+                &TaskInputs::default(),
+                Some((&rec_use1, &tctx)),
+                &ws,
+                opts,
+            )
         });
         let t0 = std::time::Instant::now();
         while !log.is_file() && t0.elapsed().as_secs() < 30 {
@@ -947,7 +991,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
         std::fs::create_dir_all(built_ab.join("node_modules/b")).unwrap();
         std::fs::write(built_ab.join("node_modules/a/index.js"), "a").unwrap();
         std::fs::write(built_ab.join("node_modules/b/index.js"), "b").unwrap();
-        let rec_ab = PreparedReceipt::empty(kab.digest(), "src");
+        let rec_ab = receipt_for(&rab, &kab, "node_modules");
         let ab = store.publish(&c2, &kab, &rec_ab, &built_ab).unwrap();
         (h.join().unwrap(), ab)
     });
@@ -1045,4 +1089,216 @@ fn plan_output_says_what_stays_in_place_and_why() {
         out.contains("setup stays in venv: python3 -m venv .venv (builds an environment tied to an absolute path)"),
         "{out}"
     );
+}
+
+// ---- derived workspaces are bound explicitly ----
+
+#[test]
+fn a_materialized_template_skips_the_steps_it_prepared_and_a_plain_copy_does_not() {
+    let (tmp, dir, fp) = lab(TWO_JOBS);
+    let place = Place::new(&tmp, &dir, &fp);
+    let recipe_a = derive_setup_recipe(&fp, &id("a")).unwrap();
+    let key = recipe_a.template_key(&place.tctx());
+    let built = place.workspace("builder");
+    let done = place.setup(&built, &recipe_a);
+    assert!(done.ok());
+    let c = ctx(tmp.path());
+    let store = TemplateStore::new(tmp.path().join("templates"));
+    let tpl = store.publish(&c, &key, &done.receipt, &built.root).unwrap();
+    let tpl = store.get(&key).unwrap_or(tpl);
+
+    let consumer = |name: &str| Workspace {
+        root: place.cache.join("wt").join(name),
+        repo_root: dir.clone(),
+        run_dir: place.cache.join("runs").join(name),
+        tools: place.cache.join("wt").join(format!("{name}.tools")),
+        lock_file: place.cache.join("locks/lab.lock"),
+    };
+
+    // through the API: the receipt belongs to the new tree
+    let ws = consumer("materialized");
+    std::fs::create_dir_all(&ws.run_dir).unwrap();
+    let receipt = tpl.materialize(&c, &ws.root).unwrap();
+    assert_ne!(receipt.workspace, done.receipt.workspace);
+    let r = place.task(&ws, &id("a"), Some(&receipt));
+    assert_eq!(r.receipt_ignored, None);
+    assert_eq!(outcomes(&r), vec![skipped_setup(), Outcome::Pass]);
+
+    // the template's own receipt is the builder's: not believed in the copy
+    let r = place.task(&ws, &id("a"), Some(tpl.receipt()));
+    assert!(r.receipt_ignored.as_deref().unwrap().contains("workspace"));
+
+    // a copy made by any other means is another workspace
+    let plain = consumer("plain");
+    std::fs::create_dir_all(&plain.run_dir).unwrap();
+    assert!(Command::new("cp")
+        .arg("-R")
+        .arg(&ws.root)
+        .arg(&plain.root)
+        .status()
+        .unwrap()
+        .success());
+    let r = place.task(&plain, &id("a"), Some(&receipt));
+    assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
+    assert!(r.receipt_ignored.as_deref().unwrap().contains("workspace"));
+    // the original keeps its own id
+    assert_eq!(
+        local_ci::setup::workspace_id(&ws.root).as_deref(),
+        Some(receipt.workspace.as_str())
+    );
+}
+
+#[test]
+fn units_run_in_copies_that_are_bound_to_the_setup_once_for_any_installer() {
+    // two workflows are two units, each run in a copy of the workspace. `yarn`
+    // is not covered by the npm shim's marks, so only the receipt keeps the
+    // copies from installing again.
+    let wf = |name: &str| {
+        (
+            format!(".github/workflows/{name}.yml"),
+            format!(
+                "name: {name}\non: pull_request\njobs:\n  j:\n    runs-on: x\n    steps:\n      - run: yarn install\n      - run: test -d node_modules/pkg\n"
+            ),
+        )
+    };
+    let (one, two) = (wf("one"), wf("two"));
+    let (tmp, dir, fp) = lab_files(&[(&one.0, one.1), (&two.0, two.1)]);
+    assert_eq!(fp.units.len(), 2);
+    let bin = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let count = tmp.path().join("yarn.count");
+    std::fs::write(
+        bin.join("yarn"),
+        format!(
+            "#!/bin/sh\necho run >> {}\nmkdir -p node_modules/pkg\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(bin.join("yarn"))
+        .status()
+        .unwrap();
+    let c = ctx_with(
+        tmp.path(),
+        &format!(
+            "{}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            bin.display()
+        ),
+    );
+    let place = Place::new(&tmp, &dir, &fp);
+    let ws = place.workspace("whole");
+    let mut opts = place.opts();
+    opts.parallel = 2;
+    opts.keep = false;
+    let r = local_ci::execute_plan(&c, &fp, &ws, opts).unwrap();
+    let p = passed(&r);
+    assert_eq!(p.len(), 2);
+    assert!(p.iter().all(|(_, o)| *o == Outcome::Pass), "{p:?}");
+    let runs = std::fs::read_to_string(&count).unwrap();
+    assert_eq!(runs.lines().count(), 1, "yarn ran {runs:?}");
+}
+
+// ---- the receipt is checked against what the workspace holds ----
+
+#[test]
+fn a_receipt_is_ignored_when_what_the_setup_made_is_gone() {
+    let (tmp, dir, fp) = lab(TWO_JOBS);
+    let place = Place::new(&tmp, &dir, &fp);
+    let recipe_a = derive_setup_recipe(&fp, &id("a")).unwrap();
+    let ws = place.workspace("rep");
+    let done = place.setup(&ws, &recipe_a);
+    assert!(done.ok());
+    assert!(done
+        .receipt
+        .artifacts
+        .iter()
+        .any(|a| a.path == "installed.marker"));
+    // `git clean -fdx` leaves the id in the git dir
+    std::fs::remove_file(ws.root.join("installed.marker")).unwrap();
+    assert_eq!(
+        local_ci::setup::workspace_id(&ws.root).as_deref(),
+        Some(done.receipt.workspace.as_str())
+    );
+    let r = place.task(&ws, &id("a"), Some(&done.receipt));
+    assert_eq!(outcomes(&r), vec![Outcome::Pass, Outcome::Pass]);
+    let why = r.receipt_ignored.unwrap();
+    assert!(why.contains("installed.marker"), "{why}");
+    assert!(ws.root.join("installed.marker").is_file());
+}
+
+// ---- shell and env in the keys ----
+
+#[test]
+fn a_shell_written_as_bash_is_the_default_shell() {
+    let (_t, _d, fp) = lab(concat!(
+        "  a:\n    runs-on: x\n    steps:\n      - run: npm ci\n        shell: bash\n",
+        "  b:\n    runs-on: x\n    steps:\n      - run: npm ci\n",
+    ));
+    let (a, b) = (
+        derive_setup_recipe(&fp, &id("a")).unwrap(),
+        derive_setup_recipe(&fp, &id("b")).unwrap(),
+    );
+    assert_eq!(a.steps.len(), 1);
+    assert!(a.left_in_place.is_empty() && b.left_in_place.is_empty());
+    assert_eq!(a.steps[0].id, b.steps[0].id);
+    let c = TemplateContext::local(&fp, "r");
+    assert_eq!(a.template_key(&c).digest(), b.template_key(&c).digest());
+}
+
+const DB_JOBS: &str = concat!(
+    "  a:\n    runs-on: x\n    env:\n      DATABASE_URL: db-a\n      NODE_ENV: test\n    steps:\n      - run: npm ci\n",
+    "  b:\n    runs-on: x\n    env:\n      DATABASE_URL: db-b\n      NODE_ENV: test\n    steps:\n      - run: npm ci\n",
+);
+
+#[test]
+fn an_install_with_another_job_env_is_not_hoisted_unless_the_name_is_ignored() {
+    let (_t, _d, fp) = lab(DB_JOBS);
+    stays_for_conflict(&fp, &id("a"));
+    stays_for_conflict(&fp, &id("b"));
+
+    let toml = (
+        ".local-ci.toml",
+        "[setup]\nignore-env = [\"DATABASE_URL\"]\n".to_string(),
+    );
+    let (_t, _d, fp) = lab_files(&[
+        (F, format!("name: ci\non: pull_request\njobs:\n{DB_JOBS}")),
+        toml,
+    ]);
+    let (a, b) = (
+        derive_setup_recipe(&fp, &id("a")).unwrap(),
+        derive_setup_recipe(&fp, &id("b")).unwrap(),
+    );
+    assert_eq!((a.steps.len(), b.steps.len()), (1, 1));
+    assert_eq!(a.steps[0].id, b.steps[0].id);
+    let c = TemplateContext::local(&fp, "r");
+    assert_eq!(a.template_key(&c).digest(), b.template_key(&c).digest());
+    // the name is not in the key, but the install still runs with the value
+    assert_eq!(a.steps[0].env, vec![("NODE_ENV".into(), "test".into())]);
+    assert_eq!(
+        a.steps[0].ignored_env,
+        vec![("DATABASE_URL".to_string(), "db-a".to_string())]
+    );
+}
+
+#[test]
+fn a_name_that_is_not_ignored_still_separates_installs() {
+    let (_t, _d, fp) = lab_files(&[
+        (
+            F,
+            format!(
+                "name: ci\non: pull_request\njobs:\n{}",
+                DB_JOBS.replace(
+                    "NODE_ENV: test\n    steps:\n      - run: npm ci\n  b",
+                    "NODE_ENV: production\n    steps:\n      - run: npm ci\n  b"
+                )
+            ),
+        ),
+        (
+            ".local-ci.toml",
+            "[setup]\nignore-env = [\"DATABASE_URL\"]\n".to_string(),
+        ),
+    ]);
+    stays_for_conflict(&fp, &id("a"));
 }

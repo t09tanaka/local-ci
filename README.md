@@ -86,6 +86,10 @@ the commit under test, so commit it before it takes effect.
 workflows-dirs = [".ci/workflows"]
 # Always run these, even when a recent result covers them
 no-cache = ["e2e.yml", "api-ci.yml:contract"]
+
+[setup]
+# Env names that do not change what an install does (see below)
+ignore-env = ["DATABASE_URL", "CI"]
 ```
 
 | Key | |
@@ -93,6 +97,15 @@ no-cache = ["e2e.yml", "api-ci.yml:contract"]
 | `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
 | `no-cache` | Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never reused (see *Reused results*). |
 | `link-node-modules` | `true` to give units' copies links to setup's packages instead of a clone of each `node_modules`. Off by default. |
+| `[setup]` `ignore-env` | `env:` names left out of the keys of setup steps. Off (empty) by default. |
+
+**`[setup] ignore-env`.** An install that two jobs run in one directory with a
+different `env:` (workflow, job or step) is not shared: each job runs its own,
+so that one never sees the result of the other's. That includes variables the
+install does not read, such as a `DATABASE_URL` that only the tests use. List
+those names and jobs that differ only in them share one install, which runs
+with the value of the first job that has it. A name that does change the
+install (`NODE_ENV`) must not be listed.
 
 **`link-node-modules`.** Even a copy-on-write clone makes, and later deletes,
 one file per file, and dependencies are most of the files: in a monorepo of

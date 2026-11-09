@@ -55,6 +55,11 @@ pub struct RecipeStep {
     /// `env:` entries whose value is an expression evaluated at run time; they
     /// are not set for setup, and are part of the id.
     pub unresolved_env: Vec<(String, String)>,
+    /// `env:` entries named in `ignore-env`, with the values of the first job
+    /// that has the step. The step runs with them, but they are not part of
+    /// the id or of any key.
+    #[serde(default)]
+    pub ignored_env: Vec<(String, String)>,
     pub label: String,
     /// The workflow and job the step is run for, when it is run.
     pub workflow: String,
@@ -160,13 +165,15 @@ impl SetupRecipe {
     /// The places in the jobs of the task whose steps `receipt` says were
     /// prepared, by job, when `receipt` belongs to this task in this workspace:
     /// it was made on `source`, for the workspace whose id is `workspace`, and
-    /// under the template key this recipe has now in `tctx`. Otherwise `Err`
-    /// says why it is not believed, and nothing is skipped.
+    /// under the template key this recipe has now in `tctx`, and whose
+    /// artifacts are still in `root`. Otherwise `Err` says why it is not
+    /// believed, and nothing is skipped.
     pub(crate) fn prepared_places(
         &self,
         receipt: &PreparedReceipt,
         source: &str,
         workspace: Option<&str>,
+        root: &Path,
         tctx: &TemplateContext,
     ) -> Result<HashMap<String, HashSet<usize>>, String> {
         let mut out: HashMap<String, HashSet<usize>> = HashMap::new();
@@ -181,6 +188,18 @@ impl SetupRecipe {
         }
         if receipt.template_key != self.template_key(tctx).digest() {
             return Err("its template key is not the key of this task's recipe here".into());
+        }
+        // The id outlives what the workspace held (`git clean -fdx` leaves the
+        // git dir alone), so look for what the install made before believing it.
+        if let Some(gone) = receipt
+            .artifacts
+            .iter()
+            .find(|a| root.join(&a.path).symlink_metadata().is_err())
+        {
+            return Err(format!(
+                "`{}`, which the setup made, is no longer in the workspace",
+                gone.path
+            ));
         }
         for s in self.steps.iter().filter(|s| receipt.covers(&s.id)) {
             for a in &s.at {
@@ -341,6 +360,17 @@ impl PreparedReceipt {
         }
     }
 
+    /// This receipt for the workspace `workspace`, which was made from the one
+    /// it is for: a copy [`crate::execute_task`] callers derive from a prepared
+    /// workspace (a unit's copy, a materialized template) has a new id and
+    /// holds what the original held, so the receipt is theirs to say so with.
+    pub fn rebound(&self, workspace: &str) -> PreparedReceipt {
+        PreparedReceipt {
+            workspace: workspace.into(),
+            ..self.clone()
+        }
+    }
+
     pub fn covers(&self, step_id: &str) -> bool {
         self.steps.iter().any(|s| s.id == step_id)
     }
@@ -424,7 +454,7 @@ pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Res
                 }
             }
         }
-        let prefix = plan::prefix_of(w, j);
+        let prefix = plan::prefix_of(w, j, &plan.ignore_env);
         let mut seen: HashSet<String> = HashSet::new();
         // set when a step comes up a second time, which ends the prefix
         let mut ended = false;
@@ -462,6 +492,11 @@ pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Res
                     shell: p.key.shell.clone(),
                     env: p.key.env.clone(),
                     unresolved_env: p.key.open_env.clone(),
+                    ignored_env: plan::effective_env(w, j, p.step)
+                        .0
+                        .into_iter()
+                        .filter(|(k, _)| plan.ignore_env.contains(k))
+                        .collect(),
                     label: p.step.label(),
                     workflow: w.file.clone(),
                     job: j.id.clone(),
@@ -639,8 +674,19 @@ fn git_dir_of(root: &Path) -> Option<PathBuf> {
 /// another path, and so has no id of its own until it is prepared itself.
 fn id_place(root: &Path) -> Option<(PathBuf, String)> {
     let canon = std::fs::canonicalize(root).ok()?;
+    let git_dir = git_dir_of(root)?;
+    // A `.git` file that points at the git dir of another worktree (a copy of
+    // a worktree) is not this workspace's own: nothing may be recorded there,
+    // it would replace the id of the original.
+    if root.join(".git").is_file() {
+        let owner = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+        let owner = std::fs::canonicalize(owner.trim()).ok()?;
+        if owner != std::fs::canonicalize(root.join(".git")).ok()? {
+            return None;
+        }
+    }
     Some((
-        git_dir_of(root)?.join(WORKSPACE_ID),
+        git_dir.join(WORKSPACE_ID),
         canon.to_string_lossy().into_owned(),
     ))
 }

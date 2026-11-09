@@ -19,6 +19,14 @@ struct Raw {
     no_cache: Option<Vec<String>>,
     #[serde(rename = "link-node-modules")]
     link_node_modules: Option<bool>,
+    setup: Option<RawSetup>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSetup {
+    #[serde(rename = "ignore-env")]
+    ignore_env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -31,6 +39,10 @@ pub struct Config {
     pub no_cache: Vec<String>,
     /// Units' copies link to setup's `node_modules` instead of cloning it.
     pub link_node_modules: bool,
+    /// `[setup] ignore-env`: `env:` names that do not decide what an install
+    /// does (`CI`, `DATABASE_URL`). They are left out of the keys of setup
+    /// steps, so jobs that differ only in them still share one install. Sorted.
+    pub ignore_env: Vec<String>,
 }
 
 impl Config {
@@ -76,10 +88,20 @@ pub fn parse(text: &str) -> Result<Config> {
     if let Some(e) = no_cache.iter().find(|e| e.trim().is_empty()) {
         bail!("{FILE}: no-cache {e:?}: give a workflow file (`ci.yml`) or a job (`ci.yml:e2e`)");
     }
+    let mut ignore_env = raw.setup.and_then(|s| s.ignore_env).unwrap_or_default();
+    if let Some(e) = ignore_env
+        .iter()
+        .find(|e| e.trim().is_empty() || e.contains('='))
+    {
+        bail!("{FILE}: [setup] ignore-env {e:?}: give the name of an env variable");
+    }
+    ignore_env.sort();
+    ignore_env.dedup();
     Ok(Config {
         workflows_dirs,
         no_cache,
         link_node_modules: raw.link_node_modules.unwrap_or(false),
+        ignore_env,
     })
 }
 
@@ -129,6 +151,20 @@ mod tests {
         assert!(!c.link_node_modules);
         assert!(parse("link-node-modules = true").unwrap().link_node_modules);
         assert!(parse("no-cache = [\" \"]").is_err());
+    }
+
+    #[test]
+    fn setup_ignore_env_is_sorted_and_checked() {
+        assert!(parse("").unwrap().ignore_env.is_empty());
+        let c = parse("[setup]\nignore-env = [\"DATABASE_URL\", \"CI\", \"CI\"]\n").unwrap();
+        assert_eq!(c.ignore_env, vec!["CI", "DATABASE_URL"]);
+        for text in [
+            "[setup]\nignore-env = [\"\"]",
+            "[setup]\nignore-env = [\"A=b\"]",
+            "[setup]\nignore_env = [\"A\"]",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
     }
 
     #[test]

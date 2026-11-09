@@ -40,6 +40,9 @@ pub struct FrozenConfig {
     pub no_cache: Vec<String>,
     /// Copies of the worktree link to setup's `node_modules`.
     pub link_node_modules: bool,
+    /// `env:` names left out of the keys of setup steps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_env: Vec<String>,
 }
 
 /// The selection the caller asked for.
@@ -327,6 +330,7 @@ impl FrozenPlan {
                 .map(|s| (s.workflow.clone(), s.reason.clone()))
                 .collect(),
             units: self.units.iter().map(UnitSpec::to_unit).collect(),
+            ignore_env: self.config.ignore_env.clone(),
         }
     }
 

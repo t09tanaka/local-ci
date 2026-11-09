@@ -40,10 +40,10 @@ pub struct StepKey {
     pub wd: String,
     pub run: String,
     /// The shell the step runs with (step, else job, else workflow); `None`
-    /// is the default, bash.
+    /// is the default, bash (also when it is written `bash`).
     pub shell: Option<String>,
     /// The workflow, job and step `env:` put together, sorted by name, without
-    /// the values that are expressions.
+    /// the values that are expressions and the names in `ignore-env`.
     pub env: Vec<(String, String)>,
     /// The `env:` entries whose value is an expression evaluated at run time.
     pub open_env: Vec<(String, String)>,
@@ -54,6 +54,9 @@ pub struct Plan {
     pub selected: Vec<Selected>,
     pub skipped: Vec<(String, String)>,
     pub units: Vec<Unit>,
+    /// Names of `env:` entries that do not decide what an install does
+    /// (`ignore-env` of `.local-ci.toml`); they are left out of step keys.
+    pub ignore_env: Vec<String>,
 }
 
 impl Plan {
@@ -126,12 +129,17 @@ pub fn effective_env(w: &Workflow, j: &Job, s: &Step) -> (EnvPairs, EnvPairs) {
     (env, open)
 }
 
-pub fn step_key(w: &Workflow, j: &Job, s: &Step) -> Option<StepKey> {
-    let (env, open_env) = effective_env(w, j, s);
+/// The key of a `run:` step. `ignore` names `env:` entries that are not part of
+/// it. A shell written as `bash` is the default shell, so it is `None` here:
+/// a job that says `shell: bash` and one that says nothing run the same way.
+pub fn step_key(w: &Workflow, j: &Job, s: &Step, ignore: &[String]) -> Option<StepKey> {
+    let (mut env, mut open_env) = effective_env(w, j, s);
+    env.retain(|(k, _)| !ignore.contains(k));
+    open_env.retain(|(k, _)| !ignore.contains(k));
     Some(StepKey {
         wd: step_dir(w, j, s),
         run: s.run.as_ref()?.trim().to_string(),
-        shell: resolved_shell(w, j, s),
+        shell: resolved_shell(w, j, s).filter(|sh| sh.trim() != "bash"),
         env,
         open_env,
     })
@@ -411,7 +419,7 @@ pub(crate) struct Prefix<'a> {
     pub stopped_by: Option<(usize, StayReason)>,
 }
 
-pub(crate) fn prefix_of<'a>(w: &Workflow, j: &'a Job) -> Prefix<'a> {
+pub(crate) fn prefix_of<'a>(w: &Workflow, j: &'a Job, ignore: &[String]) -> Prefix<'a> {
     let mut out = Prefix {
         steps: Vec::new(),
         stopped_by: None,
@@ -432,7 +440,7 @@ pub(crate) fn prefix_of<'a>(w: &Workflow, j: &'a Job) -> Prefix<'a> {
         }
         out.steps.push(PrefixStep {
             index,
-            key: step_key(w, j, s).unwrap(),
+            key: step_key(w, j, s, ignore).unwrap(),
             step: s,
         });
     }
@@ -570,7 +578,13 @@ pub(crate) fn hoist(plan: &Plan) -> Hoist {
             if j.container || j.reusable.is_some() {
                 continue;
             }
-            prefixes.push(prefix_of(w, j).steps.into_iter().map(|p| p.key).collect());
+            prefixes.push(
+                prefix_of(w, j, &plan.ignore_env)
+                    .steps
+                    .into_iter()
+                    .map(|p| p.key)
+                    .collect(),
+            );
         }
     }
     let mut count: HashMap<&StepKey, usize> = HashMap::new();

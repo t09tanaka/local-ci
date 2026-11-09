@@ -1270,6 +1270,7 @@ impl<'a> Runner<'a> {
             let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &s.job);
             let mut env = self.base_env(&gh, &[]);
             env.extend(s.env.iter().cloned());
+            env.extend(s.ignored_env.iter().cloned());
             let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.dir, s.label));
             let t0 = Instant::now();
             let cwd = self.wt.join(&s.dir);
@@ -1556,17 +1557,30 @@ impl<'a> Runner<'a> {
         // are run together, as the job.
         let mut inputs = TaskInputs::default();
         let mut jobs = Vec::new();
+        // A copy of the setup workspace is another workspace: it gets an id of
+        // its own, and the receipts of the setup are bound to it, as the copy
+        // holds what the setup made.
+        let copy_id = (ws != self.wt)
+            .then(|| setup::ensure_workspace_id(ws).ok())
+            .flatten();
+        let origin = setup::workspace_id(&self.wt);
         for task in self.fp.tasks.iter().filter(|t| t.unit == ui) {
             if task.variant.as_ref().is_some_and(|v| v.index > 0) {
                 continue;
             }
+            let receipt = self.receipts.as_ref().and_then(|(m, c)| {
+                m.get(&task.id).map(|r| match &copy_id {
+                    Some(id) if origin.as_deref() == Some(r.workspace.as_str()) => {
+                        (r.rebound(id), c)
+                    }
+                    _ => (r.clone(), c),
+                })
+            });
             match self.run_task(
                 ws,
                 task,
                 &inputs,
-                self.receipts
-                    .as_ref()
-                    .and_then(|(m, c)| m.get(&task.id).map(|r| (r, c))),
+                receipt.as_ref().map(|(r, c)| (r, *c)),
                 locked,
                 true,
             ) {
@@ -1657,6 +1671,7 @@ impl<'a> Runner<'a> {
                     r,
                     &self.fp.source.sha,
                     setup::workspace_id(ws).as_deref(),
+                    ws,
                     tctx,
                 ) {
                 Ok(p) => p,
@@ -2224,7 +2239,9 @@ impl<'a> Runner<'a> {
             // An install that another job runs here with another shell or env
             // is this job's own: the npm shim must not take another job's mark
             // of it for its own.
-            if plan::step_key(w, job, s).is_some_and(|k| self.hoisted.conflicting.contains(&k)) {
+            if plan::step_key(w, job, s, &self.plan.ignore_env)
+                .is_some_and(|k| self.hoisted.conflicting.contains(&k))
+            {
                 env_now.insert(
                     "LOCAL_CI_INSTALL_SCOPE".into(),
                     Value::String(job.id.clone()),
