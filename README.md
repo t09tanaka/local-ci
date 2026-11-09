@@ -256,7 +256,8 @@ they end.
   when its version differs. Other actions are skipped and listed under
   `not covered`.
 
-Not covered: steps that read `secrets.*` or `github.token`, steps that push,
+Not covered: steps that read a secret other than `github.token` (which gets
+this machine's `gh auth token`, never written to a file of the run), steps that push,
 publish or deploy (`git push`, `gh release`, `npm publish`, `aws`, `kubectl`,
 `terraform apply`, ...), steps that install system packages (`sudo`,
 `apt-get`, `brew install`, ...), `container:` jobs and reusable workflows. A
