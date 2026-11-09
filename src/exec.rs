@@ -171,6 +171,9 @@ fn charge(jobs: &mut [JobResult], w: UnitWait) {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitResult {
+    /// The unit of the plan this is the result of (index into its `units`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<usize>,
     pub workflow: String,
     pub jobs: Vec<JobResult>,
     pub waited_secs: f64,
@@ -180,6 +183,10 @@ pub struct UnitResult {
     /// Where the reused result comes from (`abc1234, 2h ago`), when the unit did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached: Option<String>,
+    /// Each job of the unit as the jobs that need it saw it, in the order they
+    /// ran. Empty for a reused result (which keeps no outputs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<JobOutcome>,
 }
 
 pub struct Opts {
@@ -1225,6 +1232,7 @@ impl<'a> Runner<'a> {
         let before = setup::top_level_entries(&self.wt, &dirs);
         let mut out = Vec::new();
         let mut prepared: Vec<PreparedStep> = Vec::new();
+        let mut notes: Vec<setup::ReceiptNote> = Vec::new();
         for (i, s) in recipe.steps.iter().enumerate() {
             if let Some(by) = covered.get(&s.id) {
                 if prepared.iter().any(|p| &p.id == by) {
@@ -1293,11 +1301,20 @@ impl<'a> Runner<'a> {
                 Err(e) => (Outcome::Error(format!("{e:#}")), None),
             };
             let stop = outcome != Outcome::Pass;
+            // an install shared by jobs whose `ignore-env` values differ ran
+            // with one set of them: say whose
+            let note = setup::ignored_env_note(s);
             if !stop {
                 prepared.push(PreparedStep {
                     id: s.id.clone(),
                     how: PreparedHow::Ran,
                 });
+                if let Some(text) = &note {
+                    notes.push(setup::ReceiptNote {
+                        step: s.id.clone(),
+                        text: text.clone(),
+                    });
+                }
             }
             out.push(StepResult {
                 label,
@@ -1305,7 +1322,7 @@ impl<'a> Runner<'a> {
                 exit,
                 secs: t0.elapsed().as_secs_f64(),
                 log: Some(log),
-                note: None,
+                note,
             });
             if stop {
                 break;
@@ -1327,6 +1344,7 @@ impl<'a> Runner<'a> {
                 workspace,
                 steps: prepared,
                 artifacts,
+                notes,
             },
             steps: out,
         }
@@ -1523,11 +1541,13 @@ impl<'a> Runner<'a> {
                     .collect();
                 charge(&mut jobs, waited);
                 UnitResult {
+                    unit: Some(ui),
                     workflow: w.file.clone(),
                     jobs,
                     waited_secs: waited.total(),
                     copy_secs: None,
                     cached: None,
+                    outcomes: vec![],
                 }
             }
         };
@@ -1557,6 +1577,7 @@ impl<'a> Runner<'a> {
         // are run together, as the job.
         let mut inputs = TaskInputs::default();
         let mut jobs = Vec::new();
+        let mut outcomes: Vec<JobOutcome> = Vec::new();
         // A copy of the setup workspace is another workspace: it gets an id of
         // its own, and the receipts of the setup are bound to it, as the copy
         // holds what the setup made.
@@ -1587,12 +1608,27 @@ impl<'a> Runner<'a> {
                 Ok(r) => {
                     for o in r.outcomes {
                         inputs.run_cancelled |= o.status == JobStatus::Cancelled;
+                        outcomes.push(o.clone());
                         inputs.needs.insert(o.job.clone(), o);
                     }
                     jobs.extend(r.jobs);
                 }
                 Err(e) => {
                     let reason = format!("{e:#}");
+                    // The jobs of a task that could not be run failed: the
+                    // jobs that need them must see that, not a missing need.
+                    for id in &task.jobs {
+                        let o = JobOutcome {
+                            job: id.clone(),
+                            variant: None,
+                            status: JobStatus::Failure,
+                            outputs: Default::default(),
+                            skipped: Some(reason.clone()),
+                            ancestor_failed: false,
+                        };
+                        outcomes.push(o.clone());
+                        inputs.needs.insert(id.clone(), o);
+                    }
                     for id in &task.jobs {
                         jobs.push(JobResult {
                             workflow: w.file.clone(),
@@ -1610,11 +1646,13 @@ impl<'a> Runner<'a> {
         }
         charge(&mut jobs, waited);
         UnitResult {
+            unit: Some(ui),
             workflow: w.file.clone(),
             jobs,
             waited_secs: waited.total(),
             copy_secs: None,
             cached: None,
+            outcomes,
         }
     }
 
@@ -1738,6 +1776,7 @@ impl<'a> Runner<'a> {
             jobs,
             outcomes,
             receipt_ignored,
+            artifacts: vec![],
         })
     }
 

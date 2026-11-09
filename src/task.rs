@@ -145,6 +145,10 @@ pub struct TaskResult {
     /// commit, another workspace, another template key); the task then did all
     /// its setup itself. `None` when there was no receipt or it was used.
     pub receipt_ignored: Option<String>,
+    /// Names of the artifacts the task published (none are produced yet; the
+    /// `artifacts` a task's [`crate::dag::OutputVerification`] asks for are
+    /// checked against this).
+    pub artifacts: Vec<String>,
 }
 
 /// One job, or one matrix entry of it, from its result and outputs.

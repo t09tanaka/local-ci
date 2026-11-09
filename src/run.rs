@@ -338,7 +338,7 @@ pub fn post_status(
             "api",
             &format!("repos/{slug}/statuses/{sha}"),
             "-f",
-            &format!("state={state}"),
+            &format!("state={}", report::github_state(state)),
             "-f",
             "context=local-ci",
             "-f",
@@ -449,7 +449,6 @@ pub fn execute_plan(
             ws.run_dir.clone(),
             vec![],
             vec![],
-            true,
             t0.elapsed().as_secs_f64(),
         ));
     }
@@ -500,7 +499,6 @@ pub fn execute_plan(
         ws.run_dir.clone(),
         setup,
         units,
-        false,
         t0.elapsed().as_secs_f64(),
     ))
 }
@@ -525,7 +523,6 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let nothing_triggered = full.units.is_empty();
     let full_plan = full.to_plan();
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
@@ -560,15 +557,22 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let mut p = full_plan;
     let mut reused = Vec::new();
     let mut to_run = Vec::new();
+    // where each unit still to run stands in the whole plan
+    let mut run_idx = Vec::new();
     let mut run_fps = Vec::new();
-    for (u, fp) in std::mem::take(&mut p.units).into_iter().zip(fingerprints) {
+    for (i, (u, fp)) in std::mem::take(&mut p.units)
+        .into_iter()
+        .zip(fingerprints)
+        .enumerate()
+    {
         let hit = fp
             .as_deref()
             .filter(|_| !a.no_cache)
             .and_then(|f| store.get(f, &p.selected[u.wf].wf.file, stamp));
         match hit {
-            Some(r) => reused.push(r),
+            Some(r) => reused.push(exec::UnitResult { unit: Some(i), ..r }),
             None => {
+                run_idx.push(i);
                 to_run.push(u);
                 run_fps.push(fp);
             }
@@ -666,13 +670,20 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             }
         }
     }
-    let units: Vec<exec::UnitResult> = reused.into_iter().chain(units).collect();
+    // The units that ran were numbered in the part of the plan that was run;
+    // the result is checked against the whole plan.
+    let units: Vec<exec::UnitResult> = reused
+        .into_iter()
+        .chain(units.into_iter().map(|u| exec::UnitResult {
+            unit: u.unit.and_then(|i| run_idx.get(i).copied()),
+            ..u
+        }))
+        .collect();
     let result = report::assemble(
-        &fp,
+        &full,
         run_dir.clone(),
         setup,
         units,
-        nothing_triggered,
         t_start.elapsed().as_secs_f64(),
     );
     exec::write_json(&run_dir.join("result.json"), &result)?;
@@ -759,5 +770,8 @@ pub fn status(
         }
     }
     post_status(ctx, &root, &want, &saved.state, &saved.description)?;
-    Ok((saved.state.clone(), want[..7].to_string()))
+    Ok((
+        report::github_state(&saved.state).to_string(),
+        want[..7].to_string(),
+    ))
 }

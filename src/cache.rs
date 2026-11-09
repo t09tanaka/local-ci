@@ -323,10 +323,12 @@ impl Store {
             })
             .collect();
         Some(UnitResult {
+            unit: None,
             workflow: workflow.to_string(),
             jobs,
             waited_secs: 0.0,
             copy_secs: None,
+            outcomes: vec![],
             cached: Some(format!(
                 "{}, {}",
                 &saved.sha[..saved.sha.len().min(7)],
@@ -567,11 +569,13 @@ jobs:
             time: None,
         };
         let u = |o: Outcome| UnitResult {
+            unit: None,
             workflow: "ci.yml".into(),
             jobs: vec![job(o)],
             waited_secs: 0.0,
             copy_secs: None,
             cached: None,
+            outcomes: vec![],
         };
         let sha = "a".repeat(40);
         store.put("f1", &sha, &u(Outcome::Fail), 100);

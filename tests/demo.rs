@@ -120,7 +120,9 @@ fn nothing_runs_when_paths_do_not_match() {
         out.contains("not triggered (paths not matched: ci.yml)"),
         "{out}"
     );
-    assert!(out.contains("result: success · pass 0"), "{out}");
+    // nothing to run is not a success of any check, but exits 0 as it always did
+    assert!(out.contains("result: no_work · pass 0"), "{out}");
+    assert!(out.contains("NO WORK"), "{out}");
     // --all runs it anyway
     let o = local_ci(&d, &["plan", "--all"]);
     let out = stdout(&o);
@@ -144,7 +146,10 @@ fn runs_jobs_with_dynamic_matrix() {
         ],
     );
     let out = stdout(&o);
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    // the report-upload step is an action local-ci cannot reproduce: nothing
+    // failed, but the run is not a pass
+    assert_eq!(o.status.code(), Some(2), "{out}");
+    assert!(out.contains("result: incomplete"), "{out}");
     for line in [
         "PASS   ci.yml › lint",
         "PASS   ci.yml › discover",

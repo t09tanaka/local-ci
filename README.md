@@ -57,7 +57,7 @@ Or download a binary from the [releases](https://github.com/t09tanaka/local-ci/r
 | Command | What it does |
 |---|---|
 | `local-ci plan` | Show the workflows, units and setup steps that would run. Runs nothing. |
-| `local-ci run` | Run them and report. Exit code 0 = success, 1 = failure, 2 = error (could not check everything), 130 = interrupted. |
+| `local-ci run` | Run them and report. Exit code 0 = success (or `no_work`: the changes trigger no workflow), 1 = failure, 2 = error or `incomplete` (could not check everything, or left out what local-ci cannot reproduce), 130 = interrupted. |
 | `local-ci status` | Record the last run's result as the `local-ci` commit status (for a commit you have pushed since). |
 
 Common options (`plan` and `run`):
@@ -202,7 +202,7 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    all `local-ci` runs, so databases do not pile up while their tests wait
    for CPU.
 4. **Report.** One line per job, the tail of each failing step, where the logs
-   are, and the overall state: `success`, `failure` or `error`. A job that
+   are, and the overall state: `success`, `failure`, `error`, `incomplete` (parts that cannot be reproduced here were skipped) or `no_work` (nothing is triggered). `success` is only for a run whose result has everything the plan expects. A job that
    waited a second or more for something says what it waited for and how long
    it really ran: `PASS  ci.yml › e2e  3m00s (ran 2m20s · waited slot 5m00s, queue 40s)`.
    The job's `time` in `result.json` and in `--json` has the same split, in

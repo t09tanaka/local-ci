@@ -60,6 +60,11 @@ pub struct RecipeStep {
     /// the id or of any key.
     #[serde(default)]
     pub ignored_env: Vec<(String, String)>,
+    /// Jobs that have this step with other values of the `ignore-env`
+    /// entries than the ones it runs with (`job`/`workflow` below): the
+    /// install is shared, and these values were not the ones it used.
+    #[serde(default)]
+    pub ignored_env_differs: Vec<IgnoredEnvDiffers>,
     pub label: String,
     /// The workflow and job the step is run for, when it is run.
     pub workflow: String,
@@ -67,6 +72,17 @@ pub struct RecipeStep {
     /// Every place in the task's jobs where this step is (a second job of the
     /// task that starts with the same install holds another place).
     pub at: Vec<StepRef>,
+}
+
+/// A job whose `ignore-env` entry has another value than the one an install
+/// shared with it ran with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredEnvDiffers {
+    pub workflow: String,
+    pub job: String,
+    pub name: String,
+    /// What the job has; `None` when it does not set the variable.
+    pub value: Option<String>,
 }
 
 /// A step that looks like preparation but stays in its job, and why.
@@ -115,6 +131,20 @@ impl SetupRecipe {
                         for a in &s.at {
                             if !x.at.contains(a) {
                                 x.at.push(a.clone());
+                            }
+                        }
+                        // the same install in another task: it runs once,
+                        // with the values of the first
+                        let mut differs = ignored_differences(
+                            &x.ignored_env,
+                            &s.ignored_env,
+                            &s.workflow,
+                            &s.job,
+                        );
+                        differs.extend(s.ignored_env_differs.iter().cloned());
+                        for d in differs {
+                            if !x.ignored_env_differs.contains(&d) {
+                                x.ignored_env_differs.push(d);
                             }
                         }
                     }
@@ -190,16 +220,28 @@ impl SetupRecipe {
             return Err("its template key is not the key of this task's recipe here".into());
         }
         // The id outlives what the workspace held (`git clean -fdx` leaves the
-        // git dir alone), so look for what the install made before believing it.
-        if let Some(gone) = receipt
-            .artifacts
-            .iter()
-            .find(|a| root.join(&a.path).symlink_metadata().is_err())
-        {
-            return Err(format!(
-                "`{}`, which the setup made, is no longer in the workspace",
-                gone.path
-            ));
+        // git dir alone), and a tree with the right names may hold other
+        // contents: believe the install only for the tree it made.
+        for a in &receipt.artifacts {
+            let at = root.join(&a.path);
+            if at.symlink_metadata().is_err() {
+                return Err(format!(
+                    "`{}`, which the setup made, is no longer in the workspace",
+                    a.path
+                ));
+            }
+            match crate::tree::tree_digest(&at) {
+                Ok(d) if d.digest == a.digest => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "`{}` is no longer what the setup made (its tree digest differs)",
+                        a.path
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!("`{}` cannot be checked: {e:#}", a.path));
+                }
+            }
         }
         for s in self.steps.iter().filter(|s| receipt.covers(&s.id)) {
             for a in &s.at {
@@ -318,13 +360,11 @@ pub struct PreparedStep {
     pub how: PreparedHow,
 }
 
-/// A digest of something setup made, by path relative to the workspace.
-///
-/// For now this is a digest of the names and sizes in the first two levels of
-/// each new top-level entry, not of the contents, so it cannot tell two trees
-/// with the same names and sizes apart. The digest of the contents (a tree
-/// digest) comes with the result checks of a later stage; until then whoever
-/// stores a template should compute the digest of the tree it stores.
+/// A digest of something setup made, by path relative to the workspace: the
+/// [tree digest](crate::tree::tree_digest) of what the setup added there (a
+/// directory such as `node_modules`, recursively, or a file). It covers names,
+/// kinds, executable bits, link values and contents, so a task believes the
+/// receipt only for a tree that is still what the setup made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDigest {
     pub path: String,
@@ -346,6 +386,19 @@ pub struct PreparedReceipt {
     /// is not here.
     pub steps: Vec<PreparedStep>,
     pub artifacts: Vec<ArtifactDigest>,
+    /// What a reader of the receipt should know about how a step was done,
+    /// e.g. which job's `ignore-env` values an install shared by several jobs
+    /// ran with.
+    #[serde(default)]
+    pub notes: Vec<ReceiptNote>,
+}
+
+/// A line about one step of a receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptNote {
+    /// The id of the [`RecipeStep`] it is about.
+    pub step: String,
+    pub text: String,
 }
 
 impl PreparedReceipt {
@@ -357,6 +410,7 @@ impl PreparedReceipt {
             workspace: String::new(),
             steps: vec![],
             artifacts: vec![],
+            notes: vec![],
         }
     }
 
@@ -395,6 +449,12 @@ impl PreparedReceipt {
                     let parent = a.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                     recipe.steps.iter().any(|r| r.dir == parent)
                 })
+                .cloned()
+                .collect(),
+            notes: self
+                .notes
+                .iter()
+                .filter(|n| recipe.steps.iter().any(|r| r.id == n.step))
                 .cloned()
                 .collect(),
         }
@@ -483,8 +543,22 @@ pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Res
                 job: j.id.clone(),
                 index: p.index,
             };
+            let ignored: Vec<(String, String)> = plan::effective_env(w, j, p.step)
+                .0
+                .into_iter()
+                .filter(|(k, _)| plan.ignore_env.contains(k))
+                .collect();
             match out.steps.iter_mut().find(|s| s.id == id) {
-                Some(s) => s.at.push(at),
+                Some(s) => {
+                    s.at.push(at);
+                    // The install runs once with the values of the first job;
+                    // say where another job has other ones.
+                    for d in ignored_differences(&s.ignored_env, &ignored, &w.file, &j.id) {
+                        if !s.ignored_env_differs.contains(&d) {
+                            s.ignored_env_differs.push(d);
+                        }
+                    }
+                }
                 None => out.steps.push(RecipeStep {
                     id,
                     dir: p.key.wd.clone(),
@@ -492,11 +566,8 @@ pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Res
                     shell: p.key.shell.clone(),
                     env: p.key.env.clone(),
                     unresolved_env: p.key.open_env.clone(),
-                    ignored_env: plan::effective_env(w, j, p.step)
-                        .0
-                        .into_iter()
-                        .filter(|(k, _)| plan.ignore_env.contains(k))
-                        .collect(),
+                    ignored_env: ignored,
+                    ignored_env_differs: vec![],
                     label: p.step.label(),
                     workflow: w.file.clone(),
                     job: j.id.clone(),
@@ -527,6 +598,71 @@ pub(crate) fn derive_in(plan: &Plan, hoist: &Hoist, task: &ExecutionTask) -> Res
     }
     out.toolchain = tools.into_iter().collect();
     Ok(out)
+}
+
+/// The `ignore-env` entries of `other` (a job's) that differ from `used` (the
+/// ones the shared install runs with).
+fn ignored_differences(
+    used: &[(String, String)],
+    other: &[(String, String)],
+    workflow: &str,
+    job: &str,
+) -> Vec<IgnoredEnvDiffers> {
+    let mut names: BTreeSet<&str> = used.iter().map(|(k, _)| k.as_str()).collect();
+    names.extend(other.iter().map(|(k, _)| k.as_str()));
+    let get =
+        |m: &'_ [(String, String)], k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    names
+        .into_iter()
+        .filter(|k| get(used, k) != get(other, k))
+        .map(|k| IgnoredEnvDiffers {
+            workflow: workflow.to_string(),
+            job: job.to_string(),
+            name: k.to_string(),
+            value: get(other, k),
+        })
+        .collect()
+}
+
+/// One line on the `ignore-env` values a shared install ran with, when another
+/// job that shares it has other ones: which job's which env, with which value.
+pub(crate) fn ignored_env_note(s: &RecipeStep) -> Option<String> {
+    if s.ignored_env_differs.is_empty() {
+        return None;
+    }
+    let show = |m: &[(String, String)]| {
+        if m.is_empty() {
+            "no ignore-env entry".to_string()
+        } else {
+            m.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let others = s
+        .ignored_env_differs
+        .iter()
+        .map(|d| {
+            format!(
+                "{} › {}: {}",
+                d.workflow,
+                d.job,
+                match &d.value {
+                    Some(v) => format!("{}={v}", d.name),
+                    None => format!("{} unset", d.name),
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "ignore-env: `{}` was installed with {} (from {} › {}); other jobs that share it have {others}",
+        s.label,
+        show(&s.ignored_env),
+        s.workflow,
+        s.job,
+    ))
 }
 
 /// Installs of one kind in one place (`npm ci` and `npm install` in `app`)
@@ -596,10 +732,9 @@ pub(crate) fn top_level_entries(root: &Path, dirs: &BTreeSet<String>) -> BTreeSe
     out
 }
 
-const MANIFEST_CAP: usize = 20_000;
-
-/// A digest of the names and sizes of the first two levels under each entry of
-/// `after` that was not in `before`.
+/// The tree digest of each entry of `after` that was not in `before`. An
+/// entry that cannot be read gets a digest that no tree has, so no receipt
+/// made from it is ever believed.
 pub(crate) fn artifact_digests(
     root: &Path,
     before: &BTreeSet<String>,
@@ -607,42 +742,13 @@ pub(crate) fn artifact_digests(
 ) -> Vec<ArtifactDigest> {
     after
         .difference(before)
-        .map(|p| {
-            let mut lines = Vec::new();
-            manifest(&root.join(p), "", 0, &mut lines);
-            lines.sort();
-            ArtifactDigest {
-                path: p.clone(),
-                digest: sha256_of(&lines.join("\n")),
-            }
+        .map(|p| ArtifactDigest {
+            path: p.clone(),
+            digest: crate::tree::tree_digest(&root.join(p))
+                .map(|d| d.digest)
+                .unwrap_or_else(|e| format!("unreadable: {e:#}")),
         })
         .collect()
-}
-
-fn manifest(path: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
-    let Ok(md) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    let kind = if md.file_type().is_symlink() {
-        "l"
-    } else if md.is_dir() {
-        "d"
-    } else {
-        "f"
-    };
-    out.push(format!(
-        "{rel}\t{kind}\t{}",
-        if kind == "f" { md.len() } else { 0 }
-    ));
-    if kind != "d" || depth >= 2 || out.len() >= MANIFEST_CAP {
-        return;
-    }
-    if let Ok(rd) = std::fs::read_dir(path) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            manifest(&e.path(), &format!("{rel}/{name}"), depth + 1, out);
-        }
-    }
 }
 
 /// The file in a workspace's git dir that holds its id.

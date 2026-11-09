@@ -5,6 +5,7 @@
 //! any release. The `local-ci` binary is a thin adapter over it.
 
 pub mod cache;
+pub mod complete;
 pub mod config;
 pub mod context;
 pub mod dag;
@@ -22,9 +23,11 @@ pub mod setup;
 pub mod source;
 pub mod task;
 pub mod template;
+pub mod tree;
 pub mod wire;
 pub mod workflow;
 
+pub use complete::{validate_run_result, verify_task_result, Completeness, Verdict};
 pub use context::{CancelHandle, ExecContext};
 pub use frozen::{derive_job_dag, FrozenPlan};
 pub use run::{

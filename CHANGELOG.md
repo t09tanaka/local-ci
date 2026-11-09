@@ -95,6 +95,43 @@
   `JobOutcome` has `ancestor_failed`, `TaskInputs` has `run_cancelled` (both
   default to false when missing), and `TaskInputs::new` builds the inputs of a
   task from the outcomes finished so far.
+- A result is checked against everything the plan expects before it counts as
+  a success. `validate_run_result(&FrozenPlan, &RunResult)` lists the units,
+  the job entries (a matrix job once per variant) and the steps of the whole
+  plan (a unit reused from the cache counts as its result) and reports what is
+  missing, there twice, not in the plan, or without a reason (a skip), and
+  what the plan requires of a task's result (the outputs its jobs declare, the
+  artifacts it must publish; `verify_task_result` does this for one
+  `TaskResult`). `result.json` and `--json` have a `completeness` object, and
+  `state` can now also be `no_work`, `incomplete` or, for a result that lacks
+  or doubles something, `error`. Behaviour changes:
+  - A run whose changes trigger no workflow has the state `no_work`, not
+    `success` (it says `NO WORK`, and its commit status description starts
+    with `no_work`). The exit code stays 0, and the commit status is still
+    posted as `success`, so a required `local-ci` check can pass on a commit
+    that triggers nothing, as before.
+  - A run that skipped what local-ci cannot reproduce (a step that uses an
+    action it does not know, a `secrets` step, an install of system
+    packages, a push or deploy, `upload-artifact` / `download-artifact`) has
+    the state `incomplete` and exits 2 (it used to be a `success` with a
+    "not covered" note and exit 0). Its commit status is `error`, never
+    `success`; `local-ci status` does the same. `checkout`, `cache` and the
+    setup actions are not gaps.
+  - A task that cannot be run (not a step that fails: the task itself)
+    counts as a failure for the jobs that need it. Before, those jobs saw a
+    need that was not there.
+- A setup receipt holds the content digest of what the setup made. The
+  artifacts of `PreparedReceipt` were a digest of names and sizes; they are now
+  the tree digest (`tree::tree_digest`: path, kind, executable bit and content
+  hash of every entry, symlinks by their link value, in a fixed order). A task
+  skips its installs only when the tree is still what the setup made: a file
+  gone or changed in `node_modules` makes it ignore the receipt and install
+  again (`receipt_ignored` says so). Receipts made before this have a digest
+  that never matches and are ignored. Library: `PreparedReceipt` has `notes`.
+- When jobs that share one install have other values of an `ignore-env`
+  variable, the install ran with the values of the first. The setup step's
+  note, the run's warnings and the receipt's `notes` now say which job's
+  value it ran with and which other jobs differ.
 
 ## 0.7.0
 

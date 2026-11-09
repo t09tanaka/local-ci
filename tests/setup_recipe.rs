@@ -858,6 +858,7 @@ fn recipe_step(run: &str) -> RecipeStep {
         env: vec![],
         unresolved_env: vec![],
         ignored_env: vec![],
+        ignored_env_differs: vec![],
         label: run.into(),
         workflow: F.into(),
         job: "a".into(),
@@ -883,6 +884,7 @@ fn receipt_for(recipe: &SetupRecipe, key: &TemplateKey, artifact: &str) -> Prepa
             path: artifact.into(),
             digest: "d".into(),
         }],
+        notes: vec![],
     }
 }
 

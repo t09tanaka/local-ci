@@ -208,7 +208,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
             match posted {
                 Ok(target) => println!(
                     "status: local-ci={} posted to {}",
-                    result.state,
+                    report::github_state(&result.state),
                     &target[..7]
                 ),
                 Err(e) => println!("status: not posted ({e})"),
@@ -219,7 +219,9 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
         130
     } else {
         match result.state.as_str() {
-            "success" => 0,
+            // `no_work` (the changes trigger no workflow) keeps the exit code a
+            // run with nothing to do always had
+            "success" | "no_work" => 0,
             "failure" => 1,
             _ => 2,
         }
