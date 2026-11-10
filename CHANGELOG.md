@@ -45,7 +45,7 @@
     (`NotRequested`, `NoEnumeration`, `DiscoveryFailed`, `IncompleteDiscovery`,
     `NoShardTarget`, `SharedState`, `NoIsolation`, `InexactAggregation`,
     `TooSmall`, `ManifestMismatch`, `JobFilter`, `UnreadableArgs`,
-    `NotConnectable`, `PathOverlap`, `ArgvTooLarge`) and derives `Eq`; an
+    `NotConnectable`, `PathOverlap`, `ArgvTooLarge`, `CoverageNotMerged`) and derives `Eq`; an
     exhaustive `match` adds arms. `dag::OutputAggregation` has the new variant
     `TestIdentity`.
   - New and required: `dag::ShardRequest` (the request to split a job) has the
@@ -71,6 +71,39 @@
     fails when a shard could not be run, did not report, reported tests it was
     not given, or when the shards gave different values for an output. With
     `fail-fast`, the shards after a failed one end `cancelled`.
+- End-to-end suites can be split. New adapters `shard::adapters::Playwright`
+  (a test per project, named `[project] › file › title`; a shard names its
+  tests in a `--test-list` file, the runner's own `--shard` is not used because
+  it can leave a shard with no test) and `shard::adapters::Cypress` (a spec
+  file per test; the listing is the files of the default layout, and a
+  configuration that says which files are specs makes the listing fail rather
+  than be guessed; a shard's report is the summary table at the end of a
+  `cypress run`). `parse_command` reads `playwright test` and `cypress run`.
+  `Safety::e2e()` is what an end-to-end suite is until the caller says each
+  shard has its own fixtures: such a job is not split (`NoIsolation`).
+  Playwright's listing also stops a split when the configuration has a
+  `webServer`, a global setup or teardown, `repeatEach` or a `shard`, when the
+  listing has errors, and when two tests cannot be told apart by a test list.
+  A project with `dependencies` is not visible in the listing; the setup runs
+  in every shard that needs it and the merge reports it as a problem.
+- Jobs that start something their shards would share are not split:
+  `shard::isolation::reason` reads the steps and env of a job for containers
+  (`docker`, `podman`, `kubectl`, ...), servers and ports (`npm start`,
+  `next dev`, `localhost:3000`, `PORT=`, a command sent to the background) and
+  service actions, and `connection_reason` and `exec` refuse such a job
+  (`NoIsolation`). It sees only what the workflow says; a suite that reaches a
+  shared database through its own configuration is not detected.
+- A job that collects coverage (`--coverage`, `--collectCoverage`, ...) is not
+  split (`NotSplit::CoverageNotMerged`; it used to be `UnreadableArgs`): each
+  shard would measure only its own tests and `exec` does not collect the
+  reports. New `shard::coverage` merges the reports a caller collects from the
+  shards, Istanbul `coverage-final.json` and LCOV, adding hit counts only for
+  files whose statements, functions, branches and lines are the same in every
+  shard; other formats (`cargo llvm-cov` profile data, Cobertura, ...) are
+  `CoverageError::Unsupported`.
+- `exec` refuses a shard task whose runner cannot divide its tests the way the
+  task says (a listed split for a runner that cannot target tests, a native
+  split for one without a shard feature of its own).
 - The plan schema version is 5; a plan of version 4 is refused by name.
 
 ## [0.9.0] - 2026-11-10

@@ -2378,11 +2378,20 @@ impl<'a> Runner<'a> {
         {
             return bad("it is not the command the shards were made from");
         }
-        if ts.mode == SplitMode::Single
-            || (ts.mode == SplitMode::Listed && ts.tests.is_empty())
-            || adapters::from_info(&ts.runner, "").is_none()
-        {
+        if crate::shard::isolation::reason(job).is_some() {
+            return bad("the job starts a container, a server or a service its shards would share");
+        }
+        let caps = adapters::from_info(&ts.runner, "").map(|a| a.capabilities());
+        let Some(caps) = caps else {
             return bad("the shard has no tests to run");
+        };
+        if ts.mode == SplitMode::Single || (ts.mode == SplitMode::Listed && ts.tests.is_empty()) {
+            return bad("the shard has no tests to run");
+        }
+        if (ts.mode == SplitMode::Listed && !caps.targets)
+            || (ts.mode == SplitMode::Native && !caps.native_shard)
+        {
+            return bad("the runner cannot divide its tests that way");
         }
         Ok(())
     }

@@ -12,7 +12,7 @@ mod common;
 use local_ci::complete::aggregate_shard_group;
 use local_ci::dag::{NotSplit, ShardRequest};
 use local_ci::exec::{Opts, Outcome, Workspace};
-use local_ci::shard::adapters::{run_invocation, CargoTest, Jest, Safety, Vitest};
+use local_ci::shard::adapters::{run_invocation, CargoTest, Jest, Playwright, Safety, Vitest};
 use local_ci::shard::{
     partition_tests, Discovered, History, PartitionOpts, RunnerAdapter, ShardOutcome, SplitMode,
     TestStatus,
@@ -129,10 +129,10 @@ fn lab(example_dir: &str, command: &str, env: &str) -> Lab {
     let wt = cache.join("wt/t");
     local_ci::git::add_worktree(&ctx, &dir, &wt, &fp.source.execution_commit).unwrap();
     // what `npm ci` made is not in the commit
-    if example_dir == "node" {
+    if example_dir == "node" || example_dir == "playwright" {
         std::os::unix::fs::symlink(
-            example("node").join("node_modules"),
-            wt.join("node/node_modules"),
+            example(example_dir).join("node_modules"),
+            wt.join(example_dir).join("node_modules"),
         )
         .unwrap();
     }
@@ -367,6 +367,21 @@ fn vitest_shards_run_their_own_files_and_all_of_them_once() {
     );
 }
 
+// A41: an end-to-end suite runs as shards the same way: each shard names its
+// tests in a test list, and the shards together run every test of every project once.
+#[test]
+fn playwright_shards_run_their_own_tests_and_all_of_them_once() {
+    let l = lab("playwright", "npx playwright test", "");
+    let a = Playwright::from_command("1.63.0", "npx playwright test", Safety::default()).unwrap();
+    let (d, fp) = split(&l, &a, "playwright", 3);
+    assert_eq!(d.tests.len(), 12);
+    let outcomes = run_shards(&l, &fp);
+    assert_covers(&fp, &d, &outcomes);
+    assert!(
+        aggregate_shard_group(fp.shard_groups.iter().find(|g| g.split).unwrap(), &outcomes).ok()
+    );
+}
+
 #[test]
 fn jest_shards_run_their_own_files_and_all_of_them_once() {
     let node = example("node");
@@ -452,6 +467,10 @@ fn a_shard_task_that_cannot_run_its_command_is_refused() {
         edit(&|s| s.runner.config = vec!["--release".into()]),
         edit(&|s| s.tests.clear()),
         edit(&|s| s.mode = SplitMode::Single),
+        // a runner that cannot divide its tests that way
+        edit(&|s| s.mode = SplitMode::Native),
+        // a job that starts what its shards would share
+        step_of(&|st| st.env = vec![("PORT".into(), "3000".into())]),
         // the listing was made somewhere else than the step runs
         edit(&|s| s.dir = "elsewhere".into()),
         step_of(&|st| st.working_directory = Some("elsewhere".into())),

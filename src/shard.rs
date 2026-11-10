@@ -9,6 +9,8 @@
 //! ([`NotSplit`]).
 
 pub mod adapters;
+pub mod coverage;
+pub mod isolation;
 
 use crate::dag::NotSplit;
 use serde::{Deserialize, Serialize};

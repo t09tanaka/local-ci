@@ -465,6 +465,9 @@ pub enum NotSplit {
     PathOverlap,
     /// The shard's command would be too long to start.
     ArgvTooLarge,
+    /// The job collects coverage; each shard would measure only its own tests
+    /// and nothing here puts the reports together.
+    CoverageNotMerged,
 }
 
 /// A job (or the jobs of a task) that could become several shards, and the
@@ -936,6 +939,10 @@ fn connection_reason(
     let Some(run) = run else {
         return Some(NotSplit::NotConnectable);
     };
+    // a container, a server on a port or a service the shards would share
+    if crate::shard::isolation::reason(job).is_some() {
+        return Some(NotSplit::NoIsolation);
+    }
     let Some(parsed) = crate::shard::adapters::parse_command(run) else {
         return Some(NotSplit::NotConnectable);
     };
