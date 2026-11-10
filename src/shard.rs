@@ -1373,6 +1373,58 @@ mod tests {
     }
 
     #[test]
+    fn the_length_of_a_command_counts_each_word_and_its_separator() {
+        let inv = |a: &[&str]| Invocation {
+            argv: a.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+        };
+        assert_eq!(argv_bytes(&inv(&["ab", "c"])), 5);
+        assert_eq!(argv_bytes(&inv(&[])), 0);
+        // the most a command may take is allowed, one byte more is not
+        use super::adapters::{CargoTest, Safety};
+        let c = CargoTest::new("1", &[], Safety::default());
+        // the words without a test; a name and its separator come on top
+        let fixed = argv_bytes(&c.invoke(
+            &Shard {
+                index: 0,
+                tests: vec![],
+                load: 0,
+            },
+            2,
+            SplitMode::Listed,
+        ));
+        for (len, split) in [
+            (MAX_ARGV_BYTES - fixed - 1, true),
+            (MAX_ARGV_BYTES - fixed, false),
+        ] {
+            let names: Vec<String> = ["a", "b"].iter().map(|c| c.repeat(len)).collect();
+            let d = Discovered {
+                tests: names,
+                complete: true,
+            };
+            let p = partition_tests(&c, &d, &History::default(), 2, &PartitionOpts::default());
+            assert_eq!(p.is_split(), split, "{len}");
+            if split {
+                let worst = p
+                    .shards
+                    .iter()
+                    .map(|s| argv_bytes(&c.invoke(s, 2, SplitMode::Listed)))
+                    .max()
+                    .unwrap();
+                assert_eq!(worst, MAX_ARGV_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn an_outcome_without_the_flag_was_read() {
+        let o: ShardOutcome =
+            serde_json::from_str(r#"{"job_id":"j","shard_id":"s","tests":[],"exit_ok":true}"#)
+                .unwrap();
+        assert!(o.parsed);
+    }
+
+    #[test]
     fn a_shard_that_reports_nothing_readable_is_a_problem() {
         use TestStatus::*;
         let mut unread = outcome("s0", true, &[]);

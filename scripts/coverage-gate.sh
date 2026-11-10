@@ -17,6 +17,7 @@ want = {
     "src/frozen.rs",
     "src/artifact.rs",
     "src/shard.rs",
+    "src/shard/adapters.rs",
 }
 seen = set()
 bad = []

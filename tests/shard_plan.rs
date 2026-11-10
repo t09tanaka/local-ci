@@ -59,6 +59,28 @@ const JOBS: &str = "  test:
         n: [1, 2]
     steps:
       - run: cargo test
+  filt:
+    runs-on: x
+    steps:
+      - run: cargo test adds
+  other:
+    runs-on: x
+    steps:
+      - run: echo hi
+  pyshell:
+    runs-on: x
+    steps:
+      - run: cargo test
+        shell: python
+  action:
+    runs-on: x
+    steps:
+      - uses: ./local
+  multi:
+    runs-on: x
+    steps:
+      - run: echo setup
+      - run: cargo test --workspace
   vt:
     runs-on: x
     steps:
@@ -398,4 +420,102 @@ fn the_adapter_merge_is_the_same_check() {
             "shard s of j succeeded but reported no test"
         ]
     );
+}
+
+fn step_request(job: &str, step: usize, args: &[&str]) -> ShardRequest {
+    let d = listing(&["a", "b", "c", "d"]);
+    let a = CargoTest::new("1", args, Safety::default());
+    let p = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
+    ShardRequest {
+        step,
+        ..request(job, p, d)
+    }
+}
+
+#[test]
+fn a_job_is_split_only_where_its_step_is_the_command_the_plan_was_made_from() {
+    let (_t, fp) = plan();
+    let reasons = |sp: &FrozenPlan, job: &str| group(sp, job).not_split.clone();
+    // a filter of the job's own command: the shards would run the whole job's tests
+    let sp = fp.with_shards(&[split_request("filt", 2)]).unwrap();
+    assert!(sp.tasks.iter().all(|t| t.shard.is_none()));
+    assert_eq!(reasons(&sp, "filt"), vec![NotSplit::JobFilter]);
+    // a step that is not a runner's command
+    let sp = fp.with_shards(&[split_request("other", 2)]).unwrap();
+    assert_eq!(reasons(&sp, "other"), vec![NotSplit::NotConnectable]);
+    // a step that a shell does not read as a command
+    let sp = fp.with_shards(&[split_request("pyshell", 2)]).unwrap();
+    assert_eq!(reasons(&sp, "pyshell"), vec![NotSplit::NotConnectable]);
+    let sp = fp.with_shards(&[split_request("action", 2)]).unwrap();
+    assert_eq!(reasons(&sp, "action"), vec![NotSplit::NotConnectable]);
+    // the step named is the one, not the first
+    let sp = fp
+        .with_shards(&[step_request("multi", 1, &["--workspace"])])
+        .unwrap();
+    assert!(group(&sp, "multi").split);
+    let shard = sp.tasks.iter().find_map(|t| t.shard.as_ref()).unwrap();
+    assert_eq!(
+        (shard.step, shard.runner.runner.as_str()),
+        (1, "cargo-test")
+    );
+    assert_eq!(shard.runner.config, ["--workspace"]);
+    assert_eq!(sp.with_plan(sp.to_plan()).unwrap(), sp);
+    for (step, args) in [
+        (0, vec!["--workspace"]),
+        (7, vec!["--workspace"]),
+        // the arguments of the command are not the plan's
+        (1, vec![]),
+        (1, vec!["--workspace", "--release"]),
+    ] {
+        let sp = fp
+            .with_shards(&[step_request("multi", step, &args)])
+            .unwrap();
+        assert!(!group(&sp, "multi").split, "step {step} {args:?}");
+        assert_eq!(reasons(&sp, "multi"), vec![NotSplit::NotConnectable]);
+    }
+    // another runner than the command is
+    let d = listing(&["a.test.js", "b.test.js"]);
+    let v = local_ci::shard::adapters::Vitest::new("2", "/p", &[], Safety::default());
+    let p = partition_tests(&v, &d, &History::default(), 2, &PartitionOpts::default());
+    let sp = fp.with_shards(&[request("test", p, d)]).unwrap();
+    assert_eq!(reasons(&sp, "test"), vec![NotSplit::NotConnectable]);
+}
+
+#[test]
+fn a_native_split_that_knows_its_tests_checks_them() {
+    use TestStatus::*;
+    let (_t, fp) = plan();
+    for (complete, extra_ok) in [(true, false), (false, true)] {
+        let d = Discovered {
+            tests: vec!["a.js".into(), "b.js".into(), "c.js".into()],
+            complete,
+        };
+        let a = local_ci::shard::adapters::Vitest::new("2", "/p", &[], Safety::default());
+        let mut p = partition_tests(&a, &d, &History::default(), 3, &PartitionOpts::default());
+        // a runner that cannot target tests uses its own shard feature
+        p.mode = SplitMode::Native;
+        p.shards.iter_mut().for_each(|s| s.tests.clear());
+        let sp = fp.with_shards(&[request("vt", p, d)]).unwrap();
+        let g = group(&sp, "vt").clone();
+        assert!(g.split, "{:?}", g.not_split);
+        assert_eq!(g.manifest, ["a.js", "b.js", "c.js"]);
+        assert_eq!(g.manifest_exact, complete);
+        assert_eq!(sp.with_plan(sp.to_plan()).unwrap(), sp);
+        let by = |i: usize, t: &[&str]| {
+            outcome(
+                "vt",
+                &g.shards[i],
+                true,
+                &t.iter().map(|n| (*n, Passed)).collect::<Vec<_>>(),
+            )
+        };
+        let all = [by(0, &["a.js"]), by(1, &["b.js"]), by(2, &["c.js"])];
+        assert!(aggregate_shard_group(&g, &all).ok());
+        // a test that no shard ran
+        let short = [by(0, &["a.js"]), by(1, &["b.js"]), by(2, &[])];
+        assert!(!aggregate_shard_group(&g, &short).ok());
+        // a test that was not listed: a problem only when the listing is all there is
+        let more = [by(0, &["a.js", "z.js"]), by(1, &["b.js"]), by(2, &["c.js"])];
+        assert_eq!(aggregate_shard_group(&g, &more).ok(), extra_ok);
+    }
 }

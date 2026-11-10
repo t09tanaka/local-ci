@@ -388,7 +388,7 @@ cargo test
 ```
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
-`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`) are gated on 100% line coverage over the whole test suite.
+`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`) are gated on 100% line coverage over the whole test suite.
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 

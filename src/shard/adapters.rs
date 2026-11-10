@@ -448,7 +448,7 @@ impl RunnerAdapter for CargoTest {
             .filter_map(|l| {
                 let rest = l.strip_prefix("test ")?;
                 let (name, result) = rest.rsplit_once(" ... ")?;
-                let status = match result.split(',').next()? {
+                let status = match result.split(',').next().unwrap_or_default() {
                     "ok" => TestStatus::Passed,
                     "FAILED" => TestStatus::Failed,
                     "ignored" => TestStatus::Skipped,
@@ -846,6 +846,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         assert_eq!(relative("/p", "/pp/a.js"), "/pp/a.js");
         assert_eq!(relative("/p", "a.js"), "a.js");
         assert_eq!(absolute("/p/", "a/b.js"), "/p/a/b.js");
+        assert_eq!(absolute("/p", "/q/a.js"), "/q/a.js");
     }
 
     #[test]
@@ -988,5 +989,304 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         assert!(run_invocation(&ctx, &invocation(vec![]), &dir).is_err());
         let missing = invocation(argv(&["no-such-program-l2"]));
         assert!(run_invocation(&ctx, &missing, &dir).is_err());
+    }
+
+    fn parsed(run: &str) -> Parsed {
+        parse_command(run).unwrap()
+    }
+
+    #[test]
+    fn a_command_is_read_into_what_it_keeps_and_why_it_cannot_be_split() {
+        // not a runner
+        for run in [
+            "",
+            "echo cargo test",
+            "cargo build",
+            "npm test",
+            "'unclosed",
+            "cargo",
+        ] {
+            assert_eq!(parse_command(run), None, "{run}");
+        }
+        let p = parsed("cargo test --workspace --features a,b -p x --no-fail-fast --release");
+        assert_eq!(p.runner, "cargo-test");
+        assert_eq!(
+            p.args,
+            ["--workspace", "--features", "a,b", "-p", "x", "--release"]
+        );
+        assert!(p.blocked.is_empty());
+        let p = parsed("cargo test --features=a --manifest-path m/Cargo.toml");
+        assert_eq!(p.args, ["--features=a", "--manifest-path", "m/Cargo.toml"]);
+        assert!(p.blocked.is_empty());
+
+        let filter = vec![NotSplit::JobFilter];
+        let unread = vec![NotSplit::UnreadableArgs];
+        for (run, why) in [
+            // a name filter of cargo, before and after the `--`
+            ("cargo test adds", &filter),
+            ("cargo test -- adds", &filter),
+            ("cargo test -- --skip slow", &filter),
+            ("cargo test -- --skip=slow", &filter),
+            ("cargo test -- --ignored", &filter),
+            ("cargo test -- --include-ignored", &filter),
+            ("cargo test -- --exact a", &filter),
+            // arguments to the test binary that are not known to keep the tests
+            ("cargo test -- --nocapture", &unread),
+            ("cargo test --doc", &unread),
+            ("cargo test --quiet", &unread),
+            ("cargo test +nightly", &filter),
+            ("cargo test -p", &unread),
+            ("cargo test --workspace=1", &unread),
+            // shell syntax
+            ("cargo test && echo", &unread),
+            ("cargo test | tee x", &unread),
+            ("cargo test $ARGS", &unread),
+            ("cargo test --features \"a\"; true", &unread),
+            // Vitest
+            ("npx vitest run src/a.test.js", &filter),
+            ("vitest -t slow", &filter),
+            ("vitest --testNamePattern=slow", &filter),
+            ("vitest --exclude x", &filter),
+            ("vitest --changed", &filter),
+            ("vitest --shard=1/2", &filter),
+            ("vitest --coverage", &unread),
+            ("vitest --config", &unread),
+            // Jest
+            ("npx jest src", &filter),
+            ("jest -t slow", &filter),
+            ("jest --testPathIgnorePatterns slow", &filter),
+            ("jest --testPathIgnorePatterns=slow", &filter),
+            ("jest --onlyChanged", &filter),
+            ("jest -o", &filter),
+            ("jest --coverage", &unread),
+        ] {
+            assert_eq!(&parsed(run).blocked, why, "{run}");
+        }
+        // two reasons are both given, once each
+        assert_eq!(
+            parsed("jest a b --coverage --bogus").blocked,
+            [NotSplit::JobFilter, NotSplit::UnreadableArgs]
+        );
+        // what is kept
+        let p = parsed("npx vitest run --config v.js --project a --silent");
+        assert_eq!(p.runner, "vitest");
+        assert_eq!(p.args, ["--config", "v.js", "--project", "a", "--silent"]);
+        assert!(p.blocked.is_empty());
+        let p = parsed("jest -c j.js --ci -i --runInBand --silent");
+        assert_eq!(p.runner, "jest");
+        assert_eq!(
+            p.args,
+            ["-c", "j.js", "--ci", "-i", "--runInBand", "--silent"]
+        );
+        assert!(p.blocked.is_empty());
+        assert!(parsed("vitest").args.is_empty());
+        assert!(parsed("npx vitest run").blocked.is_empty());
+        // nothing after the `--` is nothing
+        assert!(parsed("cargo test --workspace --").blocked.is_empty());
+    }
+
+    #[test]
+    fn an_adapter_made_from_a_command_does_not_split_what_it_filters() {
+        let s = Safety::default();
+        let c = CargoTest::from_command("1", "cargo test --workspace", s).unwrap();
+        assert_eq!(c.info().config, ["--workspace"]);
+        assert!(!c.capabilities().job_filtered && !c.capabilities().unreadable_args);
+        let c = CargoTest::from_command("1", "cargo test slow", s).unwrap();
+        assert!(c.capabilities().job_filtered && !c.capabilities().unreadable_args);
+        let c = CargoTest::from_command("1", "cargo test --bogus", s).unwrap();
+        assert!(!c.capabilities().job_filtered && c.capabilities().unreadable_args);
+        assert!(CargoTest::from_command("1", "npx jest", s).is_none());
+        let v = Vitest::from_command("1", "/p", "vitest run -t x", s).unwrap();
+        assert!(v.capabilities().job_filtered && v.capabilities().substring_targets);
+        assert!(Vitest::from_command("1", "/p", "jest", s).is_none());
+        let j = Jest::from_command("1", "/p", "jest --testPathIgnorePatterns x", s).unwrap();
+        assert!(j.capabilities().job_filtered && !j.capabilities().substring_targets);
+        assert!(Jest::from_command("1", "/p", "vitest", s).is_none());
+        // the reasons come out of the partition
+        let d = Discovered {
+            tests: vec!["a".into(), "b".into()],
+            complete: true,
+        };
+        let p = c.partition(
+            &d,
+            &super::super::History::default(),
+            2,
+            &Default::default(),
+        );
+        assert_eq!(p.not_split, vec![NotSplit::UnreadableArgs]);
+    }
+
+    #[test]
+    fn the_adapter_of_a_plan_is_made_again_where_the_tests_are() {
+        let info = |runner: &str, config: &[&str]| RunnerInfo {
+            runner: runner.into(),
+            version: "1".into(),
+            config: config.iter().map(|s| s.to_string()).collect(),
+            filters: vec![],
+        };
+        let s = shard(&["a"]);
+        let c = from_info(&info("cargo-test", &["-p", "x"]), "/w").unwrap();
+        assert_eq!(
+            c.invoke(&s, 2, SplitMode::Listed).argv,
+            [
+                "cargo",
+                "test",
+                "-p",
+                "x",
+                "--no-fail-fast",
+                "--",
+                "--exact",
+                "a"
+            ]
+        );
+        let v = from_info(&info("vitest", &["--config=v.js"]), "/w/node").unwrap();
+        assert_eq!(
+            v.invoke(&s, 2, SplitMode::Listed).argv.last().unwrap(),
+            "/w/node/a"
+        );
+        let j = from_info(&info("jest", &[]), "/w/node").unwrap();
+        assert_eq!(
+            j.invoke(&s, 2, SplitMode::Listed).argv.last().unwrap(),
+            "/w/node/a"
+        );
+        assert!(from_info(&info("mocha", &[]), "/w").is_none());
+    }
+
+    #[test]
+    fn a_command_is_a_script_with_each_word_quoted() {
+        let inv = Invocation {
+            argv: argv(&["cargo", "test", "--", "it's", "a b", "$x"]),
+            env: vec![],
+        };
+        assert_eq!(
+            script_of(&inv).unwrap(),
+            "cargo test -- \"it's\" 'a b' '$x'"
+        );
+        let inv = Invocation {
+            argv: argv(&["npx", "jest"]),
+            env: vec![("A".into(), "1 2".into())],
+        };
+        assert_eq!(script_of(&inv).unwrap(), "env 'A=1 2' npx jest");
+        // a word with a NUL cannot be quoted
+        let bad = Invocation {
+            argv: vec!["a\0b".into()],
+            env: vec![],
+        };
+        assert_eq!(script_of(&bad), None);
+        let bad_env = Invocation {
+            argv: argv(&["x"]),
+            env: vec![("A".into(), "\0".into())],
+        };
+        assert_eq!(script_of(&bad_env), None);
+    }
+
+    #[test]
+    fn a_target_with_a_harness_of_its_own_makes_the_listing_incomplete() {
+        let c = CargoTest::new("1", &[], Safety::default());
+        let listing = |stderr: &str, stdout: &str| {
+            c.discover(&CommandOutput {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                success: true,
+            })
+            .unwrap()
+        };
+        let two = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n     Running tests/b.rs (target/debug/deps/b-2)\n";
+        let ok = "a: test\n\n1 test, 0 benchmarks\nb: test\n\n1 tests, 0 benchmarks\n";
+        assert!(listing(two, ok).complete);
+        // the second target printed no summary: it is not libtest
+        let custom = "a: test\n\n1 test, 0 benchmarks\nwhatever it prints\n";
+        let d = listing(two, custom);
+        assert!(!d.complete);
+        assert_eq!(d.tests, ["a"]);
+        // lines that only look like a summary are not one
+        for line in [
+            "1 test, 0",
+            "x tests, 0 benchmarks",
+            "1 cases, 0 benchmarks",
+            "1 tests, y benchmarks",
+            "1 tests, 0 numbers",
+        ] {
+            assert!(!is_list_summary(line), "{line}");
+        }
+        assert!(is_list_summary("12 tests, 3 benchmarks"));
+    }
+
+    #[test]
+    fn a_cargo_run_without_a_result_line_is_not_a_report() {
+        let c = CargoTest::new("1", &[], Safety::default());
+        let o = c.collect("j", "s", &out("error: could not compile\n", false));
+        assert!(!o.parsed && o.tests.is_empty());
+        let o = c.collect(
+            "j",
+            "s",
+            &out(
+                "running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
+                true,
+            ),
+        );
+        assert!(o.parsed && o.tests.is_empty());
+    }
+
+    #[test]
+    fn jest_keeps_the_arguments_it_is_given() {
+        let j = Jest::new("29", "/p", &["--config=j.js"], Safety::default());
+        assert_eq!(j.info().config, ["--config=j.js"]);
+        assert_eq!(
+            j.discover_command().argv,
+            ["npx", "jest", "--listTests", "--config=j.js"]
+        );
+        assert_eq!(
+            j.invoke(&shard(&["a.js"]), 1, SplitMode::Single).argv,
+            ["npx", "jest", "--json", "--config=j.js"]
+        );
+    }
+
+    #[test]
+    fn a_report_is_found_among_other_output() {
+        let v = Vitest::new("1", "/p", &[], Safety::default());
+        let report = r#"{"testResults":[{"name":"/p/a.test.js","status":"passed"}]}"#;
+        // a line of the tests' own output that opens an object, then the report, then more
+        let text = format!("{{\"not\": \"a report\"}}\n{{ broken\n{report}\ntrailing line\n");
+        let o = v.collect("j", "s", &out(&text, true));
+        assert!(o.parsed);
+        assert_eq!(o.tests.len(), 1);
+        // an object without results is not the report
+        let o = v.collect("j", "s", &out("{\"testResults\": 1}\n", true));
+        assert!(!o.parsed && o.tests.is_empty());
+        // a file that failed is failed, whatever its tests say
+        assert_eq!(file_status("failed", &["passed"]), TestStatus::Failed);
+        assert_eq!(
+            file_status("passed", &["passed", "failed"]),
+            TestStatus::Failed
+        );
+        assert_eq!(file_status("passed", &[]), TestStatus::Passed);
+    }
+
+    #[test]
+    fn paths_are_compared_as_the_system_spells_them() {
+        let tmp = std::env::temp_dir().join(format!("l2-paths-{}", std::process::id()));
+        let real = tmp.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (link, real_s) = (
+            link.to_str().unwrap().to_string(),
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
+        // a reporter prints the real path of a file under a root given as a link
+        assert_eq!(relative(&link, &format!("{real_s}/a/b.js")), "a/b.js");
+        assert_eq!(relative(&link, &format!("{link}/a.js")), "a.js");
+        // a command is given the real one
+        assert_eq!(absolute(&link, "a/b.js"), format!("{real_s}/a/b.js"));
+        // an absolute file is used as it is
+        assert_eq!(absolute(&link, "/elsewhere/x.js"), "/elsewhere/x.js");
+        assert_eq!(relative(&link, "/elsewhere/x.js"), "/elsewhere/x.js");
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

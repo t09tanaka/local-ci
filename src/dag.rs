@@ -904,19 +904,24 @@ fn connection_reason(
     w: &crate::workflow::Workflow,
     jobs_in_task: usize,
 ) -> Option<NotSplit> {
-    let job = w.jobs.iter().find(|j| j.id == r.job)?;
-    let step = job.steps.get(r.step).filter(|_| jobs_in_task == 1);
-    let Some((step, run)) = step.and_then(|s| s.run.as_ref().map(|r| (s, r))) else {
+    let job = w.jobs.iter().find(|j| j.id == r.job);
+    let step = job
+        .and_then(|j| j.steps.get(r.step))
+        .filter(|_| jobs_in_task == 1);
+    let (Some(job), Some(step)) = (job, step) else {
         return Some(NotSplit::NotConnectable);
     };
-    if step.uses.is_some()
-        || !matches!(
-            plan::resolved_shell(w, job, step).as_deref().map(str::trim),
-            None | Some("bash") | Some("sh")
-        )
-    {
+    // one plain command, run by a shell that reads it as one
+    let run = step.run.as_ref().filter(|_| {
+        step.uses.is_none()
+            && matches!(
+                plan::resolved_shell(w, job, step).as_deref().map(str::trim),
+                None | Some("bash") | Some("sh")
+            )
+    });
+    let Some(run) = run else {
         return Some(NotSplit::NotConnectable);
-    }
+    };
     let Some(parsed) = crate::shard::adapters::parse_command(run) else {
         return Some(NotSplit::NotConnectable);
     };
