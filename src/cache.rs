@@ -9,6 +9,9 @@
 //! not run the unit again. Results are kept for a day: tests that depend on
 //! the date, and checks against advisory databases, change without the code.
 
+use crate::artifact;
+use crate::artifact_io;
+use crate::context::ExecContext;
 use crate::exec::{JobResult, Outcome, StepResult, UnitResult};
 use crate::filter::last_match;
 use crate::plan::Unit;
@@ -19,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 
 pub const TTL_SECS: u64 = 24 * 3600;
@@ -41,6 +44,8 @@ const TOOLS: &[(&str, &[&str])] = &[
 
 /// What the fingerprints of one run share.
 pub struct Inputs {
+    /// Starts the version commands and git with the attempt's environment.
+    ctx: ExecContext,
     root: PathBuf,
     /// `(path, object)` of every file at the commit, in git's order.
     files: Vec<(String, String)>,
@@ -57,6 +62,7 @@ pub struct Inputs {
 
 impl Inputs {
     pub fn read(
+        ctx: &ExecContext,
         root: &Path,
         sha: &str,
         base: &str,
@@ -64,7 +70,7 @@ impl Inputs {
         workflow_dirs: &[String],
         no_cache: &[String],
     ) -> Result<Inputs> {
-        let listed = crate::git::git(root, &["ls-tree", "-r", "-z", "--full-tree", sha])?;
+        let listed = crate::git::git(ctx, root, &["ls-tree", "-r", "-z", "--full-tree", sha])?;
         let mut files = Vec::new();
         for entry in listed.split('\0').filter(|e| !e.is_empty()) {
             // `<mode> <type> <object>\t<path>`
@@ -78,7 +84,7 @@ impl Inputs {
         for d in workflow_dirs {
             always.push(format!("{}/", d.trim_end_matches('/')));
         }
-        let merge_base = crate::git::git(root, &["merge-base", base, sha]).ok();
+        let merge_base = crate::git::git(ctx, root, &["merge-base", base, sha]).ok();
         let exe = std::env::current_exe()
             .and_then(|p| p.metadata())
             .map(|m| {
@@ -92,6 +98,7 @@ impl Inputs {
             })
             .unwrap_or_default();
         Ok(Inputs {
+            ctx: ctx.fresh_attempt(),
             root: root.to_path_buf(),
             files,
             always,
@@ -114,6 +121,16 @@ impl Inputs {
         for id in &u.jobs {
             let j = w.jobs.iter().find(|j| &j.id == id)?;
             for s in &j.steps {
+                // what an upload leaves is kept with the result (see `Store`);
+                // a download is reused only against the artifacts it took,
+                // which a name that is not known now cannot be checked for
+                if let Some(u) = s.uses.as_deref() {
+                    if matches!(artifact::parse_uses(u), Some(Ok(artifact::Kind::Download)))
+                        && artifact::needed_download(u, &s.with).is_none()
+                    {
+                        return None;
+                    }
+                }
                 let Some(run) = &s.run else { continue };
                 let dir = crate::plan::step_dir(w, j, s);
                 let pkg = if dir.is_empty() {
@@ -163,7 +180,7 @@ impl Inputs {
                 m.push_str(&format!("{object} {path}\n"));
             }
         }
-        hash(&self.root, &m)
+        hash(&self.ctx, &self.root, &m)
     }
 
     fn excluded(&self, w: &Workflow, jobs: &[String]) -> bool {
@@ -177,7 +194,9 @@ impl Inputs {
     fn version(&self, cmd: &[&str]) -> String {
         let key = cmd.join(" ");
         self.remember(key, || {
-            let o = Command::new(cmd[0])
+            let o = self
+                .ctx
+                .command(cmd[0])
                 .args(&cmd[1..])
                 .stdin(Stdio::null())
                 .output()
@@ -194,8 +213,9 @@ impl Inputs {
     fn blob(&self, path: &str) -> Option<String> {
         let object = self.files.iter().find(|(p, _)| p == path)?.1.clone();
         let root = self.root.clone();
+        let ctx = self.ctx.fresh_attempt();
         self.remember(format!("blob {object}"), move || {
-            crate::git::git(&root, &["cat-file", "-p", &object]).ok()
+            crate::git::git(&ctx, &root, &["cat-file", "-p", &object]).ok()
         })
     }
 
@@ -222,8 +242,9 @@ fn names(text: &str, word: &str) -> bool {
         .any(|w| w == word)
 }
 
-fn hash(root: &Path, text: &str) -> Option<String> {
-    let mut child = Command::new("git")
+fn hash(ctx: &ExecContext, root: &Path, text: &str) -> Option<String> {
+    let mut child = ctx
+        .command("git")
         .args(["hash-object", "--stdin"])
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -244,6 +265,61 @@ struct Saved {
     at: u64,
     sha: String,
     jobs: Vec<SavedJob>,
+    /// The artifacts the unit downloaded and what they held (name, digest):
+    /// the result is reused only against the same ones.
+    #[serde(default)]
+    downloads: Vec<(String, String)>,
+    /// The artifacts the unit uploaded, kept beside this file in
+    /// `<fp>.artifacts/` (name, version, digest).
+    #[serde(default)]
+    uploads: Vec<(String, u32, String)>,
+}
+
+/// A kept result that is recent enough, with what it needs from and gives to
+/// the artifacts of the run it is reused in.
+pub struct Hit {
+    pub result: UnitResult,
+    pub downloads: Vec<(String, String)>,
+    pub uploads: Vec<(String, u32, String)>,
+}
+
+/// Which of the kept results (`None`: there is none) are reused. A result
+/// that downloaded artifacts is reused only when every one of them is what
+/// another reused result uploads (its newest version), with the digest it was
+/// kept against: an artifact that will be made again by a unit that runs, or
+/// that changed, is not. Results that depend on each other are settled
+/// together, whatever their order. An artifact is of the workflow that
+/// uploaded it: another workflow's result of the same name is not it.
+pub fn settle(hits: &[Option<Hit>]) -> Vec<bool> {
+    let mut taken = vec![false; hits.len()];
+    // artifacts belong to a workflow: (workflow, name) -> digest
+    let mut available: HashMap<(&str, &str), &str> = HashMap::new();
+    loop {
+        let mut progress = false;
+        for (i, h) in hits.iter().enumerate() {
+            let Some(h) = h.as_ref().filter(|_| !taken[i]) else {
+                continue;
+            };
+            let wf = h.result.workflow.as_str();
+            if !h
+                .downloads
+                .iter()
+                .all(|(n, d)| available.get(&(wf, n.as_str())) == Some(&d.as_str()))
+            {
+                continue;
+            }
+            taken[i] = true;
+            progress = true;
+            let mut ups: Vec<&(String, u32, String)> = h.uploads.iter().collect();
+            ups.sort_by_key(|u| u.1);
+            for (n, _, d) in ups {
+                available.insert((wf, n), d);
+            }
+        }
+        if !progress {
+            return taken;
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -275,13 +351,18 @@ impl Store {
         Store { dir }
     }
 
+    fn artifacts_dir(&self, fp: &str) -> PathBuf {
+        self.dir.join(format!("{fp}.artifacts"))
+    }
+
     /// The kept result for `fp`, as a unit that passed, if it is recent enough.
-    pub fn get(&self, fp: &str, workflow: &str, now: u64) -> Option<UnitResult> {
+    pub fn get(&self, fp: &str, workflow: &str, now: u64) -> Option<Hit> {
         let text = std::fs::read_to_string(self.dir.join(format!("{fp}.json"))).ok()?;
         let saved: Saved = serde_json::from_str(&text).ok()?;
         if now.saturating_sub(saved.at) > TTL_SECS {
             return None;
         }
+        let (downloads, uploads) = (saved.downloads, saved.uploads);
         let jobs = saved
             .jobs
             .into_iter()
@@ -294,6 +375,7 @@ impl Store {
                     None => Outcome::Pass,
                 },
                 secs: 0.0,
+                cancelled: false,
                 time: None,
                 steps: j
                     .steps
@@ -312,21 +394,55 @@ impl Store {
                     .collect(),
             })
             .collect();
-        Some(UnitResult {
-            workflow: workflow.to_string(),
-            jobs,
-            waited_secs: 0.0,
-            copy_secs: None,
-            cached: Some(format!(
-                "{}, {}",
-                &saved.sha[..saved.sha.len().min(7)],
-                ago(now.saturating_sub(saved.at))
-            )),
+        Some(Hit {
+            result: UnitResult {
+                unit: None,
+                workflow: workflow.to_string(),
+                jobs,
+                waited_secs: 0.0,
+                copy_secs: None,
+                outcomes: vec![],
+                cached: Some(format!(
+                    "{}, {}",
+                    &saved.sha[..saved.sha.len().min(7)],
+                    ago(now.saturating_sub(saved.at))
+                )),
+            },
+            downloads,
+            uploads,
         })
     }
 
-    /// Keep `u`'s result under `fp` when every job passed or was skipped.
-    pub fn put(&self, fp: &str, sha: &str, u: &UnitResult, now: u64) {
+    /// Put the artifacts the result under `fp` kept into `run_dir`, as this
+    /// run's own (see [`artifact_io::restore_artifacts`]). An error means the
+    /// result is not reused: a file that does not match its receipt, or
+    /// something missing.
+    pub fn restore(&self, fp: &str, hit: &Hit, run_dir: &Path, plan_digest: &str) -> Result<()> {
+        if hit.uploads.is_empty() {
+            return Ok(());
+        }
+        artifact_io::restore_artifacts(
+            &self.artifacts_dir(fp),
+            run_dir,
+            plan_digest,
+            &hit.result.workflow,
+            &hit.uploads,
+        )
+    }
+
+    /// Keep `u`'s result under `fp` when every job passed or was skipped, with
+    /// the artifacts it uploaded in `run_dir` and the digests of the `downloads`
+    /// (artifact names) it took. A result whose artifacts cannot be kept whole
+    /// is not kept.
+    pub fn put(
+        &self,
+        fp: &str,
+        sha: &str,
+        u: &UnitResult,
+        now: u64,
+        run_dir: &Path,
+        downloads: &[String],
+    ) {
         if u.jobs.is_empty()
             || u.jobs
                 .iter()
@@ -338,9 +454,44 @@ impl Store {
             Outcome::Skip(r) => Some(r.clone()),
             _ => None,
         };
+        let _ = std::fs::create_dir_all(&self.dir);
+        let nodes: Vec<String> = u
+            .jobs
+            .iter()
+            .map(|j| crate::dag::node_id(&j.workflow, &j.job))
+            .collect();
+        let tmp_art = self
+            .dir
+            .join(format!(".{fp}.artifacts.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_art);
+        let Ok(uploads) = artifact_io::save_unit_artifacts(run_dir, &u.workflow, &nodes, &tmp_art)
+        else {
+            let _ = std::fs::remove_dir_all(&tmp_art);
+            return;
+        };
+        let mut seen = Vec::new();
+        // what the unit uploaded itself is not another unit's to change
+        for n in downloads
+            .iter()
+            .filter(|n| !uploads.iter().any(|(u, _, _)| u == *n))
+        {
+            let Some(d) = artifact_io::latest_digest(run_dir, &u.workflow, n) else {
+                let _ = std::fs::remove_dir_all(&tmp_art);
+                return;
+            };
+            seen.push((n.clone(), d));
+        }
+        let final_art = self.artifacts_dir(fp);
+        let _ = std::fs::remove_dir_all(&final_art);
+        if !uploads.is_empty() && std::fs::rename(&tmp_art, &final_art).is_err() {
+            let _ = std::fs::remove_dir_all(&tmp_art);
+            return;
+        }
         let saved = Saved {
             at: now,
             sha: sha.to_string(),
+            downloads: seen,
+            uploads,
             jobs: u
                 .jobs
                 .iter()
@@ -361,7 +512,6 @@ impl Store {
                 })
                 .collect(),
         };
-        let _ = std::fs::create_dir_all(&self.dir);
         let tmp = self.dir.join(format!(".{fp}.{}", std::process::id()));
         if let Ok(text) = serde_json::to_string(&saved) {
             if std::fs::write(&tmp, text).is_ok() {
@@ -383,7 +533,12 @@ impl Store {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .is_some_and(|t| now.saturating_sub(t.as_secs()) > TTL_SECS);
             if old {
-                let _ = std::fs::remove_file(e.path());
+                let p = e.path();
+                let _ = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
             }
         }
     }
@@ -404,6 +559,15 @@ mod tests {
 
     fn inputs(files: &[(&str, &str)]) -> Inputs {
         let i = Inputs {
+            ctx: ExecContext::new(
+                [
+                    ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+                    ("HOME", "/tmp"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ),
             root: std::env::temp_dir(),
             files: files
                 .iter()
@@ -544,27 +708,143 @@ jobs:
                     note: None,
                 },
             ],
+            cancelled: false,
             time: None,
         };
         let u = |o: Outcome| UnitResult {
+            unit: None,
             workflow: "ci.yml".into(),
             jobs: vec![job(o)],
             waited_secs: 0.0,
             copy_secs: None,
             cached: None,
+            outcomes: vec![],
         };
         let sha = "a".repeat(40);
-        store.put("f1", &sha, &u(Outcome::Fail), 100);
+        let run = tmp.path().join("run");
+        store.put("f1", &sha, &u(Outcome::Fail), 100, &run, &[]);
         assert!(store.get("f1", "ci.yml", 100).is_none());
-        store.put("f2", &sha, &u(Outcome::Pass), 100);
-        let hit = store.get("f2", "ci.yml", 100 + 7200).unwrap();
+        store.put("f2", &sha, &u(Outcome::Pass), 100, &run, &[]);
+        let hit = store.get("f2", "ci.yml", 100 + 7200).unwrap().result;
         assert_eq!(hit.jobs[0].outcome, Outcome::Pass);
         assert_eq!(hit.cached.as_deref(), Some("aaaaaaa, 2h ago"));
         // what was not covered is still reported
         assert_eq!(
-            crate::report::not_covered(&[hit]),
+            crate::report::not_covered(&[hit], ".github/workflows"),
             vec!["ci.yml › test › deploy: uses secrets"]
         );
         assert!(store.get("f2", "ci.yml", 100 + TTL_SECS + 1).is_none());
+    }
+
+    fn hit(downloads: &[(&str, &str)], uploads: &[(&str, u32, &str)]) -> Option<Hit> {
+        hit_in("ci.yml", downloads, uploads)
+    }
+
+    fn hit_in(
+        workflow: &str,
+        downloads: &[(&str, &str)],
+        uploads: &[(&str, u32, &str)],
+    ) -> Option<Hit> {
+        Some(Hit {
+            result: UnitResult {
+                unit: None,
+                workflow: workflow.into(),
+                jobs: vec![],
+                waited_secs: 0.0,
+                copy_secs: None,
+                outcomes: vec![],
+                cached: None,
+            },
+            downloads: downloads
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect(),
+            uploads: uploads
+                .iter()
+                .map(|(n, v, d)| (n.to_string(), *v, d.to_string()))
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_download_is_reused_only_against_what_it_took() {
+        // no downloads: reused; nothing kept: not
+        assert_eq!(settle(&[hit(&[], &[]), None]), [true, false]);
+        // the uploader is reused with the digest the download was kept
+        // against, whichever comes first
+        let up = hit(&[], &[("b", 1, "d1")]);
+        let down = hit(&[("b", "d1")], &[]);
+        assert_eq!(settle(&[down, up]), [true, true]);
+        // another digest, an uploader that runs again, or none at all
+        assert_eq!(
+            settle(&[hit(&[("b", "d1")], &[]), hit(&[], &[("b", 1, "d2")])]),
+            [false, true]
+        );
+        assert_eq!(settle(&[hit(&[("b", "d1")], &[]), None]), [false, false]);
+        assert_eq!(settle(&[hit(&[("b", "d1")], &[])]), [false]);
+        // a chain settles whatever its order
+        assert_eq!(
+            settle(&[
+                hit(&[("c", "x")], &[]),
+                hit(&[("b", "y")], &[("c", 1, "x")]),
+                hit(&[], &[("b", 1, "y")]),
+            ]),
+            [true, true, true]
+        );
+        // a newer version is the one a download takes
+        assert_eq!(
+            settle(&[
+                hit(&[("b", "new")], &[]),
+                hit(&[], &[("b", 2, "new"), ("b", 1, "old")]),
+            ]),
+            [true, true]
+        );
+        // every artifact it took must match
+        assert_eq!(
+            settle(&[
+                hit(&[("a", "1"), ("b", "2")], &[]),
+                hit(&[], &[("a", 1, "1")]),
+            ]),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn an_artifact_is_only_of_the_workflow_that_uploaded_it() {
+        // the same name and digest, uploaded by another workflow: not it
+        assert_eq!(
+            settle(&[
+                hit_in("e2e.yml", &[("b", "d")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "d")]),
+            ]),
+            [false, true]
+        );
+        // the same workflow: it is
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("b", "d")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "d")]),
+            ]),
+            [true, true]
+        );
+        // two workflows that upload one name each have their own
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("b", "x")], &[]),
+                hit_in("e2e.yml", &[("b", "y")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "x")]),
+                hit_in("e2e.yml", &[], &[("b", 1, "y")]),
+            ]),
+            [true, true, true, true]
+        );
+        // a chain inside one workflow settles whatever its order
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("c", "x")], &[]),
+                hit_in("ci.yml", &[("b", "y")], &[("c", 1, "x")]),
+                hit_in("ci.yml", &[], &[("b", 1, "y")]),
+            ]),
+            [true, true, true]
+        );
     }
 }

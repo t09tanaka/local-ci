@@ -1,5 +1,6 @@
 //! The result of a run: its state, the short text report, and the JSON file.
 
+use crate::complete::{Completeness, Verdict};
 use crate::exec::{tail, JobResult, JobTime, Outcome, StepResult, UnitResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ pub struct Skipped {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunResult {
     pub version: String,
     pub sha: String,
@@ -27,6 +28,10 @@ pub struct RunResult {
     pub skipped_workflows: Vec<Skipped>,
     pub not_covered: Vec<String>,
     pub warnings: Vec<String>,
+    /// Whether the units, jobs and steps of the plan are all in this result
+    /// (see [`crate::complete`]). `state` is `success` only when they are and
+    /// nothing was left out.
+    pub completeness: Completeness,
 }
 
 /// What `local-ci status` needs back from a saved result.
@@ -37,28 +42,20 @@ pub struct Saved {
     pub description: String,
 }
 
-static DEFAULT_WORKFLOWS_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
-
-/// The directory `short` leaves off: the first `workflows-dirs` entry of
-/// `.local-ci.toml`. Set by `resolve`, before anything is printed.
-pub fn set_default_workflows_dir(d: &str) {
-    *DEFAULT_WORKFLOWS_DIR
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = Some(d.to_string());
+/// What printing needs to know about the host: the directory output leaves
+/// off workflow paths, and the home directory shown as `~`.
+#[derive(Debug, Clone)]
+pub struct Style {
+    /// The first `workflows-dirs` entry of `.local-ci.toml`, else `.github/workflows`.
+    pub workflows_dir: String,
+    pub home: Option<String>,
 }
 
 /// How a workflow is named in output: the file name for the default directory
-/// (`.github/workflows/`, or the first one `.local-ci.toml` names), the path
-/// for any other, so equal file names stay apart.
-pub fn short(f: &str) -> &str {
-    let dir = DEFAULT_WORKFLOWS_DIR
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    short_in(
-        dir.as_deref()
-            .unwrap_or(crate::config::DEFAULT_WORKFLOWS_DIR),
-        f,
-    )
+/// `dir` (`.github/workflows/`, or the first one `.local-ci.toml` names), the
+/// path for any other, so equal file names stay apart.
+pub fn short<'a>(dir: &str, f: &'a str) -> &'a str {
+    short_in(dir, f)
 }
 
 fn short_in<'a>(dir: &str, f: &'a str) -> &'a str {
@@ -67,10 +64,11 @@ fn short_in<'a>(dir: &str, f: &'a str) -> &'a str {
         .unwrap_or(f)
 }
 
-pub fn tilde(p: &Path) -> String {
+/// `p` with `home` at its start shown as `~`.
+pub fn tilde(p: &Path, home: Option<&str>) -> String {
     let s = p.to_string_lossy().into_owned();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+    match home {
+        Some(h) if !h.is_empty() && s.starts_with(h) => format!("~{}", &s[h.len()..]),
         _ => s,
     }
 }
@@ -138,7 +136,9 @@ pub fn cached_jobs(units: &[UnitResult]) -> usize {
         .sum()
 }
 
-/// success / failure / error, the same table the commit status uses.
+/// success / failure / error from what ran, the same table the commit status
+/// uses. This looks only at the results that are there; [`final_state`] adds
+/// whether they are all there.
 pub fn state(setup: &[StepResult], units: &[UnitResult]) -> &'static str {
     let c = counts(units);
     if setup.iter().any(|s| s.outcome == Outcome::Fail) || c.fail > 0 {
@@ -150,25 +150,61 @@ pub fn state(setup: &[StepResult], units: &[UnitResult]) -> &'static str {
     }
 }
 
+/// The state of a run: a failure is a failure and an error an error whatever
+/// else is missing; otherwise `success` only for a complete result, `no_work`
+/// for a plan with nothing to run, `incomplete` when parts that cannot be
+/// reproduced here were left out, and `error` when the result lacks (or has
+/// twice, or has too much of) what the plan expects.
+pub fn final_state(base: &'static str, c: &Completeness) -> &'static str {
+    if base != "success" {
+        return base;
+    }
+    match c.verdict {
+        Verdict::Complete => "success",
+        Verdict::NoWork => "no_work",
+        Verdict::Incomplete => "incomplete",
+        Verdict::Invalid => "error",
+    }
+}
+
+/// The state a commit status can have for a run state. `success` is posted
+/// only for a complete run, and for a run that had nothing to run (a commit
+/// that triggers no workflow still has to be able to pass a required check,
+/// as before; its description says `no_work`). Anything else that is not a
+/// failure is an `error`: it was not checked.
+pub fn github_state(state: &str) -> &'static str {
+    match state {
+        "success" | "no_work" => "success",
+        "failure" => "failure",
+        _ => "error",
+    }
+}
+
+/// Whether a skip is something local-ci cannot reproduce (as opposed to a
+/// step that is not needed here, like a checkout of the commit or a cache).
+pub(crate) fn not_reproduced(reason: &str) -> bool {
+    reason == "uses secrets"
+        || reason == "artifact"
+        || reason.starts_with("action ")
+        || reason == "installs system packages"
+        || reason == "pushes, publishes or deploys"
+}
+
 /// Steps and jobs that were skipped because they cannot be reproduced here.
-pub fn not_covered(units: &[UnitResult]) -> Vec<String> {
+pub fn not_covered(units: &[UnitResult], dir: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for j in units.iter().flat_map(|u| &u.jobs) {
         if let Outcome::Skip(r) = &j.outcome {
             if r.contains("not supported") {
-                out.push(format!("{} › {}: {r}", short(&j.workflow), j.display));
+                out.push(format!("{} › {}: {r}", short(dir, &j.workflow), j.display));
             }
         }
         for s in &j.steps {
             if let Outcome::Skip(r) = &s.outcome {
-                if r == "uses secrets"
-                    || r.starts_with("action ")
-                    || r == "installs system packages"
-                    || r == "pushes, publishes or deploys"
-                {
+                if not_reproduced(r) {
                     out.push(format!(
                         "{} › {} › {}: {r}",
-                        short(&j.workflow),
+                        short(dir, &j.workflow),
                         j.display,
                         s.label
                     ));
@@ -179,41 +215,127 @@ pub fn not_covered(units: &[UnitResult]) -> Vec<String> {
     out
 }
 
-pub fn warnings(units: &[UnitResult]) -> Vec<String> {
-    let mut out: Vec<String> = units
+pub fn warnings(setup: &[StepResult], units: &[UnitResult]) -> Vec<String> {
+    let mut out: Vec<String> = setup
         .iter()
-        .flat_map(|u| &u.jobs)
-        .flat_map(|j| &j.steps)
-        .filter_map(|s| {
-            s.note
-                .as_ref()
-                .filter(|n| n.starts_with("wants "))
-                .map(|n| format!("{}: {n}", s.label))
-        })
+        .filter_map(|s| s.note.clone())
+        .filter(|n| n.starts_with("ignore-env"))
         .collect();
+    // a step's note may hold several, told apart by "; "
+    for j in units.iter().flat_map(|u| &u.jobs) {
+        for st in &j.steps {
+            for n in st.note.iter().flat_map(|n| n.split("; ")) {
+                if n.starts_with("wants ") {
+                    out.push(format!("{}: {n}", st.label));
+                } else if n.starts_with("job output ") {
+                    out.push(format!("{}: {n}", j.job));
+                } else if n.starts_with("warning: ") {
+                    out.push(format!("{}: {n}", st.label));
+                }
+            }
+        }
+    }
     out.sort();
     out.dedup();
     out
 }
 
+/// The result of a run over `units`, worked out from what ran and checked
+/// against `fp`, which must be the whole plan (units whose result was reused
+/// are in `units` too, with `cached` set), not the part of it that was run.
+pub fn assemble(
+    fp: &crate::frozen::FrozenPlan,
+    run_dir: PathBuf,
+    setup: Vec<StepResult>,
+    units: Vec<UnitResult>,
+    secs: f64,
+) -> RunResult {
+    let dir = fp.config.default_workflows_dir.as_str();
+    let base = state(&setup, &units);
+    let not_covered = not_covered(&units, dir);
+    let mut result = RunResult {
+        version: env!("CARGO_PKG_VERSION").into(),
+        sha: fp.source.execution_commit.clone(),
+        base: fp.source.base.clone(),
+        changed_files: fp.changed_files.len(),
+        mode: if fp.filters.all { "all" } else { "changes" }.into(),
+        state: base.into(),
+        description: String::new(),
+        secs,
+        run_dir,
+        warnings: warnings(&setup, &units),
+        setup,
+        units,
+        skipped_workflows: fp
+            .skipped
+            .iter()
+            .map(|s| Skipped {
+                workflow: s.workflow.clone(),
+                reason: s.reason.clone(),
+            })
+            .collect(),
+        not_covered,
+        completeness: Completeness {
+            verdict: Verdict::Complete,
+            expected_units: 0,
+            expected_jobs: 0,
+            from_cache: 0,
+            missing: vec![],
+            duplicate: vec![],
+            unexpected: vec![],
+            invalid: vec![],
+            incomplete: vec![],
+        },
+    };
+    result.completeness = crate::complete::validate_run_result(fp, &result);
+    let state = final_state(base, &result.completeness);
+    result.state = state.into();
+    result.description = description(
+        state,
+        &result.units,
+        result.completeness.verdict == Verdict::NoWork,
+        &result.completeness.incomplete,
+        result.completeness.problems().len(),
+        dir,
+    );
+    result
+}
+
 pub fn description(
     state: &str,
     units: &[UnitResult],
-    skipped_only: bool,
-    not_covered: usize,
+    no_work: bool,
+    not_covered: &[String],
+    problems: usize,
+    dir: &str,
 ) -> String {
-    if skipped_only {
-        return "no workflow triggered by these changes".into();
+    if no_work {
+        return "no_work: no workflow triggered by these changes".into();
     }
     let c = counts(units);
-    let mut wfs: Vec<&str> = units.iter().map(|u| short(&u.workflow)).collect();
+    let mut wfs: Vec<&str> = units.iter().map(|u| short(dir, &u.workflow)).collect();
     wfs.dedup();
     let mut d = format!(
         "{state}: pass {} / fail {} / error {} / skip {}",
         c.pass, c.fail, c.error, c.skip
     );
-    if not_covered > 0 {
-        d.push_str(&format!(", {not_covered} not covered"));
+    if !not_covered.is_empty() {
+        d.push_str(&format!(", {} not covered", not_covered.len()));
+        // the first two names, so the status says what was left out
+        let names: Vec<String> = not_covered
+            .iter()
+            .take(2)
+            .map(|e| {
+                let n = e.split(": ").next().unwrap_or(e);
+                let n = n.rsplit(" › ").next().unwrap_or(n);
+                n.chars().take(24).collect()
+            })
+            .collect();
+        d.push_str(&format!(" ({}", names.join(", ")));
+        d.push_str(if not_covered.len() > 2 { ", ...)" } else { ")" });
+    }
+    if problems > 0 {
+        d.push_str(&format!(", {problems} result problems"));
     }
     let cached = cached_jobs(units);
     if cached > 0 {
@@ -238,12 +360,12 @@ fn failed_step(j: &JobResult) -> Option<&StepResult> {
 }
 
 /// "paths not matched: a.yml, b.yml; only schedule: c.yml"
-pub fn group_skipped(skipped: &[Skipped]) -> String {
+pub fn group_skipped(skipped: &[Skipped], dir: &str) -> String {
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for sk in skipped {
         match groups.iter_mut().find(|(reason, _)| *reason == sk.reason) {
-            Some((_, files)) => files.push(short(&sk.workflow)),
-            None => groups.push((&sk.reason, vec![short(&sk.workflow)])),
+            Some((_, files)) => files.push(short(dir, &sk.workflow)),
+            None => groups.push((&sk.reason, vec![short(dir, &sk.workflow)])),
         }
     }
     groups
@@ -253,7 +375,8 @@ pub fn group_skipped(skipped: &[Skipped]) -> String {
         .join("; ")
 }
 
-pub fn print(r: &RunResult, tail_lines: usize) {
+pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
+    let dir = style.workflows_dir.as_str();
     println!(
         "local-ci {} · {} vs {} · {} file{} changed · {} · logs {}",
         r.version,
@@ -266,7 +389,7 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         } else {
             "triggered by the changes"
         },
-        tilde(&r.run_dir)
+        tilde(&r.run_dir, style.home.as_deref())
     );
     let setup_bad: Vec<&StepResult> = r
         .setup
@@ -292,7 +415,7 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         .iter()
         .flat_map(|u| u.jobs.iter().map(move |j| (u, j)))
     {
-        let name = format!("{} › {}", short(&j.workflow), j.display);
+        let name = format!("{} › {}", short(dir, &j.workflow), j.display);
         match &j.outcome {
             Outcome::Pass => match &u.cached {
                 Some(from) => println!("PASS   {name}  cached ({from})"),
@@ -317,10 +440,28 @@ pub fn print(r: &RunResult, tail_lines: usize) {
         println!("SKIP   {}", skipped_jobs.join(", "));
     }
     if !r.skipped_workflows.is_empty() {
-        println!("not triggered ({})", group_skipped(&r.skipped_workflows));
+        println!(
+            "not triggered ({})",
+            group_skipped(&r.skipped_workflows, dir)
+        );
     }
-    if !r.not_covered.is_empty() {
-        println!("not covered: {}", r.not_covered.join("; "));
+    if r.completeness.verdict == Verdict::NoWork {
+        println!("NO WORK  no workflow is triggered by these changes (nothing was checked)");
+    }
+    let problems = r.completeness.problems();
+    if !problems.is_empty() {
+        println!("INCOMPLETE RESULT  {}", problems.join("; "));
+    }
+    if !r.completeness.incomplete.is_empty() {
+        println!(
+            "not covered{}: {}",
+            if r.state == "incomplete" {
+                " (so this is not a pass)"
+            } else {
+                ""
+            },
+            r.completeness.incomplete.join("; ")
+        );
     }
     if !r.warnings.is_empty() {
         println!("warnings: {}", r.warnings.join("; "));
@@ -333,12 +474,12 @@ pub fn print(r: &RunResult, tail_lines: usize) {
     for j in r.units.iter().flat_map(|u| &u.jobs) {
         if matches!(j.outcome, Outcome::Fail | Outcome::Error(_)) {
             if let Some(s) = failed_step(j) {
-                details.push((format!("{} › {}", short(&j.workflow), j.display), s));
+                details.push((format!("{} › {}", short(dir, &j.workflow), j.display), s));
             } else if let Outcome::Error(e) = &j.outcome {
                 if e.lines().count() > 1 {
                     println!(
                         "\n── ERROR {} › {}\n{}",
-                        short(&j.workflow),
+                        short(dir, &j.workflow),
                         j.display,
                         indent(e.lines().skip(1).map(String::from).collect())
                     );
@@ -359,7 +500,7 @@ pub fn print(r: &RunResult, tail_lines: usize) {
             } else {
                 println!("{}", indent(t));
             }
-            println!("   log: {}", tilde(log));
+            println!("   log: {}", tilde(log, style.home.as_deref()));
         }
     }
     let c = counts(&r.units);
@@ -400,6 +541,7 @@ mod tests {
             outcome,
             secs: 1.0,
             steps: vec![],
+            cancelled: false,
             time: None,
         }
     }
@@ -408,11 +550,13 @@ mod tests {
     fn states() {
         let u = |o: Vec<Outcome>| {
             vec![UnitResult {
+                unit: None,
                 workflow: "ci.yml".into(),
                 jobs: o.into_iter().map(job).collect(),
                 waited_secs: 0.0,
                 copy_secs: None,
                 cached: None,
+                outcomes: vec![],
             }]
         };
         assert_eq!(
@@ -436,10 +580,21 @@ mod tests {
             ),
             "failure"
         );
-        let d = description("success", &u(vec![Outcome::Pass]), false, 2);
+        let d = description(
+            "success",
+            &u(vec![Outcome::Pass]),
+            false,
+            &[
+                "ci.yml › deploy › Push image: pushes, publishes or deploys".into(),
+                "ci.yml › deploy › Install jq: installs system packages".into(),
+                "x".into(),
+            ],
+            0,
+            ".github/workflows",
+        );
         assert_eq!(
             d,
-            "ci.yml: success: pass 1 / fail 0 / error 0 / skip 0, 2 not covered"
+            "ci.yml: success: pass 1 / fail 0 / error 0 / skip 0, 3 not covered (Push image, Install jq, ...)"
         );
         assert!(d.len() <= 140);
     }

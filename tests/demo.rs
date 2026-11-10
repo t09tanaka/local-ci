@@ -1,5 +1,8 @@
 //! End-to-end runs against `examples/demo`, copied into a fresh git repository.
 
+#![allow(clippy::disallowed_methods)] // the tests build the binary's environment
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -36,14 +39,14 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 struct Demo {
-    _tmp: tempfile::TempDir,
+    _tmp: common::Tmp,
     repo: PathBuf,
     home: PathBuf,
 }
 
 /// The demo on `main`, plus a `feature` branch that changes `app/`.
 fn demo(change: &str) -> Demo {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let repo = tmp.path().join("demo");
     copy_dir(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/demo"),
@@ -118,7 +121,9 @@ fn nothing_runs_when_paths_do_not_match() {
         out.contains("not triggered (paths not matched: ci.yml)"),
         "{out}"
     );
-    assert!(out.contains("result: success · pass 0"), "{out}");
+    // nothing to run is not a success of any check, but exits 0 as it always did
+    assert!(out.contains("result: no_work · pass 0"), "{out}");
+    assert!(out.contains("NO WORK"), "{out}");
     // --all runs it anyway
     let o = local_ci(&d, &["plan", "--all"]);
     let out = stdout(&o);
@@ -142,7 +147,10 @@ fn runs_jobs_with_dynamic_matrix() {
         ],
     );
     let out = stdout(&o);
+    // the report-upload step is run for real (one artifact per shard), so
+    // nothing is left out of the run
     assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("result: success"), "{out}");
     for line in [
         "PASS   ci.yml › lint",
         "PASS   ci.yml › discover",

@@ -1,6 +1,9 @@
 //! The library entry points, called without the command-line adapter.
 
-use local_ci::{Quiet, Target};
+#![allow(clippy::disallowed_methods)] // the tests build their own commands
+
+mod common;
+use local_ci::{ExecContext, Quiet, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,8 +27,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A repository with one workflow, changed on a `feature` branch.
-fn repo() -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn repo() -> (common::Tmp, PathBuf) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("r");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -41,6 +44,16 @@ fn repo() -> (tempfile::TempDir, PathBuf) {
     std::fs::write(dir.join("a.txt"), "b\n").unwrap();
     git(&dir, &["commit", "-qam", "change"]);
     (tmp, dir)
+}
+
+/// A context with a fixed environment of its own.
+fn ctx() -> ExecContext {
+    ExecContext::new(
+        [("PATH", "/usr/bin:/bin"), ("HOME", "/nonexistent")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
 }
 
 fn target(dir: &Path) -> Target {
@@ -60,7 +73,7 @@ fn target(dir: &Path) -> Target {
 fn resolve_plans_the_triggered_job_without_touching_the_process_cwd() {
     let (_tmp, dir) = repo();
     let before = std::env::current_dir().unwrap();
-    let (repo, plan) = local_ci::resolve(&target(&dir), &mut Quiet).unwrap();
+    let (repo, plan) = local_ci::resolve(&ctx(), &target(&dir), &mut Quiet).unwrap();
     assert_eq!(std::env::current_dir().unwrap(), before);
     assert_eq!(repo.base, "main");
     assert_eq!(repo.changed, vec!["a.txt".to_string()]);
@@ -73,20 +86,33 @@ fn resolve_keeps_only_the_named_jobs() {
     let (_tmp, dir) = repo();
     let mut t = target(&dir);
     t.jobs = vec!["nope".into()];
-    let (_, plan) = local_ci::resolve(&t, &mut Quiet).unwrap();
+    let (_, plan) = local_ci::resolve(&ctx(), &t, &mut Quiet).unwrap();
     assert!(plan.units.is_empty());
 }
 
 #[test]
 fn resolve_fails_outside_a_repository() {
-    let tmp = tempfile::tempdir().unwrap();
-    assert!(local_ci::resolve(&target(tmp.path()), &mut Quiet).is_err());
+    let tmp = common::tempdir().unwrap();
+    // the temporary directory may itself sit inside a repository (a mutation
+    // run points TMPDIR into the target directory): stop git from looking up
+    let ceiling = tmp.path().parent().unwrap().to_string_lossy().to_string();
+    let ctx = ExecContext::new(
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/nonexistent"),
+            ("GIT_CEILING_DIRECTORIES", ceiling.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    assert!(local_ci::resolve(&ctx, &target(tmp.path()), &mut Quiet).is_err());
 }
 
 #[test]
 fn status_without_a_recorded_run_is_an_error() {
     let (tmp, dir) = repo();
-    let err = local_ci::status(&dir, "HEAD", &tmp.path().join("cache")).unwrap_err();
+    let err = local_ci::status(&ctx(), &dir, "HEAD", &tmp.path().join("cache")).unwrap_err();
     assert!(
         format!("{err:#}").contains("no local-ci run recorded"),
         "{err:#}"

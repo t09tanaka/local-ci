@@ -1,10 +1,22 @@
 //! Resolving what a commit triggers, running it, and recording the result.
 //!
 //! The functions here do not print, read the process's working directory or
-//! exit; everything they need comes in as arguments and everything they have
-//! to say goes out through the return value or a [`Observer`].
+//! environment, or exit; everything they need comes in as arguments (the
+//! environment in an [`ExecContext`]) and everything they have to say goes out
+//! through the return value or a [`Observer`].
+//!
+//! Planning ([`build_frozen_plan`]) and executing ([`execute_plan`]) are
+//! separate: the first reads the repository and decides, the second runs what
+//! was decided in a workspace it is given. [`run`] puts them together with the
+//! results cache, the worktree and the saved result.
 
-use crate::{cache, config, exec, filter, git, plan, report, workflow};
+use crate::context::ExecContext;
+use crate::frozen::{
+    DisabledRecord, DisabledSource, DisabledWorkflow, Filters, FrozenConfig, FrozenPlan, PlanParts,
+    SourceRef,
+};
+use crate::source::{self, SourceInfo, SourceKind, SourceManifest};
+use crate::{cache, config, exec, filter, git, plan, report, setup, workflow};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
@@ -13,7 +25,7 @@ pub trait Observer {
     /// A warning or progress line (no `local-ci:` prefix).
     fn notice(&mut self, _msg: &str) {}
     /// The run is about to start processes; the caller may install its signal
-    /// handler now (see [`crate::cancel`]).
+    /// handler now (it cancels with the [`ExecContext::cancel`] handle).
     fn executing(&mut self) {}
 }
 
@@ -46,8 +58,12 @@ pub struct RunOptions {
     pub keep: bool,
     pub job_timeout: f64,
     pub no_cache: bool,
-    /// Where runs, results, worktrees and locks live (see [`cache_dir`]).
+    /// Where runs, results, worktrees and locks live (see [`ExecContext::cache_dir`]).
     pub cache_dir: PathBuf,
+    /// The captured source the run is over: `target.sha` is its execution
+    /// commit (found in `target.dir`, e.g. after `source::import_objects`).
+    /// `None` for a run of a plain commit.
+    pub source: Option<SourceManifest>,
 }
 
 /// What [`run`] produced; the caller prints it and picks the exit code.
@@ -55,6 +71,11 @@ pub struct RunReport {
     pub result: report::RunResult,
     pub repo_root: PathBuf,
     pub cancelled: bool,
+    /// How to print `result` (see [`report::print`]).
+    pub style: report::Style,
+    /// The captured source the run was over, if it was over one. Decides
+    /// whether the result may be a commit status: see [`publish_target`].
+    pub source: Option<SourceInfo>,
 }
 
 pub struct Repo {
@@ -71,25 +92,50 @@ pub struct Repo {
     pub no_cache: Vec<String>,
     /// `link-node-modules` of `.local-ci.toml`.
     pub link_node_modules: bool,
+    /// `[setup] ignore-env` of `.local-ci.toml`.
+    pub ignore_env: Vec<String>,
+    /// The directory output leaves off workflow paths (see [`report::Style`]).
+    pub default_workflows_dir: String,
+    /// The disabled workflows the plan was made with, and where the list came from.
+    pub disabled: DisabledRecord,
 }
 
-pub fn resolve(t: &Target, obs: &mut dyn Observer) -> Result<(Repo, plan::Plan)> {
-    let root = git::toplevel(&t.dir)?;
-    let sha = git::rev(&root, &t.sha)?;
+/// Read the repository and work out what `t` triggers. Besides the plan it
+/// returns what the caller of the command line wants to print.
+pub fn resolve(
+    ctx: &ExecContext,
+    t: &Target,
+    obs: &mut dyn Observer,
+) -> Result<(Repo, plan::Plan)> {
+    resolve_with(ctx, t, None, obs)
+}
+
+/// [`resolve`], with the workflows GitHub does not run given by the caller:
+/// `Some(list)` is taken as is and nothing is asked of `gh` or the network;
+/// `None` asks `gh` (unless the target is `all` or `include_disabled`, which
+/// never ask).
+pub fn resolve_with(
+    ctx: &ExecContext,
+    t: &Target,
+    disabled_list: Option<Vec<DisabledWorkflow>>,
+    obs: &mut dyn Observer,
+) -> Result<(Repo, plan::Plan)> {
+    let root = git::toplevel(ctx, &t.dir)?;
+    let sha = git::rev(ctx, &root, &t.sha)?;
     let base = match &t.base {
         Some(b) => b.clone(),
-        None => git::default_base(&root)?,
+        None => git::default_base(ctx, &root)?,
     };
-    let changed = git::changed_files(&root, &base, &sha)?;
+    let changed = git::changed_files(ctx, &root, &base, &sha)?;
     let head = if t.sha == "HEAD" {
-        git::current_branch(&root)
+        git::current_branch(ctx, &root)
     } else {
         None
     };
-    let config = config::at(&root, &sha)?;
-    report::set_default_workflows_dir(config.default_workflows_dir());
+    let config = config::at(ctx, &root, &sha)?;
     let mut wfs = Vec::new();
     for (file, text) in git::workflows_at(
+        ctx,
         &root,
         &sha,
         config.workflows_dirs.as_deref(),
@@ -101,40 +147,52 @@ pub fn resolve(t: &Target, obs: &mut dyn Observer) -> Result<(Repo, plan::Plan)>
         }
     }
     let ev = filter::Event {
-        base: git::base_branch_name(&root, &base),
+        base: git::base_branch_name(ctx, &root, &base),
         head: head.clone(),
         changed: changed.clone(),
         all: t.all,
     };
     // GitHub does not run workflows that are disabled there; neither does the default mode.
     let mut disabled_skips = Vec::new();
+    let mut record = DisabledRecord::not_checked();
     if !t.all && !t.include_disabled {
-        let disabled = disabled_workflows(&root);
-        wfs.retain(
-            |w| match disabled.iter().find(|(path, _)| path == &w.file) {
-                Some((_, state)) => {
-                    if t.workflows.is_empty()
-                        || t.workflows
-                            .iter()
-                            .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
-                    {
-                        disabled_skips.push((
-                            w.file.clone(),
-                            format!("{} on GitHub", state.replace('_', " ")),
-                        ));
-                    }
-                    false
-                }
-                None => true,
+        let (source, mut list) = match disabled_list {
+            Some(l) => (DisabledSource::Provided, l),
+            None => match disabled_workflows(ctx, &root) {
+                Some(l) => (DisabledSource::Github, l),
+                None => (DisabledSource::Unavailable, vec![]),
             },
-        );
+        };
+        list.sort();
+        list.dedup();
+        let disabled = list.clone();
+        record = DisabledRecord {
+            source,
+            workflows: list,
+        };
+        wfs.retain(|w| match disabled.iter().find(|d| d.path == w.file) {
+            Some(DisabledWorkflow { state, .. }) => {
+                if t.workflows.is_empty()
+                    || t.workflows
+                        .iter()
+                        .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
+                {
+                    disabled_skips.push((
+                        w.file.clone(),
+                        format!("{} on GitHub", state.replace('_', " ")),
+                    ));
+                }
+                false
+            }
+            None => true,
+        });
     }
     let mut p = plan::build(wfs, &ev, &t.workflows);
     p.skipped.extend(disabled_skips);
     if !t.jobs.is_empty() {
         keep_jobs(&mut p, &t.jobs);
     }
-    let dirty = git::is_dirty(&root);
+    let dirty = git::is_dirty(ctx, &root);
     let mut workflow_dirs = config
         .workflows_dirs
         .clone()
@@ -150,23 +208,23 @@ pub fn resolve(t: &Target, obs: &mut dyn Observer) -> Result<(Repo, plan::Plan)>
             dirty,
             all: t.all,
             workflow_dirs,
+            default_workflows_dir: config.default_workflows_dir().to_string(),
+            disabled: record,
             no_cache: config.no_cache,
             link_node_modules: config.link_node_modules,
+            ignore_env: config.ignore_env,
         },
         p,
     ))
 }
 
-/// Workflows that are not `active` on GitHub (`disabled_manually`, ...), as (path, state).
-/// Empty when gh or the network is not available.
-fn disabled_workflows(root: &std::path::Path) -> Vec<(String, String)> {
-    let Some(slug) = git::repo_slug(root) else {
-        return vec![];
-    };
-    if find_tool("gh").is_none() {
-        return vec![];
-    }
-    let child = std::process::Command::new("gh")
+/// Workflows that are not `active` on GitHub (`disabled_manually`, ...).
+/// `None` when gh or the network is not available.
+fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Option<Vec<DisabledWorkflow>> {
+    let slug = git::repo_slug(ctx, root)?;
+    let gh = ctx.find_tool("gh")?;
+    let child = ctx
+        .command(gh)
         .args([
             "api",
             &format!("repos/{slug}/actions/workflows?per_page=100"),
@@ -177,7 +235,7 @@ fn disabled_workflows(root: &std::path::Path) -> Vec<(String, String)> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn();
-    let Ok(mut child) = child else { return vec![] };
+    let Ok(mut child) = child else { return None };
     let t0 = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -187,23 +245,27 @@ fn disabled_workflows(root: &std::path::Path) -> Vec<(String, String)> {
             }
             _ => {
                 let _ = child.kill();
-                return vec![];
+                return None;
             }
         }
     }
     let Ok(out) = child.wait_with_output() else {
-        return vec![];
+        return None;
     };
     if !out.status.success() {
-        return vec![];
+        return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            l.split_once('\t')
-                .map(|(p, s)| (p.to_string(), s.to_string()))
-        })
-        .collect()
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                l.split_once('\t').map(|(p, s)| DisabledWorkflow {
+                    path: p.to_string(),
+                    state: s.to_string(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Keep only the named jobs and the jobs they need.
@@ -230,15 +292,13 @@ fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
         u.jobs.retain(|j| keep.contains(j));
     }
     p.units.retain(|u| !u.jobs.is_empty());
-    // worked out again rather than filtered: an install kept from a job left
-    // out may be the one that runs, its twin in a kept job marked not to
-    plan::fill_setup(p);
 }
 
 /// One key per repository, shared by all of its worktrees.
-fn repo_key(root: &std::path::Path) -> String {
+fn repo_key(ctx: &ExecContext, root: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let common = git::git(
+        ctx,
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
@@ -262,35 +322,23 @@ fn repo_key(root: &std::path::Path) -> String {
     format!("{name}-{:08x}", h.finish() as u32)
 }
 
-pub fn find_tool(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    for d in path.split(':').filter(|d| !d.is_empty()) {
-        let p = PathBuf::from(d).join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let p = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".cargo/bin")
-        .join(name);
-    p.is_file().then_some(p)
-}
-
 /// Post the `local-ci` commit status with gh. Err explains why it was not posted.
 pub fn post_status(
+    ctx: &ExecContext,
     root: &std::path::Path,
     sha: &str,
     state: &str,
     description: &str,
 ) -> Result<()> {
-    let slug = git::repo_slug(root).context("no origin remote")?;
-    find_tool("gh").context("gh is not installed")?;
-    let out = std::process::Command::new("gh")
+    let slug = git::repo_slug(ctx, root).context("no origin remote")?;
+    let gh = ctx.find_tool("gh").context("gh is not installed")?;
+    let out = ctx
+        .command(gh)
         .args([
             "api",
             &format!("repos/{slug}/statuses/{sha}"),
             "-f",
-            &format!("state={state}"),
+            &format!("state={}", report::github_state(state)),
             "-f",
             "context=local-ci",
             "-f",
@@ -311,6 +359,28 @@ pub fn post_status(
     bail!("gh api failed: {}", err.lines().next().unwrap_or("").trim())
 }
 
+/// A new directory for a run of `sha7` started at `stamp`: `<stamp>-<sha7>`,
+/// or with `-<n>` after it when another run of the same commit started in the
+/// same second and has it. The directory is made here, so two runs never share
+/// one (what a run does to its artifact area would destroy the other's).
+pub fn claim_run_dir(runs: &std::path::Path, stamp: u64, sha7: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(runs)?;
+    for n in 0u32.. {
+        let name = if n == 0 {
+            format!("{stamp}-{sha7}")
+        } else {
+            format!("{stamp}-{sha7}-{n}")
+        };
+        let dir = runs.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("a counter that does not end")
+}
+
 fn prune_runs(dir: &std::path::Path, keep: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -328,99 +398,309 @@ fn prune_runs(dir: &std::path::Path, keep: usize) {
     }
 }
 
-pub fn run(a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
+/// Plan what `t` triggers and fix it. Reads the repository (and asks `gh`
+/// which workflows are disabled, unless the target says otherwise) but starts
+/// no job, touches no results cache and creates no worktree.
+pub fn build_frozen_plan(
+    ctx: &ExecContext,
+    t: &Target,
+    obs: &mut dyn Observer,
+) -> Result<FrozenPlan> {
+    build_frozen_plan_with(ctx, t, None, obs)
+}
+
+/// [`build_frozen_plan`] with the disabled workflows given: `Some(list)` plans
+/// without asking `gh` or the network, so the plan depends on its inputs only;
+/// the list and its source are recorded in the plan.
+pub fn build_frozen_plan_with(
+    ctx: &ExecContext,
+    t: &Target,
+    disabled: Option<Vec<DisabledWorkflow>>,
+    obs: &mut dyn Observer,
+) -> Result<FrozenPlan> {
+    let (repo, p) = resolve_with(ctx, t, disabled, obs)?;
+    freeze(ctx, &repo, p, t)
+}
+
+/// Fix an already resolved plan (what [`build_frozen_plan`] does after
+/// [`resolve`]).
+pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
+    FrozenPlan::new(PlanParts {
+        repository: git::repo_slug(ctx, &repo.root),
+        source: SourceRef {
+            source_id: format!("commit:{}", repo.sha),
+            execution_commit: repo.sha.clone(),
+            base: repo.base.clone(),
+        },
+        branch: repo.head.clone(),
+        changed_files: repo.changed.clone(),
+        config: FrozenConfig {
+            workflow_dirs: repo.workflow_dirs.clone(),
+            default_workflows_dir: repo.default_workflows_dir.clone(),
+            no_cache: repo.no_cache.clone(),
+            link_node_modules: repo.link_node_modules,
+            ignore_env: repo.ignore_env.clone(),
+        },
+        filters: Filters {
+            all: t.all,
+            include_disabled: t.include_disabled,
+            workflows_dirs: t.workflows_dirs.iter().map(|d| plan::norm_dir(d)).collect(),
+            workflows: t.workflows.clone(),
+            jobs: t.jobs.clone(),
+        },
+        disabled: repo.disabled.clone(),
+        plan: p,
+    })
+}
+
+/// Run what `fp` says in `ws` and report. Nothing is decided again: the units,
+/// their order and the setup are the plan's. The attempt's processes and
+/// containers are tracked in `ctx.cancel`; the containers are gone when this
+/// returns, the workspace is left for the caller to remove.
+///
+/// `ws.run_dir` must be new and unique to this run (see [`claim_run_dir`]):
+/// the run's artifacts are laid out in it, and one that has artifacts already
+/// (another run's, or an earlier call's) is refused before anything starts.
+pub fn execute_plan(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    ws: &exec::Workspace,
+    opts: exec::Opts,
+) -> Result<report::RunResult> {
+    let area = ws.run_dir.join("artifacts");
+    if std::fs::read_dir(&area).is_ok_and(|mut d| d.next().is_some()) {
+        bail!(
+            "{} already has artifacts: a run needs a directory of its own",
+            ws.run_dir.display()
+        );
+    }
+    run_plan(ctx, fp, ws, opts)
+}
+
+/// [`execute_plan`] without the check of the run directory, for a run that
+/// has put the artifacts of its reused units there itself.
+fn run_plan(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    ws: &exec::Workspace,
+    opts: exec::Opts,
+) -> Result<report::RunResult> {
+    let t0 = std::time::Instant::now();
+    let nothing = fp.units.is_empty();
+    if nothing {
+        return Ok(report::assemble(
+            fp,
+            ws.run_dir.clone(),
+            vec![],
+            vec![],
+            t0.elapsed().as_secs_f64(),
+        ));
+    }
+    let keep = opts.keep;
+    let mut runner = exec::Runner::new(ctx, fp, ws, opts);
+    let result = (|| -> Result<_> {
+        runner.prepare_tools()?;
+        // Each task has a recipe of its own. This run does them in the one
+        // workspace, each step once, and tells every task which of its steps
+        // that covered; a template key shared by several tasks is prepared
+        // (and receipted) once.
+        let recipes = runner.task_recipes()?;
+        let run_id = ws
+            .run_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tctx = setup::TemplateContext::local(fp, &run_id);
+        let all = setup::SetupRecipe::union(&recipes.iter().map(|(_, r)| r).collect::<Vec<_>>());
+        let done = runner.run_recipe(&all, all.template_key(&tctx).digest());
+        let ok = done.ok();
+        let mut by_key: std::collections::HashMap<String, setup::PreparedReceipt> =
+            Default::default();
+        let mut receipts = std::collections::HashMap::new();
+        for (task, recipe) in &recipes {
+            let key = recipe.template_key(&tctx);
+            let r = by_key
+                .entry(key.digest().to_string())
+                .or_insert_with(|| done.receipt.restricted_to(recipe, &key));
+            receipts.insert(task.clone(), r.clone());
+        }
+        runner.set_receipts(receipts, tctx);
+        let setup = done.steps;
+        let units = if ok && !ctx.cancel.is_cancelled() {
+            runner.run_units()
+        } else {
+            vec![]
+        };
+        Ok((setup, units))
+    })();
+    ctx.cancel.remove_containers(ctx);
+    if !keep {
+        runner.release_ports(&ws.root);
+    }
+    let (setup, units) = result?;
+    Ok(report::assemble(
+        fp,
+        ws.run_dir.clone(),
+        setup,
+        units,
+        t0.elapsed().as_secs_f64(),
+    ))
+}
+
+pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
     let t_start = std::time::Instant::now();
-    let (repo, mut p) = resolve(&a.target, obs)?;
+    let mut full = build_frozen_plan(ctx, &a.target, obs)?;
+    if let Some(m) = &a.source {
+        if m.execution_commit.as_deref() != Some(full.source.execution_commit.as_str()) {
+            bail!(
+                "the target is {}, not the execution commit of source {}",
+                &full.source.execution_commit[..7],
+                m.source_id
+            );
+        }
+        full = full.with_source_id(&m.source_id)?;
+    }
+    let root = git::toplevel(ctx, &a.target.dir)?;
     let cache = a.cache_dir.clone();
-    let key = repo_key(&repo.root);
+    let key = repo_key(ctx, &root);
     let runs = cache.join("runs").join(&key);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let nothing_triggered = p.units.is_empty();
+    let mut full_plan = full.to_plan();
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
     store.prune(stamp);
-    let fingerprints: Vec<Option<String>> = if p.units.is_empty() {
+    let sha = full.source.execution_commit.as_str();
+    let fingerprints: Vec<Option<String>> = if full.units.is_empty() {
         vec![]
     } else {
         match cache::Inputs::read(
-            &repo.root,
-            &repo.sha,
-            &repo.base,
-            repo.head.as_deref(),
-            &repo.workflow_dirs,
-            &repo.no_cache,
+            ctx,
+            &root,
+            sha,
+            &full.source.base,
+            full.branch.as_deref(),
+            &full.config.workflow_dirs,
+            &full.config.no_cache,
         ) {
-            Ok(inputs) => p
+            Ok(inputs) => full_plan
                 .units
                 .iter()
                 .map(|u| {
-                    let s = &p.selected[u.wf];
+                    let s = &full_plan.selected[u.wf];
                     inputs.fingerprint(&s.wf, &s.event, u)
                 })
                 .collect(),
             Err(e) => {
                 obs.notice(&format!("not reusing results: {e:#}"));
-                vec![None; p.units.len()]
+                vec![None; full.units.len()]
             }
         }
     };
-    let mut reused = Vec::new();
-    let mut to_run = Vec::new();
-    let mut run_fps = Vec::new();
-    for (u, fp) in std::mem::take(&mut p.units).into_iter().zip(fingerprints) {
-        let hit = fp
-            .as_deref()
-            .filter(|_| !a.no_cache)
-            .and_then(|f| store.get(f, &p.selected[u.wf].wf.file, stamp));
-        match hit {
-            Some(r) => reused.push(r),
-            None => {
-                to_run.push(u);
-                run_fps.push(fp);
-            }
-        }
-    }
-    p.units = to_run;
-    if !reused.is_empty() {
-        plan::fill_setup(&mut p);
-    }
-    let run_dir = runs.join(format!("{stamp}-{}", &repo.sha[..7]));
-    std::fs::create_dir_all(&run_dir)?;
-    std::fs::create_dir_all(cache.join("locks"))?;
-    if repo.dirty {
-        obs.notice(&format!(
-            "uncommitted changes are not tested; testing commit {}",
-            &repo.sha[..7]
-        ));
-    }
-    let skipped: Vec<report::Skipped> = p
-        .skipped
+    // Units whose kept result still holds: the ones with a fingerprint that
+    // `store` knows. Their artifacts are put into this run's area under the
+    // digest of the plan that is left to run, which depends on which of them
+    // are reused, so a result whose artifacts do not restore (a file that does
+    // not match its receipt) is given up, and the rest settled again.
+    let run_dir = claim_run_dir(&runs, stamp, &sha[..7])?;
+    let mut hits: Vec<Option<cache::Hit>> = std::mem::take(&mut full_plan.units)
         .iter()
-        .map(|(w, r)| report::Skipped {
-            workflow: w.clone(),
-            reason: r.clone(),
+        .zip(&fingerprints)
+        .map(|(u, fp)| {
+            fp.as_deref()
+                .filter(|_| !a.no_cache)
+                .and_then(|f| store.get(f, &full_plan.selected[u.wf].wf.file, stamp))
         })
         .collect();
+    let all_units = full.to_plan().units;
+    let (fp, taken) = loop {
+        let taken = cache::settle(&hits);
+        let mut p = full.to_plan();
+        p.units = all_units
+            .iter()
+            .zip(&taken)
+            .filter(|(_, t)| !**t)
+            .map(|(u, _)| u.clone())
+            .collect();
+        let fp = full.with_plan(p)?;
+        // what an earlier pass restored is not this pass's: a result given up
+        // takes with it the artifacts of the units that were settled on it
+        let _ = std::fs::remove_dir_all(run_dir.join("artifacts"));
+        if !taken.iter().any(|t| *t) {
+            break (fp, taken);
+        }
+        let mut failed = false;
+        for (i, t) in taken.iter().enumerate() {
+            let (Some(h), Some(f)) = (hits[i].as_ref(), fingerprints[i].as_deref()) else {
+                continue;
+            };
+            if *t && store.restore(f, h, &run_dir, &fp.digest).is_err() {
+                hits[i] = None;
+                failed = true;
+            }
+        }
+        if !failed {
+            break (fp, taken);
+        }
+    };
+    let mut reused = Vec::new();
+    // where each unit still to run stands in the whole plan
+    let mut run_idx = Vec::new();
+    let mut run_fps = Vec::new();
+    for (i, (fp_, t)) in fingerprints.into_iter().zip(taken).enumerate() {
+        if t {
+            if let Some(h) = hits[i].take() {
+                reused.push(exec::UnitResult {
+                    unit: Some(i),
+                    ..h.result
+                });
+            }
+        } else {
+            run_idx.push(i);
+            run_fps.push(fp_);
+        }
+    }
+    std::fs::create_dir_all(&run_dir)?;
+    let source_info = a.source.as_ref().map(SourceInfo::of);
+    if let Some(info) = &source_info {
+        exec::write_json(&run_dir.join("source.json"), info)?;
+    }
+    std::fs::create_dir_all(cache.join("locks"))?;
+    if git::is_dirty(ctx, &root) {
+        obs.notice(&format!(
+            "uncommitted changes are not tested; testing commit {}",
+            &sha[..7]
+        ));
+    }
 
-    let (setup, units) = if p.units.is_empty() {
+    let (setup, units) = if fp.units.is_empty() {
         (vec![], vec![])
     } else {
-        let name = format!("{}-{}", &repo.sha[..7], std::process::id());
+        let name = format!("{}-{}", &sha[..7], std::process::id());
         let wt = cache.join("wt").join(&name);
         let tools = cache.join("wt").join(format!("{name}.tools"));
         std::fs::create_dir_all(cache.join("wt"))?;
-        git::add_worktree(&repo.root, &wt, &repo.sha)?;
+        match &a.source {
+            // the captured bytes, not a checkout of the commit
+            Some(m) => source::add_worktree(
+                ctx,
+                &source::ObjectStore::open(cache.join("sources"))?,
+                &root,
+                &wt,
+                m,
+            )?,
+            None => git::add_worktree(ctx, &root, &wt, sha)?,
+        }
         obs.executing();
-        exec::remove_orphan_containers();
+        exec::remove_orphan_containers(ctx);
         let canirun = if a.no_canirun {
             None
         } else {
-            find_tool("canirun")
+            ctx.find_tool("canirun")
         };
         let parallel = a.parallel.unwrap_or(if canirun.is_some() {
-            p.units.len().clamp(1, 16)
+            fp.units.len().clamp(1, 16)
         } else {
             4
         });
@@ -430,113 +710,179 @@ pub fn run(a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
             portool: if a.no_portool {
                 None
             } else {
-                find_tool("portool")
+                ctx.find_tool("portool")
             },
             containers: a.containers,
             job_timeout_min: a.job_timeout,
             keep: a.keep,
             trash: cache.join("trash"),
         };
-        let slug = git::repo_slug(&repo.root).unwrap_or_default();
-        let runner = exec::Runner::new(
-            &repo,
-            &p,
-            wt.clone(),
-            run_dir.clone(),
-            tools.clone(),
-            cache.join("locks").join(format!("{key}.lock")),
-            slug,
-            opts,
-        );
-        let result = (|| -> Result<_> {
-            runner.prepare_tools()?;
-            let setup = runner.run_setup();
-            let ok = setup.iter().all(|s| s.outcome == exec::Outcome::Pass);
-            let units = if ok && !exec::CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
-                runner.run_units()
-            } else {
-                vec![]
-            };
-            Ok((setup, units))
-        })();
-        exec::remove_containers();
+        let ws = exec::Workspace {
+            root: wt.clone(),
+            repo_root: root.clone(),
+            run_dir: run_dir.clone(),
+            tools: tools.clone(),
+            lock_file: cache.join("locks").join(format!("{key}.lock")),
+        };
+        let result = run_plan(ctx, &fp, &ws, opts);
         if a.keep {
-            obs.notice(&format!("kept worktree {}", report::tilde(&wt)));
-            if p.units.len() > 1 {
+            obs.notice(&format!("kept worktree {}", report::tilde(&wt, ctx.home())));
+            if fp.units.len() > 1 {
                 obs.notice(
                     "and the copies of units and matrix entries beside it (`-u<n>-`, `-c<n>-`)",
                 );
             }
         } else {
-            runner.release_ports(&wt);
-            git::remove_worktree(&repo.root, &wt, &cache.join("trash"));
+            git::remove_worktree(ctx, &root, &wt, &cache.join("trash"));
             let _ = std::fs::remove_dir_all(&tools);
         }
-        result?
+        let r = result?;
+        (r.setup, r.units)
     };
-    if !exec::CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+    if !ctx.cancel.is_cancelled() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        for (u, fp) in units.iter().zip(&run_fps) {
-            if let Some(fp) = fp {
-                store.put(fp, &repo.sha, u, now);
+        for (u, fp_) in units.iter().zip(&run_fps) {
+            if let Some(f) = fp_ {
+                // the artifacts it takes from other units of the run
+                let mut downloads: Vec<String> = u
+                    .unit
+                    .into_iter()
+                    .flat_map(|ui| fp.tasks.iter().filter(move |t| t.unit == ui))
+                    .flat_map(|t| t.artifacts.iter().cloned())
+                    .collect();
+                downloads.sort();
+                downloads.dedup();
+                store.put(f, sha, u, now, &run_dir, &downloads);
             }
         }
     }
-    let units: Vec<exec::UnitResult> = reused.into_iter().chain(units).collect();
-    let state = report::state(&setup, &units);
-    let not_covered = report::not_covered(&units);
-    let description = report::description(state, &units, nothing_triggered, not_covered.len());
-    let result = report::RunResult {
-        version: env!("CARGO_PKG_VERSION").into(),
-        sha: repo.sha.clone(),
-        base: repo.base.clone(),
-        changed_files: repo.changed.len(),
-        mode: if repo.all { "all" } else { "changes" }.into(),
-        state: state.into(),
-        description: description.clone(),
-        secs: t_start.elapsed().as_secs_f64(),
-        run_dir: run_dir.clone(),
-        warnings: report::warnings(&units),
+    // The units that ran were numbered in the part of the plan that was run;
+    // the result is checked against the whole plan.
+    let units: Vec<exec::UnitResult> = reused
+        .into_iter()
+        .chain(units.into_iter().map(|u| exec::UnitResult {
+            unit: u.unit.and_then(|i| run_idx.get(i).copied()),
+            ..u
+        }))
+        .collect();
+    let result = report::assemble(
+        &full,
+        run_dir.clone(),
         setup,
         units,
-        skipped_workflows: skipped,
-        not_covered,
-    };
+        t_start.elapsed().as_secs_f64(),
+    );
     exec::write_json(&run_dir.join("result.json"), &result)?;
     std::fs::write(runs.join("last"), run_dir.to_string_lossy().as_bytes())?;
     prune_runs(&runs, 20);
-    let cancelled = exec::CANCEL.load(std::sync::atomic::Ordering::SeqCst);
+    let cancelled = ctx.cancel.is_cancelled();
     Ok(RunReport {
         result,
-        repo_root: repo.root,
+        repo_root: root,
         cancelled,
+        style: report::Style {
+            workflows_dir: full.config.default_workflows_dir.clone(),
+            home: ctx.home().map(String::from),
+        },
+        source: source_info,
     })
+}
+
+/// The commit a result may be posted to as its `local-ci` status.
+///
+/// A run of a plain commit (`info` is `None`) posts to the commit it tested.
+/// A run of a captured source posts to the commit it was captured from, and
+/// only when what was tested is what that commit holds; otherwise `Err` says
+/// why not. Success of a dirty worktree, a synthetic commit or a directory
+/// is never success of the original `HEAD`.
+pub fn publish_target(
+    ctx: &ExecContext,
+    root: &std::path::Path,
+    tested_sha: &str,
+    info: Option<&SourceInfo>,
+) -> std::result::Result<String, String> {
+    let Some(info) = info else {
+        return Ok(tested_sha.to_string());
+    };
+    let target = match info.source_kind {
+        SourceKind::Worktree => info.original_head.clone(),
+        SourceKind::Commit => info.execution_commit.clone(),
+        SourceKind::Directory => None,
+    };
+    let Some(target) = target else {
+        return Err("the run tested a directory snapshot, not a commit".into());
+    };
+    source::publishable(ctx, root, info, &target)?;
+    Ok(target)
 }
 
 /// Record the last run's result as the `local-ci` commit status.
 /// Returns the state and the short sha it was posted for.
 pub fn status(
+    ctx: &ExecContext,
     dir: &std::path::Path,
     sha: &str,
     cache_dir: &std::path::Path,
 ) -> Result<(String, String)> {
-    let root = git::toplevel(dir)?;
-    let want = git::rev(&root, sha)?;
-    let last = cache_dir.join("runs").join(repo_key(&root)).join("last");
+    let root = git::toplevel(ctx, dir)?;
+    let want = git::rev(ctx, &root, sha)?;
+    let last = cache_dir
+        .join("runs")
+        .join(repo_key(ctx, &root))
+        .join("last");
     let run_dir =
         std::fs::read_to_string(&last).context("no local-ci run recorded for this repository")?;
     let saved: report::Saved = serde_json::from_str(&std::fs::read_to_string(
         PathBuf::from(run_dir.trim()).join("result.json"),
     )?)?;
-    if saved.sha != want {
-        bail!(
+    let run_dir = PathBuf::from(run_dir.trim());
+    let info: Option<SourceInfo> = match std::fs::read_to_string(run_dir.join("source.json")) {
+        Ok(t) => Some(serde_json::from_str(&t).context("source.json is not readable")?),
+        Err(_) => None,
+    };
+    match &info {
+        None if saved.sha != want => bail!(
             "the last run tested {}, not {}; run `local-ci run` again",
             &saved.sha[..7],
             &want[..7]
-        );
+        ),
+        None => {}
+        Some(i) => {
+            // the run was over a captured source: it speaks for `want` only
+            // when it tested the same content
+            if let Err(why) = source::publishable(ctx, &root, i, &want) {
+                bail!("not posting: {why}");
+            }
+        }
     }
-    post_status(&root, &saved.sha, &saved.state, &saved.description)?;
-    Ok((saved.state.clone(), saved.sha[..7].to_string()))
+    post_status(ctx, &root, &want, &saved.state, &saved.description)?;
+    Ok((
+        report::github_state(&saved.state).to_string(),
+        want[..7].to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_runs_of_one_commit_in_one_second_get_directories_of_their_own() {
+        let t = tempfile::tempdir().unwrap();
+        let runs = t.path().join("runs");
+        let a = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let b = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let c = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let d = claim_run_dir(&runs, 101, "abcdef0").unwrap();
+        assert_eq!(a, runs.join("100-abcdef0"));
+        assert_eq!(b, runs.join("100-abcdef0-1"));
+        assert_eq!(c, runs.join("100-abcdef0-2"));
+        assert_eq!(d, runs.join("101-abcdef0"));
+        // they come in the order they were made
+        let mut sorted = vec![c.clone(), b.clone(), a.clone()];
+        sorted.sort();
+        assert_eq!(sorted, [a, b, c]);
+    }
 }

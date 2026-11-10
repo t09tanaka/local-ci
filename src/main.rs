@@ -1,8 +1,13 @@
 //! Command-line adapter of `local-ci`: parses arguments, prints, picks the exit code.
+//! The one place that reads the process environment.
+
+#![allow(clippy::disallowed_methods)]
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use local_ci::{plan, report, workflow, Observer, Repo, RunOptions, Target};
+use local_ci::{
+    plan, report, workflow, CancelHandle, ExecContext, Observer, Repo, RunOptions, Target,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -123,17 +128,30 @@ enum Cmd {
 }
 
 /// Prints notices the way `local-ci` always has, and installs the Ctrl-C handler.
-struct Stderr;
+struct Stderr {
+    cancel: CancelHandle,
+}
 impl Observer for Stderr {
     fn notice(&mut self, msg: &str) {
         eprintln!("local-ci: {msg}");
     }
     fn executing(&mut self) {
-        ctrlc::set_handler(local_ci::cancel).ok();
+        // Ctrl-C stops the run this process is making
+        let cancel = self.cancel.clone();
+        ctrlc::set_handler(move || cancel.cancel()).ok();
     }
 }
 
-fn run(a: RunArgs) -> Result<i32> {
+/// The context of this process: its environment, and a cancel handle for the one run it makes.
+fn context() -> ExecContext {
+    ExecContext::new(
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect(),
+    )
+}
+
+fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
     let (json, tail, no_status) = (a.json, a.tail, a.no_status);
     let opts = RunOptions {
         target: a.target.into_target()?,
@@ -144,14 +162,21 @@ fn run(a: RunArgs) -> Result<i32> {
         keep: a.keep,
         job_timeout: a.job_timeout,
         no_cache: a.no_cache,
-        cache_dir: local_ci::cache_dir(),
+        cache_dir: ctx.cache_dir(),
+        source: None,
     };
-    let rep = local_ci::run(opts, &mut Stderr)?;
+    let rep = local_ci::run(
+        ctx,
+        opts,
+        &mut Stderr {
+            cancel: ctx.cancel.clone(),
+        },
+    )?;
     let result = &rep.result;
     if json {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else {
-        report::print(result, tail);
+        report::print(result, tail, &rep.style);
     }
     let cancelled = rep.cancelled;
     if !json {
@@ -165,18 +190,28 @@ fn run(a: RunArgs) -> Result<i32> {
                 }
             );
         } else {
-            match local_ci::post_status(
-                &rep.repo_root,
-                &result.sha,
-                &result.state,
-                &result.description,
-            ) {
-                Ok(()) => println!(
+            // a run over a captured source posts only to a commit whose
+            // content it tested
+            let posted =
+                local_ci::publish_target(ctx, &rep.repo_root, &result.sha, rep.source.as_ref())
+                    .and_then(|target| {
+                        local_ci::post_status(
+                            ctx,
+                            &rep.repo_root,
+                            &target,
+                            &result.state,
+                            &result.description,
+                        )
+                        .map(|()| target)
+                        .map_err(|e| format!("{e:#}"))
+                    });
+            match posted {
+                Ok(target) => println!(
                     "status: local-ci={} posted to {}",
-                    result.state,
-                    &result.sha[..7]
+                    report::github_state(&result.state),
+                    &target[..7]
                 ),
-                Err(e) => println!("status: not posted ({e:#})"),
+                Err(e) => println!("status: not posted ({e})"),
             }
         }
     }
@@ -184,19 +219,23 @@ fn run(a: RunArgs) -> Result<i32> {
         130
     } else {
         match result.state.as_str() {
-            "success" => 0,
+            // `no_work` (the changes trigger no workflow) keeps the exit code a
+            // run with nothing to do always had
+            "success" | "no_work" => 0,
             "failure" => 1,
+            // checked what it could, and left out what local-ci cannot reproduce
+            "incomplete" => 3,
             _ => 2,
         }
     })
 }
 
-fn status(dir: Option<PathBuf>, sha: &str) -> Result<i32> {
+fn status(ctx: &ExecContext, dir: Option<PathBuf>, sha: &str) -> Result<i32> {
     let dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
     };
-    let (state, short) = local_ci::status(&dir, sha, &local_ci::cache_dir())?;
+    let (state, short) = local_ci::status(ctx, &dir, sha, &ctx.cache_dir())?;
     println!("status: local-ci={state} posted to {short}");
     Ok(0)
 }
@@ -262,7 +301,8 @@ fn matrix_size(m: &serde_yaml::Value) -> usize {
     }
 }
 
-fn print_plan(r: &Repo, p: &plan::Plan) {
+fn print_plan(r: &Repo, p: &plan::Plan, fp: &local_ci::FrozenPlan) {
+    let dir = r.default_workflows_dir.as_str();
     println!(
         "local-ci plan  {} vs {} ({} file{} changed, {}){}",
         &r.sha[..7],
@@ -280,20 +320,41 @@ fn print_plan(r: &Repo, p: &plan::Plan) {
             ""
         }
     );
-    if !p.setup.is_empty() {
-        let s: Vec<String> = p
-            .setup
+    let mut recipes: Vec<local_ci::setup::SetupRecipe> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for t in &fp.tasks {
+        match local_ci::setup::derive_setup_recipe(fp, &t.id) {
+            Ok(r) => recipes.push(r),
+            Err(e) => failed.push((t.id.clone(), format!("{e:#}"))),
+        }
+    }
+    for (task, why) in &failed {
+        println!("setup of {task} could not be worked out: {why}");
+    }
+    let all = local_ci::setup::SetupRecipe::union(&recipes.iter().collect::<Vec<_>>());
+    let covered = local_ci::setup::covered_by(&all);
+    if !all.steps.is_empty() {
+        let s: Vec<String> = all
+            .steps
             .iter()
-            .filter(|s| s.execute)
+            .filter(|s| !covered.contains_key(&s.id))
             .map(|s| {
                 format!(
                     "{}$ {}",
-                    if s.key.wd.is_empty() { "." } else { &s.key.wd },
+                    if s.dir.is_empty() { "." } else { &s.dir },
                     s.label
                 )
             })
             .collect();
         println!("setup (once): {}", s.join(" | "));
+    }
+    for l in &all.left_in_place {
+        println!(
+            "setup stays in {}: {} ({})",
+            l.job,
+            l.label,
+            l.reason.describe()
+        );
     }
     for (i, u) in p.units.iter().enumerate() {
         let w = &p.selected[u.wf].wf;
@@ -305,7 +366,7 @@ fn print_plan(r: &Repo, p: &plan::Plan) {
         println!(
             "unit {:<2} {}: {}{}",
             i + 1,
-            report::short(&w.file),
+            report::short(dir, &w.file),
             jobs.join(" → "),
             if u.exclusive { "  [exclusive]" } else { "" }
         );
@@ -319,22 +380,28 @@ fn print_plan(r: &Repo, p: &plan::Plan) {
                 reason: r.clone(),
             })
             .collect();
-        println!("not triggered ({})", report::group_skipped(&skipped));
+        println!("not triggered ({})", report::group_skipped(&skipped, dir));
     }
 }
 
 fn main() {
     let cli = Cli::parse();
+    let ctx = context();
     let res = match cli.cmd {
-        Cmd::Plan { target } => target
-            .into_target()
-            .and_then(|t| local_ci::resolve(&t, &mut Stderr))
-            .map(|(r, p)| {
-                print_plan(&r, &p);
-                0
-            }),
-        Cmd::Run(a) => run(a),
-        Cmd::Status { dir, sha } => status(dir, &sha),
+        Cmd::Plan { target } => target.into_target().and_then(|t| {
+            let (r, p) = local_ci::resolve(
+                &ctx,
+                &t,
+                &mut Stderr {
+                    cancel: ctx.cancel.clone(),
+                },
+            )?;
+            let fp = local_ci::freeze(&ctx, &r, p.clone(), &t)?;
+            print_plan(&r, &p, &fp);
+            Ok(0)
+        }),
+        Cmd::Run(a) => run(&ctx, a),
+        Cmd::Status { dir, sha } => status(&ctx, dir, &sha),
     };
     let code = res.unwrap_or_else(|e| {
         eprintln!("local-ci: {e:#}");

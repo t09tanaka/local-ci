@@ -16,21 +16,66 @@ pub enum Status {
     Cancelled,
 }
 
+/// What `success()`, `failure()` and `cancelled()` answer. A step is in one of
+/// the three ([`Status`]); a job may be in none (a job it needs was skipped:
+/// neither `success()` nor `failure()`), and `failure()` there also covers the
+/// failure of any ancestor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusFns {
+    pub success: bool,
+    pub failure: bool,
+    pub cancelled: bool,
+}
+
+impl From<Status> for StatusFns {
+    fn from(s: Status) -> Self {
+        StatusFns {
+            success: s == Status::Success,
+            failure: s == Status::Failure,
+            cancelled: s == Status::Cancelled,
+        }
+    }
+}
+
 pub struct Ctx<'a> {
     /// Top-level contexts: github, env, matrix, steps, needs, job, runner, inputs, vars, strategy.
     pub contexts: &'a Map<String, Value>,
-    pub status: Status,
-    /// Set when the expression touched `secrets.*`.
+    pub status: StatusFns,
+    /// Set when the expression touched `secrets.*` (or `github.token`) and no
+    /// value could be supplied.
     pub used_secrets: Cell<bool>,
+    /// Where the value of `github.token` / `secrets.GITHUB_TOKEN` comes from,
+    /// when this host can supply it.
+    token_from: Option<&'a crate::context::ExecContext>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(contexts: &'a Map<String, Value>, status: Status) -> Self {
+        Self::with_fns(contexts, status.into())
+    }
+
+    pub fn with_fns(contexts: &'a Map<String, Value>, status: StatusFns) -> Self {
         Ctx {
             contexts,
             status,
             used_secrets: Cell::new(false),
+            token_from: None,
         }
+    }
+
+    /// Supply the value of `github.token` and `secrets.GITHUB_TOKEN` from
+    /// `ctx` (this machine's `gh auth token`) instead of flagging them as
+    /// secrets, as GitHub Actions does: the expression's result holds the
+    /// value itself. A caller must not write such a result to a file; a script
+    /// that holds it is handed to the shell over a pipe (see `exec`).
+    /// Other secrets stay flagged.
+    pub fn with_token(mut self, ctx: &'a crate::context::ExecContext) -> Self {
+        self.token_from = Some(ctx);
+        self
+    }
+
+    fn token(&self) -> Option<String> {
+        self.token_from?.github_token().map(str::to_string)
     }
 }
 
@@ -408,13 +453,22 @@ fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
             }
         }
         Ast::Prop(b, k) => {
-            let base = eval(b, ctx)?;
             let key = eval(k, ctx)?;
-            // `github.token` is a credential, like `secrets.GITHUB_TOKEN`
-            if matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("github"))
-                && to_string(&key).eq_ignore_ascii_case("token")
-            {
-                ctx.used_secrets.set(true);
+            let name = to_string(&key);
+            // `secrets.GITHUB_TOKEN` and `github.token` are the same credential
+            let secrets = matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("secrets"));
+            let github = matches!(b.as_ref(), Ast::Ctx(n) if n.eq_ignore_ascii_case("github"));
+            if secrets && name.eq_ignore_ascii_case("GITHUB_TOKEN") {
+                if let Some(t) = ctx.token() {
+                    return Ok(Value::String(t));
+                }
+            }
+            let base = eval(b, ctx)?;
+            if github && name.eq_ignore_ascii_case("token") {
+                match ctx.token() {
+                    Some(t) => return Ok(Value::String(t)),
+                    None => ctx.used_secrets.set(true),
+                }
             }
             get_prop(&base, &key)
         }
@@ -454,9 +508,9 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
     let a: Vec<Value> = args.iter().map(|e| eval(e, ctx)).collect::<Result<_>>()?;
     let s = |i: usize| a.get(i).map(to_string).unwrap_or_default();
     Ok(match name {
-        "success" => Value::Bool(ctx.status == Status::Success),
-        "failure" => Value::Bool(ctx.status == Status::Failure),
-        "cancelled" => Value::Bool(ctx.status == Status::Cancelled),
+        "success" => Value::Bool(ctx.status.success),
+        "failure" => Value::Bool(ctx.status.failure),
+        "cancelled" => Value::Bool(ctx.status.cancelled),
         "always" => Value::Bool(true),
         // Cache keys only; every cache step is skipped locally.
         "hashfiles" => Value::String(String::new()),
@@ -551,6 +605,118 @@ fn find_close(s: &str) -> Option<usize> {
     None
 }
 
+/// What an expression takes from the `needs` context.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NeedsRef {
+    /// `needs.<job>.outputs.<name>`, however it is spelled.
+    Output { job: String, name: String },
+    /// Outputs of one job taken without naming one: `needs.<job>`,
+    /// `needs.<job>.outputs`, `needs.<job>.outputs.*`, `needs.<job>.outputs[x]`.
+    JobOutputs(String),
+    /// `needs` taken whole or through a computed job: `toJSON(needs)`,
+    /// `needs[matrix.job]`.
+    All,
+}
+
+enum Seg {
+    Name(String),
+    Star,
+    Dyn,
+}
+
+fn collect_needs(ast: &Ast, out: &mut Vec<NeedsRef>) {
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut computed: Vec<&Ast> = Vec::new();
+    let mut cur = ast;
+    loop {
+        match cur {
+            Ast::Prop(base, key) => {
+                match &**key {
+                    Ast::Lit(Value::String(s)) => segs.push(Seg::Name(s.clone())),
+                    other => {
+                        segs.push(Seg::Dyn);
+                        computed.push(other);
+                    }
+                }
+                cur = base;
+            }
+            Ast::Star(base) => {
+                segs.push(Seg::Star);
+                cur = base;
+            }
+            _ => break,
+        }
+    }
+    segs.reverse();
+    match cur {
+        Ast::Ctx(name) if name.eq_ignore_ascii_case("needs") => {
+            let is = |s: Option<&Seg>, w: &str| matches!(s, Some(Seg::Name(n)) if n.eq_ignore_ascii_case(w));
+            match segs.first() {
+                None | Some(Seg::Star) | Some(Seg::Dyn) => out.push(NeedsRef::All),
+                Some(Seg::Name(job)) => {
+                    let job = job.clone();
+                    match segs.get(1) {
+                        None => out.push(NeedsRef::JobOutputs(job)),
+                        Some(_) if is(segs.get(1), "outputs") => match segs.get(2) {
+                            Some(Seg::Name(name)) => out.push(NeedsRef::Output {
+                                job,
+                                name: name.clone(),
+                            }),
+                            _ => out.push(NeedsRef::JobOutputs(job)),
+                        },
+                        // `result`, or a name computed: it could be `outputs`
+                        Some(Seg::Dyn) => out.push(NeedsRef::JobOutputs(job)),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        Ast::Call(_, args) => args.iter().for_each(|a| collect_needs(a, out)),
+        Ast::Not(a) => collect_needs(a, out),
+        Ast::Bin(_, a, b) => {
+            collect_needs(a, out);
+            collect_needs(b, out);
+        }
+        _ => {}
+    }
+    for k in computed {
+        collect_needs(k, out);
+    }
+}
+
+/// What `text` takes from `needs`. `${{ }}` expressions in it are read; with
+/// `bare`, the whole text is an expression too (an `if:`). Text that mentions
+/// `needs` but cannot be read counts as taking all of it.
+pub fn needs_refs(text: &str, bare: bool) -> Vec<NeedsRef> {
+    let mut exprs: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        match find_close(after) {
+            Some(end) => {
+                exprs.push(&after[..end]);
+                rest = &after[end + 2..];
+            }
+            None => {
+                exprs.push(after);
+                break;
+            }
+        }
+    }
+    if bare && exprs.is_empty() {
+        exprs.push(text);
+    }
+    let mut out = Vec::new();
+    for e in exprs {
+        match parse(e) {
+            Ok(ast) => collect_needs(&ast, &mut out),
+            Err(_) if e.to_ascii_lowercase().contains("needs") => out.push(NeedsRef::All),
+            Err(_) => {}
+        }
+    }
+    out
+}
+
 /// Does an `if:` condition call a status function? If not, GitHub wraps it in `success() && (...)`.
 fn has_status_fn(src: &str) -> bool {
     let l = src.to_ascii_lowercase();
@@ -559,10 +725,20 @@ fn has_status_fn(src: &str) -> bool {
         .any(|f| l.contains(f))
 }
 
+/// Does an `if:` value leave a job to the default `success()` gate, so that it
+/// is skipped when a job it needs did not succeed? False if it calls
+/// `failure()`, `cancelled()` or `always()`.
+pub(crate) fn success_gated(raw: Option<&str>) -> bool {
+    let l = raw.unwrap_or("").to_ascii_lowercase();
+    !["failure(", "cancelled(", "always("]
+        .iter()
+        .any(|f| l.contains(f))
+}
+
 /// Evaluate an `if:` value (with or without `${{ }}`); `None` means the default `success()`.
 pub fn condition(raw: Option<&str>, ctx: &Ctx) -> Result<bool> {
     let raw = match raw {
-        None => return Ok(ctx.status == Status::Success),
+        None => return Ok(ctx.status.success),
         Some(r) => r.trim(),
     };
     let inner = match raw.strip_prefix("${{").and_then(|r| r.strip_suffix("}}")) {
@@ -571,13 +747,13 @@ pub fn condition(raw: Option<&str>, ctx: &Ctx) -> Result<bool> {
         _ => raw.to_string(),
     };
     if inner.is_empty() {
-        return Ok(ctx.status == Status::Success);
+        return Ok(ctx.status.success);
     }
     let v = truthy(&evaluate(&inner, ctx)?);
     if has_status_fn(&inner) {
         Ok(v)
     } else {
-        Ok(ctx.status == Status::Success && v)
+        Ok(ctx.status.success && v)
     }
 }
 

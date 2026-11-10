@@ -4,45 +4,40 @@
 //! This is not a stable API (0.x): types, functions and modules may change in
 //! any release. The `local-ci` binary is a thin adapter over it.
 
+pub mod artifact;
+pub mod artifact_io;
 pub mod cache;
+pub mod complete;
 pub mod config;
+pub mod context;
+pub mod dag;
 pub mod exec;
 pub mod expr;
 pub mod filter;
+pub mod frozen;
 pub mod git;
 pub mod matrix;
 pub mod plan;
 pub mod portool;
 pub mod report;
 mod run;
+mod script;
+pub mod setup;
+pub mod source;
+pub mod task;
+pub mod template;
+pub mod tree;
+pub mod wire;
 pub mod workflow;
 
+pub use complete::{validate_run_result, verify_task_result, Completeness, Verdict};
+pub use context::{CancelHandle, ExecContext};
+pub use frozen::{derive_job_dag, FrozenPlan};
 pub use run::{
-    find_tool, post_status, resolve, run, status, Observer, Quiet, Repo, RunOptions, RunReport,
-    Target,
+    build_frozen_plan, build_frozen_plan_with, claim_run_dir, execute_plan, freeze, post_status,
+    publish_target, resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions,
+    RunReport, Target,
 };
-
-use std::path::PathBuf;
-
-/// Where runs, results, worktrees and locks live by default (`LOCAL_CI_HOME`,
-/// else the platform cache directory).
-pub fn cache_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("LOCAL_CI_HOME") {
-        return PathBuf::from(d);
-    }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
-    if cfg!(target_os = "macos") {
-        return home.join("Library/Caches/local-ci");
-    }
-    match std::env::var("XDG_CACHE_HOME") {
-        Ok(x) if !x.is_empty() => PathBuf::from(x).join("local-ci"),
-        _ => home.join(".cache/local-ci"),
-    }
-}
-
-/// Stop the running processes of every [`run`] in this process and make them
-/// report as cancelled. Meant for a signal handler. The tracking behind it is
-/// process-global (see `exec`).
-pub fn cancel() {
-    exec::kill_all();
-}
+pub use task::{
+    aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,
+};

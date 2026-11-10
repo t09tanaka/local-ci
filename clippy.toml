@@ -1,0 +1,12 @@
+# The library takes its environment from an ExecContext; only the command-line
+# adapter (src/main.rs, which allows these) may read the process environment.
+# Every command the engine starts comes from `ExecContext::command`, which
+# clears the process's environment first; it is the one place (src/context.rs)
+# that allows `Command::new`. Tests that build their own commands allow it.
+disallowed-methods = [
+    { path = "std::env::var", reason = "read the environment from the ExecContext" },
+    { path = "std::env::var_os", reason = "read the environment from the ExecContext" },
+    { path = "std::env::vars", reason = "read the environment from the ExecContext" },
+    { path = "std::env::vars_os", reason = "read the environment from the ExecContext" },
+    { path = "std::process::Command::new", reason = "start commands with ExecContext::command, which sets the environment" },
+]

@@ -1,62 +1,39 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
+use crate::artifact::{self};
+use crate::artifact_io;
+use crate::context::ExecContext;
+use crate::dag::{self, ExecutionTask};
 use crate::expr::{self, Ctx, Status};
+use crate::frozen::FrozenPlan;
 use crate::matrix;
 use crate::plan::{self, Plan, Unit};
-use crate::run::Repo;
+use crate::setup::{
+    self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe, TemplateContext,
+};
+use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, TaskResult};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Process-global cancellation and child tracking; to be replaced by per-attempt
-/// ownership. Kept out of the public API on purpose: use `local_ci::cancel`.
-pub(crate) static CANCEL: AtomicBool = AtomicBool::new(false);
-static PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-static CONTAINERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static COMPOSE_PROJECTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Stop everything that is running (Ctrl-C).
-pub(crate) fn kill_all() {
-    CANCEL.store(true, Ordering::SeqCst);
-    for &pg in PGIDS.lock().unwrap().iter() {
-        unsafe {
-            libc::killpg(pg, libc::SIGTERM);
-        }
-    }
-}
-
-pub(crate) fn remove_containers() {
-    let projects: Vec<String> = COMPOSE_PROJECTS.lock().unwrap().drain(..).collect();
-    compose_down(&projects);
-    let names: Vec<String> = CONTAINERS.lock().unwrap().drain(..).collect();
-    if !names.is_empty() {
-        let _ = Command::new("docker")
-            .arg("rm")
-            .arg("-f")
-            .args(&names)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
 
 /// Remove the service containers of `local-ci` runs that are gone: a run
 /// killed before it cleaned up left its database behind on the service's
 /// declared port, and later runs could not bind it. A container is named
 /// `local-ci-<pid>-<n>` by the run that started it.
-pub(crate) fn remove_orphan_containers() {
-    let Ok(out) = Command::new("docker")
+pub(crate) fn remove_orphan_containers(ctx: &ExecContext) {
+    let Ok(out) = ctx
+        .command("docker")
         .args([
             "ps",
             "-a",
@@ -76,7 +53,8 @@ pub(crate) fn remove_orphan_containers() {
         .map(String::from)
         .collect();
     if !names.is_empty() {
-        let _ = Command::new("docker")
+        let _ = ctx
+            .command("docker")
             .args(["rm", "-f"])
             .args(&names)
             .stdout(Stdio::null())
@@ -99,7 +77,7 @@ fn alive(pid: i32) -> bool {
     sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "result", content = "reason", rename_all = "lowercase")]
 pub enum Outcome {
     Pass,
@@ -109,7 +87,7 @@ pub enum Outcome {
     Error(String),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResult {
     pub label: String,
     #[serde(flatten)]
@@ -123,7 +101,7 @@ pub struct StepResult {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
     pub workflow: String,
     pub job: String,
@@ -132,6 +110,10 @@ pub struct JobResult {
     pub outcome: Outcome,
     pub secs: f64,
     pub steps: Vec<StepResult>,
+    /// The run was cancelled while the job ran (its `outcome` is an error) or
+    /// before it started (a skip). `needs.<id>.result` is `cancelled` then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
     /// Where the time went. Absent for jobs that did not run and for reused results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<JobTime>,
@@ -144,7 +126,7 @@ pub struct JobResult {
 /// of a whole unit (`wait_lock_secs` for the repository lock, `wait_parallel_secs`
 /// for a `--parallel` place) are charged to its first job, so that the sum over
 /// jobs is not counted twice.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct JobTime {
     /// The job's own running, setup of its services and environment included:
     /// `secs` without `wait_queue_secs`.
@@ -191,6 +173,9 @@ fn charge(jobs: &mut [JobResult], w: UnitWait) {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitResult {
+    /// The unit of the plan this is the result of (index into its `units`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<usize>,
     pub workflow: String,
     pub jobs: Vec<JobResult>,
     pub waited_secs: f64,
@@ -200,6 +185,10 @@ pub struct UnitResult {
     /// Where the reused result comes from (`abc1234, 2h ago`), when the unit did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached: Option<String>,
+    /// Each job of the unit as the jobs that need it saw it, in the order they
+    /// ran. Empty for a reused result (which keeps no outputs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<JobOutcome>,
 }
 
 pub struct Opts {
@@ -216,9 +205,32 @@ pub struct Opts {
     pub trash: PathBuf,
 }
 
+/// Where one attempt runs: the host paths the plan is materialized at. The
+/// plan itself holds no path of the host.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    /// The checkout of the planned commit the jobs run in.
+    pub root: PathBuf,
+    /// The repository that checkout belongs to; copies for parallel units are
+    /// made from it.
+    pub repo_root: PathBuf,
+    /// Where logs and the run's artifacts go. It must be new and unique to
+    /// this run: [`crate::execute_plan`] refuses one that already has
+    /// artifacts, and two runs in one directory would share (and destroy) one
+    /// artifact area. [`crate::claim_run_dir`] makes one.
+    pub run_dir: PathBuf,
+    /// The attempt's own tool directory (shims, scripts, installed tools).
+    pub tools: PathBuf,
+    /// Held while exclusive units run.
+    pub lock_file: PathBuf,
+}
+
 pub struct Runner<'a> {
-    pub repo: &'a Repo,
-    pub plan: &'a Plan,
+    pub ctx: &'a ExecContext,
+    pub fp: &'a FrozenPlan,
+    /// The engine's view of the plan, worked out once from `fp`.
+    pub plan: Plan,
+    pub repo_root: PathBuf,
     pub wt: PathBuf,
     pub run_dir: PathBuf,
     pub tools: PathBuf,
@@ -226,28 +238,39 @@ pub struct Runner<'a> {
     pub slug: String,
     pub opts: Opts,
     pub base_path: String,
+    /// The keys of the steps that count as setup, from the plan alone.
+    hoisted: plan::Hoist,
+    /// What each task was told is prepared, and the context its template keys
+    /// are made under.
+    receipts: Option<(HashMap<String, PreparedReceipt>, TemplateContext)>,
     seq: AtomicUsize,
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
+    docker_ok: OnceLock<Result<(), String>>,
+    /// Why the units of a workflow (by index in the plan) are not run: an
+    /// artifact step of it that cannot be run.
+    refused: HashMap<usize, String>,
 }
+
+/// The descriptor a script holding the token is read from, and how a shell is
+/// told to read it.
+const PIPE_FD: i32 = 3;
+const PIPE_SCRIPT: &str = "/dev/fd/3";
 
 fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pat).unwrap())
 }
 
-fn global_install(run: &str) -> bool {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^\s*(sudo\s|brew (install|upgrade|tap)\b|apt(-get)?\s|yum\s|dnf\s|apk add\b|choco\s|snap install\b)").is_match(run)
-}
-
-/// Steps that would change something outside this machine with your credentials.
-fn remote_effect(run: &str) -> bool {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?m)(^|[;&|(]\s*|\s)(git\s+push|gh\s+(api|release|pr|issue|workflow|run|repo|secret|variable|label|gist)\b|npm\s+publish|cargo\s+publish|dart\s+pub\s+publish|docker\s+(push|login)|aws\s|gcloud\s|kubectl\s|helm\s+(install|upgrade)|terraform\s+(apply|destroy)|serverless\s+deploy|sls\s+deploy|firebase\s+deploy|vercel\b|netlify\s+deploy|wrangler\s+(deploy|publish))",
-    )
-    .is_match(run)
+/// Replace `secret` in the file at `path` with `***`.
+fn mask_in_file(path: &Path, secret: &str) {
+    if secret.len() < 4 {
+        return;
+    }
+    if let Ok(text) = fs::read_to_string(path) {
+        if text.contains(secret) {
+            let _ = fs::write(path, text.replace(secret, "***"));
+        }
+    }
 }
 
 fn slug_of(s: &str) -> String {
@@ -479,16 +502,18 @@ fn compose_globals(args: &str) -> &str {
 }
 
 /// `docker compose -p <name> down` for each project that still has containers.
-fn compose_down(projects: &[String]) {
+pub(crate) fn compose_down(ctx: &ExecContext, projects: &[String]) {
     for p in projects {
         let label = format!("label=com.docker.compose.project={p}");
-        let has = Command::new("docker")
+        let has = ctx
+            .command("docker")
             .args(["ps", "-aq", "--filter", &label])
             .output()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
         if has {
-            let _ = Command::new("docker")
+            let _ = ctx
+                .command("docker")
                 .args(["compose", "-p", p, "down", "--remove-orphans"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -531,7 +556,7 @@ dir=$(pwd -P)
 ws=$(cd "${GITHUB_WORKSPACE:-/}" 2>/dev/null && pwd -P)
 sum=$(cksum package-lock.json 2>/dev/null | cut -d' ' -f1)
 # relative to the workspace, so a unit's copy of the worktree keeps setup's marks
-key=$(printf '%s' "${dir#"$ws"}" | cksum | cut -d' ' -f1)
+key=$(printf '%s' "${dir#"$ws"}$LOCAL_CI_INSTALL_SCOPE" | cksum | cut -d' ' -f1)
 marks="$LOCAL_CI_MARKS"
 mkdir -p "$marks"
 until mkdir "$marks/$key.lock" 2>/dev/null; do sleep 1; done
@@ -756,41 +781,41 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 }
 
 impl<'a> Runner<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        repo: &'a Repo,
-        plan: &'a Plan,
-        wt: PathBuf,
-        run_dir: PathBuf,
-        tools: PathBuf,
-        lock_file: PathBuf,
-        slug: String,
-        opts: Opts,
-    ) -> Self {
-        let base_path = std::env::var("PATH").unwrap_or_default();
+    pub fn new(ctx: &'a ExecContext, fp: &'a FrozenPlan, ws: &Workspace, opts: Opts) -> Self {
+        let base_path = ctx.var("PATH").unwrap_or_default().to_string();
+        let plan = fp.to_plan();
+        let refused = (0..plan.selected.len())
+            .filter_map(|wf| Some((wf, artifact_io::workflow_refusal(&plan, wf)?)))
+            .collect();
         Runner {
-            repo,
+            ctx,
+            fp,
+            refused,
+            hoisted: plan::hoist(&plan),
             plan,
-            wt,
-            run_dir,
-            tools,
-            lock_file,
-            slug,
+            receipts: None,
+            repo_root: ws.repo_root.clone(),
+            wt: ws.root.clone(),
+            run_dir: ws.run_dir.clone(),
+            tools: ws.tools.clone(),
+            lock_file: ws.lock_file.clone(),
+            slug: fp.repository.clone().unwrap_or_default(),
             opts,
             base_path,
             seq: AtomicUsize::new(0),
             synced: Mutex::new(HashSet::new()),
+            docker_ok: OnceLock::new(),
         }
     }
 
     fn github_ctx(&self, ws: &Path, w: &Workflow, event: &str, job: &str) -> Value {
-        let base = crate::git::branch_name(&self.repo.base);
-        let head = self.repo.head.clone().unwrap_or_default();
+        let base = crate::git::branch_name(&self.fp.source.base);
+        let head = self.fp.branch.clone().unwrap_or_default();
         let pr = event == "pull_request";
         json!({
             "event_name": event,
-            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.repo.sha}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
-            "sha": self.repo.sha,
+            "event": if pr { json!({"pull_request": {"draft": false, "number": 0, "head": {"ref": head, "sha": self.fp.source.execution_commit}, "base": {"ref": base}}, "action": "synchronize"}) } else { json!({"ref": format!("refs/heads/{head}")}) },
+            "sha": self.fp.source.execution_commit,
             "ref": if pr { "refs/pull/0/merge".to_string() } else { format!("refs/heads/{head}") },
             "ref_name": if pr { "0/merge".to_string() } else { head.clone() },
             "head_ref": if pr { head.clone() } else { String::new() },
@@ -845,7 +870,7 @@ impl<'a> Runner<'a> {
                 self.marks(Path::new(&ws)).to_string_lossy().into_owned(),
             ),
             ("GITHUB_WORKSPACE".into(), ws),
-            ("GITHUB_SHA".into(), self.repo.sha.clone()),
+            ("GITHUB_SHA".into(), self.fp.source.execution_commit.clone()),
             ("GITHUB_REF".into(), s("ref")),
             ("GITHUB_REF_NAME".into(), s("ref_name")),
             ("GITHUB_HEAD_REF".into(), s("head_ref")),
@@ -895,9 +920,20 @@ impl<'a> Runner<'a> {
         ]
     }
 
+    /// `text` with this machine's GitHub token, if it was asked for, replaced
+    /// by `***`: for what is recorded.
+    fn hide_token(&self, text: String) -> String {
+        match self.ctx.github_token_if_fetched() {
+            Some(t) if t.len() >= 4 => text.replace(t, "***"),
+            _ => text,
+        }
+    }
+
     /// Run one shell step. Output goes to `log`; returns how it ended and how
     /// long canirun kept it waiting for its turn. When canirun's ledger lock
     /// times out the command never started, so it is tried again, a few times.
+    /// A `piped` script holds the GitHub token: it is not written to a file but
+    /// handed to the shell over a pipe (see `shell_once`).
     #[allow(clippy::too_many_arguments)]
     fn shell(
         &self,
@@ -908,12 +944,14 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        piped: bool,
     ) -> Result<(Exit, Duration)> {
         let mut attempt = 0;
         let mut queued = Duration::ZERO;
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
-            let (r, q) = self.shell_once(cwd, script, shell, env, timeout, log, key.clone())?;
+            let (r, q) =
+                self.shell_once(cwd, script, shell, env, timeout, log, key.clone(), piped)?;
             queued += q;
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
@@ -938,6 +976,7 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        piped: bool,
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let file = self.tools.join(format!("scripts/step-{n}.sh"));
@@ -950,15 +989,37 @@ impl<'a> Runner<'a> {
         let turn = self.tools.join(format!("scripts/step-{n}.turn"));
         let queued = self.opts.canirun.is_some() && key.is_some();
         let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
-        if marked {
+        let sh_family = matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
+        // bash and sh read a script that is not a file one byte at a time, so
+        // the lines they have not run yet are still in the pipe, and fd 3 is
+        // inherited by everything the script starts. They read the script
+        // through a descriptor of their own, so the first act of a script
+        // that holds the token is to close fd 3, on the line it starts on.
+        // (Python parses the whole script before it runs a line of it, so
+        // nothing is left in the pipe by then.)
+        let close = if piped && sh_family {
+            format!("exec {PIPE_FD}<&-; ")
+        } else {
+            String::new()
+        };
+        let body = if marked {
             let mark = shlex::try_quote(&turn.to_string_lossy())
                 .map(|q| format!(": > {q} 2>/dev/null || true; "))
                 .unwrap_or_default();
-            fs::write(&file, format!("{mark}{script}"))?;
+            format!("{close}{mark}{script}")
         } else {
-            fs::write(&file, script)?;
-        }
-        let f = file.to_string_lossy().into_owned();
+            format!("{close}{script}")
+        };
+        // A script that holds the token never reaches a file: the shell reads
+        // it from file descriptor 3, the read end of a pipe (so the argument
+        // list shows `/dev/fd/3` and nothing else), and canirun passes the
+        // descriptor on to its child.
+        let f = if piped {
+            PIPE_SCRIPT.to_string()
+        } else {
+            write_private(&file, &body)?;
+            file.to_string_lossy().into_owned()
+        };
         let mut argv: Vec<String> = match shell.map(str::trim) {
             None | Some("bash") => vec![
                 "bash".into(),
@@ -970,8 +1031,15 @@ impl<'a> Runner<'a> {
             ],
             Some("sh") => vec!["sh".into(), "-e".into(), f],
             Some("python") => vec!["python3".into(), f],
+            // A shell of our own may open the script twice (`shellcheck {0} &&
+            // bash {0}` reads nothing the second time and exits 0), and cannot
+            // be told to close fd 3: a script that holds the token is not run.
+            Some(custom) if custom.contains("{0}") && piped => bail!(
+                "the step's script holds the GitHub token, which is handed over a pipe that `shell: {custom}` cannot read; use bash, sh or python for a step that uses github.token"
+            ),
             Some(custom) if custom.contains("{0}") => shlex::split(&custom.replace("{0}", &f))
                 .ok_or_else(|| anyhow!("bad shell `{custom}`"))?,
+            // keep in step with `plan::shell_supported`
             Some(other) => bail!("unsupported shell `{other}`"),
         };
         if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
@@ -997,7 +1065,7 @@ impl<'a> Runner<'a> {
         }
         let out = OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
-        let mut cmd = Command::new(&argv[0]);
+        let mut cmd = self.ctx.command(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -1007,12 +1075,49 @@ impl<'a> Runner<'a> {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        let pipe = if piped {
+            let (r, w) = script_pipe(&self.tools.join(format!("scripts/step-{n}.fifo")))?;
+            let rfd = std::os::fd::AsRawFd::as_raw_fd(&r);
+            // SAFETY: only dup2 and fcntl, which are async-signal-safe, run
+            // between fork and exec. dup2 clears close-on-exec on the copy.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if rfd == PIPE_FD {
+                        let fl = libc::fcntl(rfd, libc::F_GETFD);
+                        if fl < 0 || libc::fcntl(rfd, libc::F_SETFD, fl & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(rfd, PIPE_FD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Some((r, w))
+        } else {
+            None
+        };
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
+        let writer_stop = Arc::new(AtomicBool::new(false));
+        let mut writer = None;
+        if let Some((r, w)) = pipe {
+            // the child has its own copy
+            drop(r);
+            // A thread writes, so that a script larger than the pipe does not
+            // block here. It ends when the shell has read it all, when every
+            // reader is gone, or when the step is over (`writer_stop`), even
+            // if something that outlived the step still holds the read end.
+            let body = body.clone();
+            let stop = writer_stop.clone();
+            writer = Some(std::thread::spawn(move || {
+                write_until_stopped(w, body.as_bytes(), &stop)
+            }));
+        }
         let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
-        PGIDS.lock().unwrap().push(pid);
+        self.ctx.cancel.track_pgid(pid);
         // With canirun the clock starts when the command gets its turn, not while it waits.
         let mut started: Option<Instant> = if self.opts.canirun.is_some() {
             None
@@ -1047,7 +1152,7 @@ impl<'a> Runner<'a> {
                 }
             }
             let over = matches!((timeout, started), (Some(t), Some(s)) if s.elapsed() > t);
-            if (over || CANCEL.load(Ordering::SeqCst)) && term_at.is_none() {
+            if (over || self.ctx.cancel.is_cancelled()) && term_at.is_none() {
                 timed_out = over;
                 unsafe {
                     libc::killpg(pid, libc::SIGTERM);
@@ -1061,8 +1166,15 @@ impl<'a> Runner<'a> {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        PGIDS.lock().unwrap().retain(|&p| p != pid);
-        let _ = fs::remove_file(&file);
+        self.ctx.cancel.untrack_pgid(pid);
+        // the step is over: nothing is owed to a reader that is still around
+        writer_stop.store(true, Ordering::SeqCst);
+        if let Some(h) = writer {
+            let _ = h.join();
+        }
+        if !piped {
+            let _ = fs::remove_file(&file);
+        }
         // Waiting for its turn: until the script touched `turn`, or the first
         // line of output that is not canirun's own, or, when neither came
         // (canirun gave up, the step was stopped, a silent step of another
@@ -1086,7 +1198,7 @@ impl<'a> Runner<'a> {
         if timed_out {
             return Ok((Exit::Timeout, waited));
         }
-        if CANCEL.load(Ordering::SeqCst) {
+        if self.ctx.cancel.is_cancelled() {
             return Ok((Exit::Cancelled, waited));
         }
         Ok((
@@ -1101,7 +1213,7 @@ impl<'a> Runner<'a> {
         let dir = self.run_dir.join(format!(
             "{}-{}",
             slug_of(
-                crate::report::short(wf)
+                crate::report::short(&self.fp.config.default_workflows_dir, wf)
                     .trim_end_matches(".yml")
                     .trim_end_matches(".yaml")
             ),
@@ -1144,7 +1256,9 @@ impl<'a> Runner<'a> {
             })
         });
         if wants_pip {
-            let ok = Command::new("python3")
+            let ok = self
+                .ctx
+                .command("python3")
                 .arg("-m")
                 .arg("venv")
                 .arg(self.tools.join("venv"))
@@ -1162,46 +1276,124 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    pub fn run_setup(&self) -> Vec<StepResult> {
-        let mut out = Vec::new();
-        for (i, s) in self.plan.setup.iter().enumerate() {
-            if !s.execute {
-                continue;
+    /// What each task of the plan was told is prepared, by task id. Set before
+    /// [`Runner::run_units`]; a task without an entry prepares everything itself.
+    /// `tctx` is the context the receipts' template keys were made under.
+    pub fn set_receipts(
+        &mut self,
+        receipts: HashMap<String, PreparedReceipt>,
+        tctx: TemplateContext,
+    ) {
+        self.receipts = Some((receipts, tctx));
+    }
+
+    /// Do the steps of `recipe` in the workspace, in order, and stop at the first
+    /// that does not pass. `key` is the digest of the template key the receipt
+    /// is for.
+    /// The recipe of each task of the plan, in the plan's order.
+    pub fn task_recipes(&self) -> Result<Vec<(String, SetupRecipe)>> {
+        self.fp
+            .tasks
+            .iter()
+            .map(|t| {
+                Ok((
+                    t.id.clone(),
+                    setup::derive_in(&self.plan, &self.hoisted, t)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> PreparedSetup {
+        if recipe.steps.is_empty() {
+            return PreparedSetup {
+                receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
+                steps: vec![],
+            };
+        }
+        let workspace = match setup::ensure_workspace_id(&self.wt) {
+            Ok(id) => id,
+            Err(e) => {
+                return PreparedSetup {
+                    receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
+                    steps: vec![StepResult {
+                        label: "setup".into(),
+                        outcome: Outcome::Error(format!("cannot record the workspace id: {e:#}")),
+                        exit: None,
+                        secs: 0.0,
+                        log: None,
+                        note: None,
+                    }],
+                };
             }
-            let sel = &self.plan.selected[s.wf];
-            let job = self.plan.job(s.wf, &s.job);
-            let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &job.id);
-            let mut env = self.base_env(&gh, &[]);
-            for (k, v) in sel
-                .wf
-                .env
-                .iter()
-                .chain(job.env.iter())
-                .chain(s.key.env.iter())
-            {
-                if !v.contains("${{") {
-                    env.push((k.clone(), v.clone()));
+        };
+        let covered = setup::covered_by(recipe);
+        let dirs: BTreeSet<String> = recipe.steps.iter().map(|s| s.dir.clone()).collect();
+        let before = setup::top_level_entries(&self.wt, &dirs);
+        let mut out = Vec::new();
+        let mut prepared: Vec<PreparedStep> = Vec::new();
+        let mut notes: Vec<setup::ReceiptNote> = Vec::new();
+        for (i, s) in recipe.steps.iter().enumerate() {
+            if let Some(by) = covered.get(&s.id) {
+                if prepared.iter().any(|p| &p.id == by) {
+                    prepared.push(PreparedStep {
+                        id: s.id.clone(),
+                        how: PreparedHow::SameAs { step: by.clone() },
+                    });
+                    continue;
                 }
             }
-            let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.key.wd, s.label));
+            let label = format!(
+                "{}$ {}",
+                if s.dir.is_empty() { "." } else { &s.dir },
+                s.label
+            );
+            let found = self
+                .plan
+                .selected
+                .iter()
+                .position(|x| x.wf.file == s.workflow)
+                .filter(|wi| {
+                    self.plan.selected[*wi]
+                        .wf
+                        .jobs
+                        .iter()
+                        .any(|j| j.id == s.job)
+                });
+            let Some(wi) = found else {
+                out.push(StepResult {
+                    label,
+                    outcome: Outcome::Error(format!(
+                        "the plan has no job {} in {}",
+                        s.job, s.workflow
+                    )),
+                    exit: None,
+                    secs: 0.0,
+                    log: None,
+                    note: None,
+                });
+                break;
+            };
+            let sel = &self.plan.selected[wi];
+            let gh = self.github_ctx(&self.wt, &sel.wf, &sel.event, &s.job);
+            let mut env = self.base_env(&gh, &[]);
+            env.extend(s.env.iter().cloned());
+            env.extend(s.ignored_env.iter().cloned());
+            let log = self.log_path("setup", "", i + 1, &format!("{}-{}", s.dir, s.label));
             let t0 = Instant::now();
-            let cwd = self.wt.join(&s.key.wd);
+            let cwd = self.wt.join(&s.dir);
             let res = self
                 .shell(
                     &cwd,
-                    &s.key.run,
+                    &s.run,
                     s.shell.as_deref(),
                     &env,
                     Some(Duration::from_secs(1800)),
                     &log,
-                    None,
+                    Some(format!("local-ci setup {label}")),
+                    false,
                 )
                 .map(|(exit, _)| exit);
-            let label = format!(
-                "{}$ {}",
-                if s.key.wd.is_empty() { "." } else { &s.key.wd },
-                s.label
-            );
             let (outcome, exit) = match res {
                 Ok(Exit::Code(0)) => (Outcome::Pass, Some(0)),
                 Ok(Exit::Code(c)) => (Outcome::Fail, Some(c)),
@@ -1210,19 +1402,53 @@ impl<'a> Runner<'a> {
                 Err(e) => (Outcome::Error(format!("{e:#}")), None),
             };
             let stop = outcome != Outcome::Pass;
+            // an install shared by jobs whose `ignore-env` values differ ran
+            // with one set of them: say whose
+            let note = setup::ignored_env_note(s);
+            if !stop {
+                prepared.push(PreparedStep {
+                    id: s.id.clone(),
+                    how: PreparedHow::Ran,
+                });
+                if let Some(text) = &note {
+                    notes.push(setup::ReceiptNote {
+                        step: s.id.clone(),
+                        text: text.clone(),
+                    });
+                }
+            }
             out.push(StepResult {
                 label,
                 outcome,
                 exit,
                 secs: t0.elapsed().as_secs_f64(),
                 log: Some(log),
-                note: None,
+                note,
             });
             if stop {
                 break;
             }
         }
-        out
+        let artifacts = if out.iter().all(|r| r.outcome == Outcome::Pass) {
+            setup::artifact_digests(
+                &self.wt,
+                &before,
+                &setup::top_level_entries(&self.wt, &dirs),
+            )
+        } else {
+            vec![]
+        };
+        PreparedSetup {
+            receipt: PreparedReceipt {
+                template_key: key.into(),
+                source: self.fp.source.execution_commit.clone(),
+                workspace,
+                steps: prepared,
+                artifacts,
+                notes,
+            },
+            steps: out,
+        }
     }
 
     pub fn run_units(&self) -> Vec<UnitResult> {
@@ -1237,6 +1463,15 @@ impl<'a> Runner<'a> {
                 let sem = &sem;
                 let results = &results;
                 scope.spawn(move || {
+                    // an artifact step of the workflow that cannot be run
+                    // fails its units here, and only them
+                    if let Some(why) = self.refused.get(&u.wf) {
+                        results
+                            .lock()
+                            .unwrap()
+                            .push((i, self.refused_unit(i, u, why)));
+                        return;
+                    }
                     let t0 = Instant::now();
                     let lock = if self.unit_locked(u) {
                         self.lock().ok()
@@ -1249,10 +1484,10 @@ impl<'a> Runner<'a> {
                         lock: locked_at,
                         parallel: t0.elapsed().as_secs_f64() - locked_at,
                     };
-                    let r = if isolate && !CANCEL.load(Ordering::SeqCst) {
-                        self.run_unit_in_copy(i + 1, u, waited)
+                    let r = if isolate && !self.ctx.cancel.is_cancelled() {
+                        self.run_unit_in_copy(i, u, waited)
                     } else {
-                        self.run_unit(u, waited, &self.wt)
+                        self.run_unit(i, u, waited, &self.wt)
                     };
                     sem.release();
                     drop(lock);
@@ -1265,7 +1500,97 @@ impl<'a> Runner<'a> {
         r.into_iter().map(|(_, u)| u).collect()
     }
 
-    fn lock(&self) -> Result<File> {
+    /// The entries of a job that is not run, each an error that says why: one
+    /// per matrix variant (`only`: that variant alone) when the matrix is
+    /// written out, so the result has what the plan expects of the job.
+    fn refused_entries(
+        &self,
+        wf: usize,
+        id: &str,
+        why: &str,
+        only: Option<usize>,
+    ) -> Vec<JobResult> {
+        let w = &self.plan.selected[wf].wf;
+        let base = self.plan.job(wf, id).name.clone().unwrap_or(id.to_string());
+        let displays: Vec<String> = match dag::matrix_plan(self.fp.job(wf, id)) {
+            dag::MatrixPlan::Static(v) => v
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| only.is_none_or(|o| o == *i))
+                .map(|(_, c)| format!("{base} ({})", matrix::describe(c)))
+                .collect(),
+            _ => vec![base],
+        };
+        displays
+            .into_iter()
+            .map(|display| JobResult {
+                workflow: w.file.clone(),
+                job: id.to_string(),
+                display,
+                outcome: Outcome::Error(why.to_string()),
+                secs: 0.0,
+                steps: vec![],
+                cancelled: false,
+                time: None,
+            })
+            .collect()
+    }
+
+    /// The result of a unit that is not run: each of its jobs is an error that
+    /// says why.
+    fn refused_unit(&self, ui: usize, u: &Unit, why: &str) -> UnitResult {
+        let w = &self.plan.selected[u.wf].wf;
+        UnitResult {
+            unit: Some(ui),
+            workflow: w.file.clone(),
+            jobs: u
+                .jobs
+                .iter()
+                .flat_map(|id| self.refused_entries(u.wf, id, why, None))
+                .collect(),
+            waited_secs: 0.0,
+            copy_secs: None,
+            cached: None,
+            outcomes: vec![],
+        }
+    }
+
+    /// The result of `task` when its workflow has an artifact step that cannot
+    /// be run, `None` when it has none: nothing is started, and each job is an
+    /// error that says why.
+    pub(crate) fn refused_task(&self, task: &ExecutionTask) -> Option<TaskResult> {
+        let wf = self
+            .plan
+            .selected
+            .iter()
+            .position(|s| s.wf.file == task.workflow)?;
+        let why = self.refused.get(&wf)?;
+        let only = task.variant.as_ref().map(|v| v.index);
+        Some(TaskResult {
+            task: task.id.clone(),
+            jobs: task
+                .jobs
+                .iter()
+                .flat_map(|id| self.refused_entries(wf, id, why, only))
+                .collect(),
+            outcomes: task
+                .jobs
+                .iter()
+                .map(|id| JobOutcome {
+                    job: id.clone(),
+                    variant: only,
+                    status: JobStatus::Failure,
+                    outputs: Default::default(),
+                    skipped: Some(why.clone()),
+                    ancestor_failed: false,
+                })
+                .collect(),
+            receipt_ignored: None,
+            artifacts: vec![],
+        })
+    }
+
+    pub(crate) fn lock(&self) -> Result<File> {
         use fs2::FileExt;
         let f = OpenOptions::new()
             .create(true)
@@ -1313,7 +1638,7 @@ impl<'a> Runner<'a> {
                     return Ok(Some(f));
                 }
             }
-            if CANCEL.load(Ordering::SeqCst) {
+            if self.ctx.cancel.is_cancelled() {
                 return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -1348,11 +1673,12 @@ impl<'a> Runner<'a> {
     /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
     fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
         crate::git::clone_worktree(
-            &self.repo.root,
+            self.ctx,
+            &self.repo_root,
             from,
             to,
-            &self.repo.sha,
-            self.repo.link_node_modules,
+            &self.fp.source.execution_commit,
+            self.fp.config.link_node_modules,
         )?;
         let marks = self.marks(to);
         fs::create_dir_all(&marks)?;
@@ -1371,18 +1697,19 @@ impl<'a> Runner<'a> {
     fn remove_copy(&self, ws: &Path) {
         if !self.opts.keep {
             self.release_ports(ws);
-            crate::git::remove_worktree(&self.repo.root, ws, &self.opts.trash);
+            crate::git::remove_worktree(self.ctx, &self.repo_root, ws, &self.opts.trash);
         }
     }
 
     /// Run the unit in its own copy of the worktree, as each GitHub job gets its
     /// own checkout: a unit that edits tracked files for a while (a negative
     /// control, a formatter) must not change what the units beside it read.
-    fn run_unit_in_copy(&self, n: usize, u: &Unit, waited: UnitWait) -> UnitResult {
+    fn run_unit_in_copy(&self, ui: usize, u: &Unit, waited: UnitWait) -> UnitResult {
+        let n = ui + 1;
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
-            &self.repo.sha[..7],
+            &self.fp.source.execution_commit[..7],
             std::process::id()
         ));
         let t0 = Instant::now();
@@ -1392,7 +1719,7 @@ impl<'a> Runner<'a> {
                 let copy_secs = t0.elapsed().as_secs_f64();
                 UnitResult {
                     copy_secs: Some(copy_secs),
-                    ..self.run_unit(u, waited, &ws)
+                    ..self.run_unit(ui, u, waited, &ws)
                 }
             }
             Err(e) => {
@@ -1408,16 +1735,19 @@ impl<'a> Runner<'a> {
                         outcome: Outcome::Error(reason.clone()),
                         secs: 0.0,
                         steps: vec![],
+                        cancelled: false,
                         time: None,
                     })
                     .collect();
                 charge(&mut jobs, waited);
                 UnitResult {
+                    unit: Some(ui),
                     workflow: w.file.clone(),
                     jobs,
                     waited_secs: waited.total(),
                     copy_secs: None,
                     cached: None,
+                    outcomes: vec![],
                 }
             }
         };
@@ -1434,53 +1764,272 @@ impl<'a> Runner<'a> {
         if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
             && ws.join(".portool.toml").is_file()
         {
-            crate::portool::release(bin, ws);
+            crate::portool::release(self.ctx, bin, ws);
         }
     }
 
-    fn run_unit(&self, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
-        let sel = &self.plan.selected[u.wf];
-        let w = &sel.wf;
-        let mut needs_ctx = Map::new();
-        let mut jobs = Vec::new();
+    fn run_unit(&self, ui: usize, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
+        let w = &self.plan.selected[u.wf].wf;
         let locked = self.unit_locked(u);
-        for id in &u.jobs {
-            let job = self.plan.job(u.wf, id);
-            let mut job_results = self.run_job(ws, w, &sel.event, job, &needs_ctx, locked);
-            let failed = job_results
-                .iter()
-                .any(|r| r.0.outcome == Outcome::Fail || matches!(r.0.outcome, Outcome::Error(_)));
-            let all_skipped = !job_results.is_empty()
-                && job_results
-                    .iter()
-                    .all(|r| matches!(r.0.outcome, Outcome::Skip(_)));
-            let result = if failed {
-                "failure"
-            } else if all_skipped {
-                "skipped"
-            } else {
-                "success"
-            };
-            let mut outputs = Map::new();
-            for (_, o) in &job_results {
-                for (k, v) in o {
-                    outputs.insert(k.clone(), v.clone());
+        // The unit is run as its tasks, in the order the plan gives them, in
+        // the one workspace of the unit (a local run's shortcut: a task run
+        // elsewhere gets a checkout of its own). The variants of a matrix job
+        // are run together, as the job.
+        let mut inputs = TaskInputs::default();
+        let mut jobs = Vec::new();
+        let mut outcomes: Vec<JobOutcome> = Vec::new();
+        // A copy of the setup workspace is another workspace: it gets an id of
+        // its own, and the receipts of the setup are bound to it, as the copy
+        // holds what the setup made.
+        let copy_id = (ws != self.wt)
+            .then(|| setup::ensure_workspace_id(ws).ok())
+            .flatten();
+        let origin = setup::workspace_id(&self.wt);
+        // The receipts are this run's own. In the setup workspace they are
+        // believed as they are. A copy is checked once, here, before any task
+        // wrote in it: what the setup made must be in it as the receipt says;
+        // after that the tasks of the unit trust the receipt even when one of
+        // them wrote next to what the install made. A copy that does not
+        // match has its receipts checked again by each task, and ignored.
+        let mut copy_checked: HashMap<String, bool> = HashMap::new();
+        if copy_id.is_some() {
+            if let Some((m, _)) = &self.receipts {
+                for t in self.fp.tasks.iter().filter(|t| t.unit == ui) {
+                    if let Some(r) = m.get(&t.id) {
+                        copy_checked
+                            .entry(t.id.clone())
+                            .or_insert_with(|| setup::verify_artifacts(r, ws, true).is_ok());
+                    }
                 }
             }
-            needs_ctx.insert(id.clone(), json!({"result": result, "outputs": outputs}));
-            jobs.extend(job_results.drain(..).map(|r| r.0));
+        }
+        for task in self.fp.tasks.iter().filter(|t| t.unit == ui) {
+            if task.variant.as_ref().is_some_and(|v| v.index > 0) {
+                continue;
+            }
+            let receipt = self.receipts.as_ref().and_then(|(m, c)| {
+                m.get(&task.id).map(|r| match &copy_id {
+                    Some(id) if origin.as_deref() == Some(r.workspace.as_str()) => {
+                        (r.rebound(id), c)
+                    }
+                    _ => (r.clone(), c),
+                })
+            });
+            let verify = copy_id.is_some() && !copy_checked.get(&task.id).copied().unwrap_or(false);
+            match self.run_task(
+                ws,
+                task,
+                &inputs,
+                receipt.as_ref().map(|(r, c)| (r, *c)),
+                verify,
+                locked,
+                true,
+            ) {
+                Ok(r) => {
+                    for o in r.outcomes {
+                        inputs.run_cancelled |= o.status == JobStatus::Cancelled;
+                        outcomes.push(o.clone());
+                        inputs.needs.insert(o.job.clone(), o);
+                    }
+                    jobs.extend(r.jobs);
+                }
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    // The jobs of a task that could not be run failed: the
+                    // jobs that need them must see that, not a missing need.
+                    for id in &task.jobs {
+                        let o = JobOutcome {
+                            job: id.clone(),
+                            variant: None,
+                            status: JobStatus::Failure,
+                            outputs: Default::default(),
+                            skipped: Some(reason.clone()),
+                            ancestor_failed: false,
+                        };
+                        outcomes.push(o.clone());
+                        inputs.needs.insert(id.clone(), o);
+                    }
+                    // every entry of a matrix job failed, not one in its place
+                    for id in &task.jobs {
+                        let job = self.plan.job(u.wf, id);
+                        let base = job.name.clone().unwrap_or(id.clone());
+                        let displays: Vec<String> =
+                            match crate::dag::matrix_plan(self.fp.job(u.wf, id)) {
+                                crate::dag::MatrixPlan::Static(v) => v
+                                    .iter()
+                                    .map(|c| format!("{base} ({})", matrix::describe(c)))
+                                    .collect(),
+                                _ => vec![base],
+                            };
+                        for display in displays {
+                            jobs.push(JobResult {
+                                workflow: w.file.clone(),
+                                job: id.clone(),
+                                display,
+                                outcome: Outcome::Error(reason.clone()),
+                                secs: 0.0,
+                                steps: vec![],
+                                cancelled: false,
+                                time: None,
+                            });
+                        }
+                    }
+                }
+            }
         }
         charge(&mut jobs, waited);
         UnitResult {
+            unit: Some(ui),
             workflow: w.file.clone(),
             jobs,
             waited_secs: waited.total(),
             copy_secs: None,
             cached: None,
+            outcomes,
         }
     }
 
+    /// Whether a task holds the per-repository lock while it runs (see
+    /// `unit_locked`).
+    pub(crate) fn task_locked(&self, t: &ExecutionTask) -> bool {
+        t.exclusive && (!self.isolated() || !t.services.is_empty())
+    }
+
+    /// Run the jobs of `task` in `ws`, in order, against the results `inputs`
+    /// holds for the jobs it needs. `locked`: the caller holds the repository
+    /// lock. `whole_matrix`: for a task that is one variant of a matrix job,
+    /// run all the variants (as one job) instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_task(
+        &self,
+        ws: &Path,
+        task: &ExecutionTask,
+        inputs: &TaskInputs,
+        prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+        // whether to hash what the receipt describes before believing it: for
+        // a receipt that comes from outside, yes; for the run's own receipt
+        // in the workspace it was made for (or a copy checked when it was
+        // made), no
+        verify_contents: bool,
+        locked: bool,
+        whole_matrix: bool,
+    ) -> Result<TaskResult> {
+        let wi = self
+            .plan
+            .selected
+            .iter()
+            .position(|s| s.wf.file == task.workflow)
+            .with_context(|| format!("the plan has no workflow {}", task.workflow))?;
+        let sel = &self.plan.selected[wi];
+        let w = &sel.wf;
+        for id in &task.jobs {
+            let job = self.plan.job(wi, id);
+            if let Some(n) = job
+                .needs
+                .iter()
+                .find(|n| !task.jobs.contains(n) && !inputs.needs.contains_key(*n))
+            {
+                bail!(
+                    "task {} needs the result of job `{n}`; none was given",
+                    task.id
+                );
+            }
+        }
+        let only = match (&task.variant, whole_matrix) {
+            (Some(v), false) => Some(v.index),
+            _ => None,
+        };
+        // A receipt is believed only for this commit, this workspace and the
+        // template key this task's recipe has here; otherwise the task does all
+        // its setup itself and says so.
+        let mut receipt_ignored = None;
+        let places = match prepared {
+            Some((r, tctx)) => match setup::derive_in(&self.plan, &self.hoisted, task)?
+                .prepared_places(
+                    r,
+                    &self.fp.source.execution_commit,
+                    setup::workspace_id(ws).as_deref(),
+                    ws,
+                    tctx,
+                    verify_contents,
+                ) {
+                Ok(p) => p,
+                Err(why) => {
+                    receipt_ignored = Some(why);
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+        let none = HashSet::new();
+        let mut needs_ctx = inputs.context();
+        let mut jobs = Vec::new();
+        let mut outcomes = Vec::new();
+        for id in &task.jobs {
+            let job = self.plan.job(wi, id);
+            // `failure()` of a job: a job it needs, or one of theirs, failed
+            let ancestor_failed = job.needs.iter().any(|n| {
+                outcomes
+                    .iter()
+                    .find(|o: &&JobOutcome| &o.job == n)
+                    .or_else(|| inputs.needs.get(n))
+                    .is_some_and(JobOutcome::failed_or_ancestor_failed)
+            });
+            let results = self.run_job(
+                ws,
+                w,
+                &sel.event,
+                job,
+                &needs_ctx,
+                ancestor_failed,
+                inputs.run_cancelled || self.ctx.cancel.is_cancelled(),
+                places.get(id).unwrap_or(&none),
+                locked,
+                only,
+            );
+            let parts: Vec<JobOutcome> = results
+                .iter()
+                .enumerate()
+                .map(|(i, (r, o))| outcome_of(id, only.or(Some(i)), r, o))
+                .collect();
+            let outcome = match only {
+                Some(_) => parts.into_iter().next().unwrap_or_else(|| JobOutcome {
+                    job: id.clone(),
+                    variant: only,
+                    status: JobStatus::Success,
+                    outputs: Default::default(),
+                    skipped: None,
+                    ancestor_failed: false,
+                }),
+                None => combine(id, parts),
+            };
+            let outcome = JobOutcome {
+                ancestor_failed,
+                ..outcome
+            };
+            needs_ctx.insert(id.clone(), task::ctx_of(&outcome));
+            jobs.extend(results.into_iter().map(|r| r.0));
+            outcomes.push(outcome);
+        }
+        Ok(TaskResult {
+            task: task.id.clone(),
+            jobs,
+            outcomes,
+            receipt_ignored,
+            artifacts: artifact_io::published_by(
+                &self.run_dir,
+                &task.workflow,
+                &task
+                    .jobs
+                    .iter()
+                    .map(|j| dag::node_id(&task.workflow, j))
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    }
+
     /// One job, all its matrix combinations. Returns each combination's result and outputs.
+    #[allow(clippy::too_many_arguments)]
     fn run_job(
         &self,
         ws: &Path,
@@ -1488,8 +2037,16 @@ impl<'a> Runner<'a> {
         event: &str,
         job: &Job,
         needs: &Map<String, Value>,
+        // a job it needs, or one of theirs, failed
+        ancestor_failed: bool,
+        // the run was cancelled
+        run_cancelled: bool,
+        // steps (by index) the task's setup already did
+        prepared: &HashSet<usize>,
         // the unit holds the per-repository lock
         locked: bool,
+        // run only this entry of the matrix
+        only: Option<usize>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
         let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
@@ -1502,10 +2059,17 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Skip(reason),
                     secs: 0.0,
                     steps: vec![],
+                    cancelled: false,
                     time: None,
                 },
                 Map::new(),
             )
+        };
+        // the run was cancelled before this entry started
+        let cancelled_skip = |display: String| {
+            let mut r = skip(display, "cancelled".into());
+            r.0.cancelled = true;
+            r
         };
         let error = |display: String, reason: String| {
             (
@@ -1516,6 +2080,7 @@ impl<'a> Runner<'a> {
                     outcome: Outcome::Error(reason),
                     secs: 0.0,
                     steps: vec![],
+                    cancelled: false,
                     time: None,
                 },
                 Map::new(),
@@ -1527,10 +2092,33 @@ impl<'a> Runner<'a> {
             .iter()
             .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
             .collect();
-        let needs_status = if needs_of_job.values().any(|v| v["result"] != "success") {
-            Status::Failure
-        } else {
-            Status::Success
+        // The status functions of a job, as on GitHub: `success()` when every
+        // job it needs succeeded (a skipped one does not count), `failure()`
+        // when one failed, or any job further up did, `cancelled()` when the
+        // run was cancelled.
+        let results: Vec<String> = needs_of_job
+            .values()
+            .map(|v| v["result"].as_str().unwrap_or("success").to_string())
+            .collect();
+        let any_result = |r: &str| results.iter().any(|x| x == r);
+        let needs_fns = expr::StatusFns {
+            success: results.iter().all(|r| r == "success"),
+            failure: ancestor_failed || any_result("failure"),
+            cancelled: run_cancelled,
+        };
+        // why a job that is not run by its `if:` is not run
+        let why_not = || {
+            if needs_fns.success || !expr::success_gated(job.cond.as_deref()) {
+                "if: false"
+            } else if any_result("failure") {
+                "needs failed"
+            } else if any_result("cancelled") {
+                "needs cancelled"
+            } else if any_result("skipped") {
+                "needs skipped"
+            } else {
+                "if: false"
+            }
         };
         let mut ctx_map = Map::new();
         ctx_map.insert("github".into(), gh.clone());
@@ -1568,9 +2156,14 @@ impl<'a> Runner<'a> {
         let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
         let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for combo in combos {
+        let total = combos.len();
+        for (idx, combo) in combos.into_iter().enumerate() {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
+            cm.insert(
+                "strategy".into(),
+                json!({"job-index": idx, "job-total": total}),
+            );
             let mut display = {
                 let ctx = Ctx::new(&cm, Status::Success);
                 match &job.name {
@@ -1587,11 +2180,14 @@ impl<'a> Runner<'a> {
             };
             // a name over some of the matrix only: keep the entries (and their logs) apart
             if !seen.insert(display.clone()) {
-                display = format!("{display} #{}", out.len() + 1);
+                display = format!("{display} #{}", idx + 1);
                 seen.insert(display.clone());
             }
+            if only.is_some_and(|o| o != idx) {
+                continue;
+            }
             let run_it = {
-                let ctx = Ctx::new(&cm, needs_status);
+                let ctx = Ctx::with_fns(&cm, needs_fns);
                 expr::condition(job.cond.as_deref(), &ctx)
             };
             match run_it {
@@ -1599,14 +2195,7 @@ impl<'a> Runner<'a> {
                     todo.push((out.len(), cm, display));
                     out.push(None);
                 }
-                Ok(false) => out.push(Some(skip(
-                    display,
-                    if needs_status == Status::Failure {
-                        "needs failed".into()
-                    } else {
-                        "if: false".into()
-                    },
-                ))),
+                Ok(false) => out.push(Some(skip(display, why_not().into()))),
                 Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
             }
         }
@@ -1628,7 +2217,7 @@ impl<'a> Runner<'a> {
             let slot = if exclusive {
                 match self.container_slot() {
                     Ok(Some(s)) => Some(s),
-                    Ok(None) => return skip(display, "cancelled".into()),
+                    Ok(None) => return cancelled_skip(display),
                     // no lock files: run without a slot rather than not at all
                     Err(_) => None,
                 }
@@ -1636,13 +2225,13 @@ impl<'a> Runner<'a> {
                 None
             };
             let wait_slot = t_slot.elapsed().as_secs_f64();
-            if CANCEL.load(Ordering::SeqCst) {
-                return skip(display, "cancelled".into());
+            if self.ctx.cancel.is_cancelled() {
+                return cancelled_skip(display);
             }
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
             }
-            let mut r = self.run_combo(ws, w, job, cm, display, stop);
+            let mut r = self.run_combo(ws, w, job, prepared, cm, display, stop);
             drop(slot);
             drop(lock);
             let secs = r.0.secs;
@@ -1675,7 +2264,7 @@ impl<'a> Runner<'a> {
                         // the pid stays last in the name: cleanup scripts read it from there
                         let copy = self.wt.with_file_name(format!(
                             "{}-c{}-{}",
-                            &self.repo.sha[..7],
+                            &self.fp.source.execution_commit[..7],
                             self.seq.fetch_add(1, Ordering::SeqCst),
                             std::process::id()
                         ));
@@ -1700,7 +2289,10 @@ impl<'a> Runner<'a> {
         out.into_iter().flatten().collect()
     }
 
+    /// Evaluate `pairs` into `into`. Says whether a secret that cannot be
+    /// supplied was read.
     fn eval_env(
+        host: &ExecContext,
         pairs: &[(String, String)],
         cm: &Map<String, Value>,
         into: &mut Map<String, Value>,
@@ -1710,7 +2302,7 @@ impl<'a> Runner<'a> {
         for (k, v) in pairs {
             let mut ctx_map = cm.clone();
             ctx_map.insert("env".into(), Value::Object(into.clone()));
-            let ctx = Ctx::new(&ctx_map, Status::Success);
+            let ctx = Ctx::new(&ctx_map, Status::Success).with_token(host);
             let val = expr::interpolate(v, &ctx)?;
             secrets |= ctx.used_secrets.get();
             into.insert(k.clone(), Value::String(rewrite_env_value(k, &val, maps)));
@@ -1718,11 +2310,13 @@ impl<'a> Runner<'a> {
         Ok(secrets)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_combo(
         &self,
         ws: &Path,
         w: &Workflow,
         job: &Job,
+        prepared: &HashSet<usize>,
         mut cm: Map<String, Value>,
         display: String,
         // set when another entry of a fail-fast matrix failed
@@ -1739,6 +2333,7 @@ impl<'a> Runner<'a> {
             outcome,
             secs: t0.elapsed().as_secs_f64(),
             steps,
+            cancelled: false,
             time: None,
         };
 
@@ -1753,10 +2348,9 @@ impl<'a> Runner<'a> {
                 }
                 Err(e) => {
                     self.stop_services(&names);
-                    return (
-                        finish(Outcome::Error(format!("services: {e:#}")), steps, t0),
-                        Map::new(),
-                    );
+                    let mut r = finish(Outcome::Error(format!("services: {e:#}")), steps, t0);
+                    r.cancelled = self.ctx.cancel.is_cancelled();
+                    return (r, Map::new());
                 }
             }
         }
@@ -1776,7 +2370,7 @@ impl<'a> Runner<'a> {
             {
                 // before the sync: it may take a block and still fail
                 self.synced.lock().unwrap().insert(ws.to_path_buf());
-                match crate::portool::sync(bin, ws) {
+                match crate::portool::sync(self.ctx, bin, ws) {
                     Ok(v) => v,
                     Err(e) => {
                         self.stop_services(&names);
@@ -1792,8 +2386,8 @@ impl<'a> Runner<'a> {
 
         // workflow + job env
         let mut env_ctx = Map::new();
-        if let Err(e) = Self::eval_env(&w.env, &cm, &mut env_ctx, &maps)
-            .and_then(|_| Self::eval_env(&job.env, &cm, &mut env_ctx, &maps))
+        if let Err(e) = Self::eval_env(self.ctx, &w.env, &cm, &mut env_ctx, &maps)
+            .and_then(|_| Self::eval_env(self.ctx, &job.env, &cm, &mut env_ctx, &maps))
             .and_then(|_| {
                 if exclusive {
                     let fixed: Vec<u16> = env_ctx
@@ -1834,11 +2428,10 @@ impl<'a> Runner<'a> {
         );
         let tag = format!("lc{}", &compose_default["local-ci-".len()..]);
         let mut projects = vec![compose_default.clone()];
-        COMPOSE_PROJECTS
-            .lock()
-            .unwrap()
-            .push(compose_default.clone());
+        self.ctx.cancel.track_compose(compose_default.clone());
         let mut errored: Option<String> = None;
+        // the first error was the run being cancelled
+        let mut cancelled = false;
         // canirun's queue, summed over the steps
         let mut queue = Duration::ZERO;
 
@@ -1852,6 +2445,8 @@ impl<'a> Runner<'a> {
             } else {
                 raw_label
             };
+            // a label comes to result.json: the token does not
+            let label = self.hide_token(label);
             let st0 = Instant::now();
             let push = |steps: &mut Vec<StepResult>,
                         outcome: Outcome,
@@ -1868,7 +2463,7 @@ impl<'a> Runner<'a> {
                 });
             };
             stopped |= stop.is_some_and(|s| s.load(Ordering::SeqCst));
-            let status = if CANCEL.load(Ordering::SeqCst) || stopped {
+            let status = if self.ctx.cancel.is_cancelled() || stopped {
                 Status::Cancelled
             } else if failed || errored.is_some() {
                 Status::Failure
@@ -1882,7 +2477,10 @@ impl<'a> Runner<'a> {
                 step_env.insert(k.clone(), Value::String(v.clone()));
             }
             scm.insert("env".into(), Value::Object(step_env.clone()));
-            let go = expr::condition(s.cond.as_deref(), &Ctx::new(&scm, status));
+            let go = expr::condition(
+                s.cond.as_deref(),
+                &Ctx::new(&scm, status).with_token(self.ctx),
+            );
             match go {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1901,20 +2499,32 @@ impl<'a> Runner<'a> {
                     continue;
                 }
                 Err(e) => {
+                    let e = self.hide_token(format!("{e:#}"));
                     push(
                         &mut steps,
-                        Outcome::Error(format!("if: {e:#}")),
+                        Outcome::Error(format!("if: {e}")),
                         None,
                         None,
                         None,
                     );
-                    errored.get_or_insert(format!("{label}: if: {e:#}"));
+                    errored.get_or_insert(format!("{label}: if: {e}"));
                     continue;
                 }
             }
 
             if let Some(uses) = &s.uses {
-                let (outcome, note) = self.check_action(uses, s, &scm);
+                let (outcome, note) = match artifact::parse_uses(uses) {
+                    Some(Ok(kind)) => self.artifact_step(ws, w, job, &display, s, &scm, kind),
+                    Some(Err(e)) => (Outcome::Error(e), None),
+                    None => self.check_action(uses, s, &scm),
+                };
+                // what a `with:` value expanded to comes to result.json
+                let outcome = match outcome {
+                    Outcome::Error(e) => Outcome::Error(self.hide_token(e)),
+                    Outcome::Skip(e) => Outcome::Skip(self.hide_token(e)),
+                    o => o,
+                };
+                let note = note.map(|n| self.hide_token(n));
                 if let Outcome::Error(e) = &outcome {
                     errored.get_or_insert(format!("{label}: {e}"));
                 }
@@ -1937,14 +2547,12 @@ impl<'a> Runner<'a> {
                 );
                 continue;
             };
-            if let Some(k) = plan::step_key(w, job, s) {
-                if self.plan.is_setup(&k) {
-                    push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
-                    record(&mut steps_ctx, &s.id, "success", "success", Map::new());
-                    continue;
-                }
+            if prepared.contains(&n) {
+                push(&mut steps, Outcome::Skip("setup".into()), None, None, None);
+                record(&mut steps_ctx, &s.id, "success", "success", Map::new());
+                continue;
             }
-            if remote_effect(run) {
+            if crate::script::remote_effect(run) {
                 push(
                     &mut steps,
                     Outcome::Skip("pushes, publishes or deploys".into()),
@@ -1955,7 +2563,9 @@ impl<'a> Runner<'a> {
                 record(&mut steps_ctx, &s.id, "skipped", "skipped", Map::new());
                 continue;
             }
-            if global_install(run) {
+            if crate::script::global_install(run, &|c| self.ctx.find_tool(c).is_some())
+                == crate::script::Install::Needed
+            {
                 push(
                     &mut steps,
                     Outcome::Skip("installs system packages".into()),
@@ -1967,22 +2577,28 @@ impl<'a> Runner<'a> {
                 continue;
             }
             // interpolate
-            let ctx = Ctx::new(&scm, status);
+            let ctx = Ctx::new(&scm, status).with_token(self.ctx);
             let script = expr::interpolate(run, &ctx);
             let mut env_now = step_env.clone();
-            let env_res = Self::eval_env(&s.env, &scm, &mut env_now, &maps);
+            // An install that another job runs here with another shell or env
+            // is this job's own: the npm shim must not take another job's mark
+            // of it for its own.
+            if plan::step_key(w, job, s, &self.plan.ignore_env)
+                .is_some_and(|k| self.hoisted.conflicting.contains(&k))
+            {
+                env_now.insert(
+                    "LOCAL_CI_INSTALL_SCOPE".into(),
+                    Value::String(job.id.clone()),
+                );
+            }
+            let env_res = Self::eval_env(self.ctx, &s.env, &scm, &mut env_now, &maps);
             let secrets = ctx.used_secrets.get() || matches!(env_res, Ok(true));
             let (script, mut env_now) = match (script, env_res) {
                 (Ok(sc), Ok(_)) => (sc, env_now),
                 (Err(e), _) | (_, Err(e)) => {
-                    push(
-                        &mut steps,
-                        Outcome::Error(format!("{e:#}")),
-                        None,
-                        None,
-                        None,
-                    );
-                    errored.get_or_insert(format!("{label}: {e:#}"));
+                    let e = self.hide_token(format!("{e:#}"));
+                    push(&mut steps, Outcome::Error(e.clone()), None, None, None);
+                    errored.get_or_insert(format!("{label}: {e}"));
                     continue;
                 }
             };
@@ -2024,6 +2640,25 @@ impl<'a> Runner<'a> {
             } else {
                 rewrite_ports(&script, &maps)
             };
+            // A script or env that holds the token is run with the script
+            // handed over a pipe, never written to a file.
+            let token = self.ctx.github_token_if_fetched().filter(|t| !t.is_empty());
+            // (A custom shell cannot be given a pipe, see `shell_once`; it is
+            // handed a file, so only a script that holds the token is refused,
+            // not one that gets the token through its environment.)
+            let step_shell = s
+                .shell
+                .as_deref()
+                .or(job.shell.as_deref())
+                .or(w.shell.as_deref());
+            let custom_shell = !matches!(
+                step_shell.map(str::trim),
+                None | Some("bash") | Some("sh") | Some("python")
+            );
+            let piped = token.is_some_and(|t| {
+                script.contains(t)
+                    || (!custom_shell && env_now.values().any(|v| expr::to_string(v).contains(t)))
+            });
             if secrets {
                 push(
                     &mut steps,
@@ -2040,10 +2675,19 @@ impl<'a> Runner<'a> {
                 .tools
                 .join(format!("files/{}", self.seq.fetch_add(1, Ordering::SeqCst)));
             let _ = fs::create_dir_all(&files_dir);
-            let fc = |name: &str| files_dir.join(name);
-            for f in ["output", "env", "path", "summary"] {
-                let _ = File::create(fc(f));
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                let _ = fs::set_permissions(&files_dir, fs::Permissions::from_mode(0o700));
+                for f in ["output", "env", "path", "summary"] {
+                    let _ = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(files_dir.join(f));
+                }
             }
+            let fc = |name: &str| files_dir.join(name);
             let gh = scm["github"].clone();
             let mut env: Vec<(String, String)> = self.base_env(&gh, &extra_path);
             env.extend(port_env.iter().cloned());
@@ -2070,7 +2714,7 @@ impl<'a> Runner<'a> {
                 .filter(|p| !p.is_empty());
             for p in compose_projects(&script).into_iter().chain(from_env) {
                 if !projects.contains(&p) {
-                    COMPOSE_PROJECTS.lock().unwrap().push(p.clone());
+                    self.ctx.cancel.track_compose(p.clone());
                     projects.push(p);
                 }
             }
@@ -2086,13 +2730,13 @@ impl<'a> Runner<'a> {
                 .unwrap_or(remaining);
             let key = format!(
                 "local-ci {} {} {}",
-                crate::report::short(&w.file),
+                crate::report::short(&self.fp.config.default_workflows_dir, &w.file),
                 job.id,
                 label
             );
             let pkg = fs::read_to_string(ws.join(&wd).join("package.json")).ok();
             if writes_node_modules(&plan::with_scripts(&script, pkg.as_deref())) {
-                if let Err(e) = crate::git::own_node_modules(ws) {
+                if let Err(e) = crate::git::own_node_modules(self.ctx, ws) {
                     let e = format!("cannot copy node_modules: {e:#}");
                     push(&mut steps, Outcome::Error(e.clone()), None, None, None);
                     errored.get_or_insert(format!("{label}: {e}"));
@@ -2103,21 +2747,25 @@ impl<'a> Runner<'a> {
                 .shell(
                     &ws.join(&wd),
                     &script,
-                    s.shell
-                        .as_deref()
-                        .or(job.shell.as_deref())
-                        .or(w.shell.as_deref()),
+                    step_shell,
                     &env,
                     Some(timeout),
                     &log,
                     Some(key),
+                    piped,
                 )
                 .map(|(exit, queued)| {
                     queue += queued;
                     exit
                 });
+            if let Some(t) = self.ctx.github_token_if_fetched() {
+                mask_in_file(&log, t);
+            }
             let read = |f: &str| fs::read_to_string(fc(f)).unwrap_or_default();
             let mut outputs = Map::new();
+            // Later steps of the job get the value, as on GitHub; it is in
+            // memory only (the files are gone below). What leaves the job
+            // is checked at the job's outputs.
             for (k, v) in parse_file_command(&read("output")) {
                 outputs.insert(k, Value::String(v));
             }
@@ -2177,7 +2825,10 @@ impl<'a> Runner<'a> {
                         Some(log),
                         None,
                     );
-                    errored.get_or_insert("cancelled".into());
+                    if errored.is_none() {
+                        errored = Some("cancelled".into());
+                        cancelled = true;
+                    }
                 }
                 Err(e) => {
                     push(
@@ -2192,20 +2843,44 @@ impl<'a> Runner<'a> {
             }
         }
         self.stop_services(&names);
-        compose_down(&projects);
-        COMPOSE_PROJECTS
-            .lock()
-            .unwrap()
-            .retain(|p| !projects.contains(p));
+        compose_down(self.ctx, &projects);
+        self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
         let mut outputs = Map::new();
         let mut ocm = cm.clone();
         ocm.insert("steps".into(), Value::Object(steps_ctx));
         let octx = Ctx::new(&ocm, Status::Success);
+        let mut dropped = Vec::new();
         for (k, v) in &job.outputs {
             if let Ok(val) = expr::interpolate(v, &octx) {
+                // GitHub does not pass a job output that holds a secret on
+                // to the jobs that need it, and nor does this
+                if self
+                    .ctx
+                    .github_token_if_fetched()
+                    .is_some_and(|t| !t.is_empty() && val.contains(t))
+                {
+                    dropped.push(k.clone());
+                    // empty, which is what a name nobody set expands to; the
+                    // key stays, because a plan expects the job to have set it
+                    outputs.insert(k.clone(), Value::String(String::new()));
+                    continue;
+                }
                 outputs.insert(k.clone(), Value::String(val));
+            }
+        }
+        if !dropped.is_empty() {
+            let note = format!(
+                "job output {} holds the GitHub token: not passed on",
+                dropped.join(", ")
+            );
+            // on the last step: a result has as many steps as the plan has
+            if let Some(last) = steps.last_mut() {
+                last.note = Some(match last.note.take() {
+                    Some(n) => format!("{n}; {note}"),
+                    None => note,
+                });
             }
         }
         let outcome = if failed {
@@ -2218,6 +2893,7 @@ impl<'a> Runner<'a> {
             Outcome::Pass
         };
         let mut result = finish(outcome, steps, t0);
+        result.cancelled = cancelled && matches!(result.outcome, Outcome::Error(_));
         result.time = Some(JobTime {
             work_secs: (result.secs - queue.as_secs_f64()).max(0.0),
             wait_queue_secs: queue.as_secs_f64(),
@@ -2234,7 +2910,7 @@ impl<'a> Runner<'a> {
         cm: &Map<String, Value>,
     ) -> (Outcome, Option<String>) {
         let name = uses.split('@').next().unwrap_or(uses).to_ascii_lowercase();
-        let ctx = Ctx::new(cm, Status::Success);
+        let ctx = Ctx::new(cm, Status::Success).with_token(self.ctx);
         let with = |k: &str| {
             s.with
                 .iter()
@@ -2243,7 +2919,7 @@ impl<'a> Runner<'a> {
                 .filter(|v| !v.is_empty())
         };
         let tool = |bin: &str, args: &[&str]| -> Option<String> {
-            let out = Command::new(bin).args(args).output().ok()?;
+            let out = self.ctx.command(bin).args(args).output().ok()?;
             let text = String::from_utf8_lossy(&out.stdout).to_string()
                 + &String::from_utf8_lossy(&out.stderr);
             out.status
@@ -2305,27 +2981,85 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn docker_ok() -> Result<(), String> {
-        static OK: OnceLock<Result<(), String>> = OnceLock::new();
-        OK.get_or_init(|| {
-            match Command::new("docker")
-                .args(["info", "--format", "{{.ServerVersion}}"])
-                .output()
-            {
-                Ok(o) if o.status.success() => Ok(()),
-                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or("docker info failed")
-                    .to_string()),
-                Err(e) => Err(format!("docker: {e}")),
+    /// An `actions/upload-artifact@v4` or `actions/download-artifact@v4` step
+    /// of this run (see [`crate::artifact_io`]).
+    #[allow(clippy::too_many_arguments)]
+    fn artifact_step(
+        &self,
+        ws: &Path,
+        w: &Workflow,
+        job: &Job,
+        display: &str,
+        s: &Step,
+        cm: &Map<String, Value>,
+        kind: artifact::Kind,
+    ) -> (Outcome, Option<String>) {
+        let ctx = Ctx::new(cm, Status::Success).with_token(self.ctx);
+        let mut with = Vec::new();
+        for (k, v) in &s.with {
+            match expr::interpolate(v, &ctx) {
+                Ok(x) => with.push((k.clone(), x)),
+                Err(e) => return (Outcome::Error(format!("with.{k}: {e:#}")), None),
             }
-        })
-        .clone()
+        }
+        let area = artifact_io::Area::of_run(&self.run_dir, &self.fp.digest, &w.file);
+        let node = dag::node_id(&w.file, &job.id);
+        let mut holding = self
+            .fp
+            .tasks
+            .iter()
+            .filter(|t| t.workflow == w.file && t.jobs.contains(&job.id));
+        let task = match (holding.next(), holding.next()) {
+            (Some(t), None) => Some(t.id.clone()),
+            _ => None,
+        };
+        let who = artifact_io::Who {
+            job: node,
+            display: display.to_string(),
+            task,
+        };
+        let done = match kind {
+            artifact::Kind::Upload => artifact_io::upload(&area, &who, ws, &with),
+            artifact::Kind::Download => artifact_io::download(&area, ws, &with),
+        };
+        match done {
+            Ok(note) => {
+                // a step pinned to a commit runs as v4, and says so
+                let note = match s.uses.as_deref().and_then(artifact::pin_warning) {
+                    Some(w) => format!("{w}; {note}"),
+                    None => note,
+                };
+                (Outcome::Pass, Some(note))
+            }
+            Err(e) => (Outcome::Error(e), None),
+        }
     }
 
-    fn docker(args: &[&str], timeout: Duration) -> Result<String> {
-        let mut child = Command::new("docker")
+    fn docker_ok(&self) -> Result<(), String> {
+        self.docker_ok
+            .get_or_init(|| {
+                match self
+                    .ctx
+                    .command("docker")
+                    .args(["info", "--format", "{{.ServerVersion}}"])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("docker info failed")
+                        .to_string()),
+                    Err(e) => Err(format!("docker: {e}")),
+                }
+            })
+            .clone()
+    }
+
+    fn docker(&self, args: &[&str], timeout: Duration) -> Result<String> {
+        let mut child = self
+            .ctx
+            .command("docker")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2336,7 +3070,7 @@ impl<'a> Runner<'a> {
             if child.try_wait()?.is_some() {
                 break;
             }
-            if t0.elapsed() > timeout || CANCEL.load(Ordering::SeqCst) {
+            if t0.elapsed() > timeout || self.ctx.cancel.is_cancelled() {
                 let _ = child.kill();
                 bail!(
                     "docker {} did not finish in {}s",
@@ -2364,14 +3098,18 @@ impl<'a> Runner<'a> {
         cm: &Map<String, Value>,
         names: &mut Vec<String>,
     ) -> Result<(Vec<PortMap>, Map<String, Value>)> {
-        Self::docker_ok().map_err(|e| anyhow!("docker is not available ({e})"))?;
+        self.docker_ok()
+            .map_err(|e| anyhow!("docker is not available ({e})"))?;
         let ctx = Ctx::new(cm, Status::Success);
         let mut maps = Vec::new();
         let mut sctx = Map::new();
         for svc in &job.services {
             let image = expr::interpolate(&svc.image, &ctx)?;
-            if Self::docker(&["image", "inspect", &image], Duration::from_secs(30)).is_err() {
-                Self::docker(&["pull", "--quiet", &image], Duration::from_secs(600))
+            if self
+                .docker(&["image", "inspect", &image], Duration::from_secs(30))
+                .is_err()
+            {
+                self.docker(&["pull", "--quiet", &image], Duration::from_secs(600))
                     .with_context(|| format!("pull {image}"))?;
             }
             let name = format!(
@@ -2405,12 +3143,12 @@ impl<'a> Runner<'a> {
             );
             args.push(image.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            Self::docker(&refs, Duration::from_secs(120))?;
-            CONTAINERS.lock().unwrap().push(name.clone());
+            self.docker(&refs, Duration::from_secs(120))?;
+            self.ctx.cancel.track_container(name.clone());
             names.push(name.clone());
             let mut ports = Map::new();
             for (d, c) in &svc.ports {
-                let line = Self::docker(
+                let line = self.docker(
                     &["port", &name, &format!("{c}/tcp")],
                     Duration::from_secs(30),
                 )?;
@@ -2441,14 +3179,16 @@ impl<'a> Runner<'a> {
         let t0 = Instant::now();
         let limit = Duration::from_secs(180);
         loop {
-            if CANCEL.load(Ordering::SeqCst) {
+            if self.ctx.cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            let state = Self::docker(&["inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], Duration::from_secs(30))?;
+            let state = self.docker(&["inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], Duration::from_secs(30))?;
             let mut parts = state.split_whitespace();
             let (run, health) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             if run == "exited" || run == "dead" {
-                let logs = Command::new("docker")
+                let logs = self
+                    .ctx
+                    .command("docker")
                     .args(["logs", "--tail", "15", name])
                     .output()
                     .map(|o| {
@@ -2493,7 +3233,9 @@ impl<'a> Runner<'a> {
         if names.is_empty() {
             return;
         }
-        let _ = Command::new("docker")
+        let _ = self
+            .ctx
+            .command("docker")
             .arg("rm")
             .arg("-f")
             .args(names)
@@ -2501,8 +3243,124 @@ impl<'a> Runner<'a> {
             .stderr(Stdio::null())
             .status();
         let set: HashSet<&String> = names.iter().collect();
-        CONTAINERS.lock().unwrap().retain(|n| !set.contains(n));
+        self.ctx.cancel.untrack_containers(&set);
     }
+}
+
+/// A pipe for a script that holds the token, made so that neither end is ever
+/// open without close-on-exec, so that no command started by another thread
+/// can inherit an end (the write end, or the read end with the rest of the
+/// script). The write end is non-blocking (see `write_until_stopped`); the
+/// read end blocks, as the shell reads with plain blocking reads.
+///
+/// macOS: `std::io::pipe` is `pipe()` and then `fcntl(FD_CLOEXEC)`, two calls
+/// with a window between them, so a FIFO is used: it is opened with
+/// `O_CLOEXEC` in the call itself, and its name is removed as soon as both
+/// ends are open. A FIFO is not used elsewhere: on Linux, opening
+/// `/dev/fd/3` opens the FIFO again through `/proc/self/fd/3`, and a blocking
+/// `O_RDONLY` open of a FIFO waits for a writer; a small script is written
+/// and the write end closed before the shell starts, so the shell would wait
+/// for ever.
+#[cfg(target_os = "macos")]
+fn script_pipe(path: &Path) -> Result<(File, File)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let _ = fs::remove_file(path);
+    // SAFETY: plain libc calls on a NUL-terminated path; the descriptors are
+    // handed to `File`, which owns them from then on.
+    unsafe {
+        if libc::mkfifo(c.as_ptr(), 0o600) < 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot make the script pipe");
+        }
+        let r = libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+        let r_err = std::io::Error::last_os_error();
+        let w = if r >= 0 {
+            libc::open(
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        } else {
+            -1
+        };
+        let w_err = std::io::Error::last_os_error();
+        let _ = libc::unlink(c.as_ptr());
+        if r < 0 || w < 0 {
+            if r >= 0 {
+                libc::close(r);
+            }
+            if w >= 0 {
+                libc::close(w);
+            }
+            return Err(if r < 0 { r_err } else { w_err }).context("cannot open the script pipe");
+        }
+        // the shell reads with plain blocking reads
+        let fl = libc::fcntl(r, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(r, libc::F_SETFL, fl & !libc::O_NONBLOCK) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(r);
+            libc::close(w);
+            return Err(e).context("cannot set up the script pipe");
+        }
+        Ok((File::from_raw_fd(r), File::from_raw_fd(w)))
+    }
+}
+
+/// Linux and the other unixes: an anonymous pipe. The standard library makes
+/// it with `pipe2(O_CLOEXEC)` on Linux, the BSDs and the like (one call, so
+/// there is no window; see `library/std/src/sys/pal/unix/pipe.rs` in the
+/// Rust source, and `strace -e trace=pipe2` on a program that calls
+/// `std::io::pipe`).
+#[cfg(not(target_os = "macos"))]
+fn script_pipe(_path: &Path) -> Result<(File, File)> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let (r, w) = std::io::pipe().context("cannot make the script pipe")?;
+    let w = File::from(OwnedFd::from(w));
+    // SAFETY: fcntl on a descriptor `w` owns. The write end is its own open
+    // file description, so this does not touch the read end.
+    unsafe {
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot set up the script pipe");
+        }
+    }
+    Ok((File::from(OwnedFd::from(r)), w))
+}
+
+/// Write `data` to the non-blocking `w`, until it is all written, the other
+/// end is closed, or `stop` is set (the step is over). A reader that outlives
+/// its step (a background process that kept the descriptor) cannot keep this
+/// thread blocked in `write`.
+fn write_until_stopped(mut w: File, data: &[u8], stop: &AtomicBool) {
+    let mut rest = data;
+    while !rest.is_empty() && !stop.load(Ordering::SeqCst) {
+        match w.write(rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Write a file only its owner can read: step scripts may hold values that
+/// must not be shared.
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    f.write_all(content.as_bytes())
 }
 
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
@@ -2545,8 +3403,73 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests build their own commands
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    #[test]
+    // What this checks: the ends of the pipe carry close-on-exec, the write end is
+    // non-blocking and the read end blocks, no name is left behind, and what is
+    // written can be read back. It does NOT check that no other thread's exec can
+    // inherit an end: that window (between `pipe()` and `fcntl` on macOS) cannot
+    // be hit from a test, so it is closed by construction (a FIFO opened with
+    // `O_CLOEXEC` on macOS, `pipe2(O_CLOEXEC)` through std elsewhere) and reviewed
+    // in `script_pipe`, not tested.
+    fn the_script_pipe_has_cloexec_a_nonblocking_writer_and_no_name_left() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.fifo");
+        let (r, w) = script_pipe(&path).unwrap();
+        assert!(!path.exists());
+        for f in [&r, &w] {
+            let fl = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+            assert!(fl >= 0 && fl & libc::FD_CLOEXEC != 0, "{fl}");
+        }
+        // the read end blocks, the write end does not
+        let (rl, wl) = unsafe {
+            (
+                libc::fcntl(r.as_raw_fd(), libc::F_GETFL),
+                libc::fcntl(w.as_raw_fd(), libc::F_GETFL),
+            )
+        };
+        assert_eq!(rl & libc::O_NONBLOCK, 0);
+        assert_ne!(wl & libc::O_NONBLOCK, 0);
+        let mut r = r;
+        let stop = AtomicBool::new(false);
+        write_until_stopped(w, b"abc", &stop);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "abc");
+    }
+
+    #[test]
+    fn the_writer_ends_with_the_step_even_if_a_reader_outlives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, w) = script_pipe(&dir.path().join("p.fifo")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let big = vec![b'x'; 4 << 20];
+        let s2 = stop.clone();
+        let h = std::thread::spawn(move || write_until_stopped(w, &big, &s2));
+        // nobody reads: the pipe fills and the writer waits
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!h.is_finished());
+        stop.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        h.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2));
+        // `r` was held the whole time, as a background process would
+        drop(r);
+    }
+
+    #[test]
+    fn the_writer_ends_when_every_reader_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, w) = script_pipe(&dir.path().join("p.fifo")).unwrap();
+        drop(r);
+        let stop = AtomicBool::new(false);
+        write_until_stopped(w, &vec![b'x'; 1 << 20], &stop);
+    }
 
     fn job_with_secs(secs: f64) -> JobResult {
         JobResult {
@@ -2556,6 +3479,7 @@ mod tests {
             outcome: Outcome::Pass,
             secs,
             steps: vec![],
+            cancelled: false,
             time: None,
         }
     }
@@ -2926,32 +3850,73 @@ mod tests {
     }
 
     #[test]
-    fn remote_effects() {
-        assert!(remote_effect("git push origin HEAD"));
-        assert!(remote_effect(
-            "npm run build && npm publish --access public"
-        ));
-        assert!(remote_effect("gh release upload v1 a.tgz"));
-        assert!(remote_effect("aws s3 sync dist s3://bucket"));
-        assert!(!remote_effect("git diff --exit-code"));
-        assert!(!remote_effect("npm run lint"));
-        assert!(!remote_effect("echo pushing"));
-    }
-
-    #[test]
-    fn system_installs() {
-        assert!(global_install("sudo apt-get install -y jq"));
-        assert!(global_install("echo hi\n  brew install x"));
-        assert!(!global_install("npm ci"));
-        assert!(!global_install("echo sudo"));
-    }
-
-    #[test]
     fn ansi_and_slugs() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m\r"), "red");
         assert_eq!(
             slug_of("Run integration tests (1/2)"),
             "run-integration-tests-1-2"
         );
+    }
+
+    #[test]
+    fn a_task_result_survives_a_round_trip_through_json() {
+        let step = |o: Outcome, note: Option<&str>| StepResult {
+            label: "step".into(),
+            outcome: o,
+            exit: Some(1),
+            secs: 1.5,
+            log: Some(PathBuf::from("/l/log")),
+            note: note.map(String::from),
+        };
+        let job = |display: &str, o: Outcome, cancelled: bool, time: Option<JobTime>| JobResult {
+            workflow: "ci.yml".into(),
+            job: "j".into(),
+            display: display.into(),
+            outcome: o,
+            secs: 2.0,
+            steps: vec![
+                step(Outcome::Pass, Some("a note")),
+                step(Outcome::Fail, None),
+            ],
+            cancelled,
+            time,
+        };
+        let time = JobTime {
+            work_secs: 1.0,
+            wait_lock_secs: 2.0,
+            wait_slot_secs: 3.0,
+            wait_queue_secs: 4.0,
+            wait_parallel_secs: 5.0,
+        };
+        let r = crate::task::TaskResult {
+            task: "t1".into(),
+            jobs: vec![
+                job("a", Outcome::Pass, false, Some(time.clone())),
+                job("b", Outcome::Fail, true, None),
+                job("c", Outcome::Skip("why".into()), false, None),
+                job("d", Outcome::Error("boom".into()), false, None),
+            ],
+            outcomes: vec![crate::task::JobOutcome {
+                job: "j".into(),
+                variant: Some(1),
+                status: crate::task::JobStatus::Success,
+                outputs: [("k".to_string(), "v".to_string())].into(),
+                skipped: None,
+                ancestor_failed: true,
+            }],
+            receipt_ignored: Some("another commit".into()),
+            artifacts: vec!["bundle".into()],
+        };
+        let text = serde_json::to_string(&r).unwrap();
+        let back: crate::task::TaskResult = serde_json::from_str(&text).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), text);
+        assert_eq!(back.jobs[0].time, Some(time));
+        assert_eq!(back.jobs[1].outcome, Outcome::Fail);
+        assert!(back.jobs[1].cancelled && !back.jobs[0].cancelled);
+        assert_eq!(back.jobs[2].outcome, Outcome::Skip("why".into()));
+        assert_eq!(back.jobs[3].outcome, Outcome::Error("boom".into()));
+        assert_eq!(back.jobs[0].steps[0].note.as_deref(), Some("a note"));
+        assert_eq!(back.jobs[0].steps[1].note, None);
+        assert_eq!(back.artifacts, ["bundle"]);
     }
 }

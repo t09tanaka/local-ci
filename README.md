@@ -57,7 +57,7 @@ Or download a binary from the [releases](https://github.com/t09tanaka/local-ci/r
 | Command | What it does |
 |---|---|
 | `local-ci plan` | Show the workflows, units and setup steps that would run. Runs nothing. |
-| `local-ci run` | Run them and report. Exit code 0 = success, 1 = failure, 2 = error (could not check everything), 130 = interrupted. |
+| `local-ci run` | Run them and report. Exit code 0 = success (or `no_work`: the changes trigger no workflow), 1 = failure, 2 = error (could not run, or the result lacks something the plan expects), 3 = `incomplete` (what ran passed, but steps or workflows that local-ci cannot reproduce were left out, so it is not a pass; the commit status is `error`), 130 = interrupted. |
 | `local-ci status` | Record the last run's result as the `local-ci` commit status (for a commit you have pushed since). |
 
 Common options (`plan` and `run`):
@@ -86,6 +86,10 @@ the commit under test, so commit it before it takes effect.
 workflows-dirs = [".ci/workflows"]
 # Always run these, even when a recent result covers them
 no-cache = ["e2e.yml", "api-ci.yml:contract"]
+
+[setup]
+# Env names that do not change what an install does (see below)
+ignore-env = ["DATABASE_URL", "CI"]
 ```
 
 | Key | |
@@ -93,6 +97,15 @@ no-cache = ["e2e.yml", "api-ci.yml:contract"]
 | `workflows-dirs` | Directories to read workflows from, relative to the repository root. They replace `.github/workflows`; `--workflows-dir` still adds to them. Each one must hold a `.yml` / `.yaml` file at the commit. The workflows in the first one are named by their file name in the output (`ci.yml › test`), the others by their path. |
 | `no-cache` | Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never reused (see *Reused results*). |
 | `link-node-modules` | `true` to give units' copies links to setup's packages instead of a clone of each `node_modules`. Off by default. |
+| `[setup]` `ignore-env` | `env:` names left out of the keys of setup steps. Off (empty) by default. |
+
+**`[setup] ignore-env`.** An install that two jobs run in one directory with a
+different `env:` (workflow, job or step) is not shared: each job runs its own,
+so that one never sees the result of the other's. That includes variables the
+install does not read, such as a `DATABASE_URL` that only the tests use. List
+those names and jobs that differ only in them share one install, which runs
+with the value of the first job that has it. A name that does change the
+install (`NODE_ENV`) must not be listed.
 
 **`link-node-modules`.** Even a copy-on-write clone makes, and later deletes,
 one file per file, and dependencies are most of the files: in a monorepo of
@@ -154,9 +167,14 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    files are harmless. The worktree is removed afterwards.
 2. **Setup, once.** In CI every job runs `npm ci` on a fresh VM. Locally that
    would install the same dependencies once per job. Install steps
-   (`npm ci`, `pip install`, `flutter pub get`, `npx prisma generate`, ...)
+   (`npm ci`, `flutter pub get`, `npx prisma generate`, ...)
    and steps that several jobs repeat word for word at their start are run
-   once, before any job, and skipped in the jobs. Installs that happen later
+   once, before any job, and skipped in the jobs. A step whose result cannot be
+   carried to another job stays in its job: one that holds an expression,
+   an `if:` or `needs`/`matrix`-dependent env, one that needs the job's
+   services, one that writes `GITHUB_ENV`/`GITHUB_PATH`/step outputs, and
+   Python venv / `pip install` steps (the venv lives at an absolute path).
+   `local-ci plan` lists them with the reason. Installs that happen later
    anyway (a matrix job, a script that calls `npm ci`) go through an `npm`
    wrapper on `PATH`: a directory is installed once per run and lockfile, and
    later `npm ci` / `npm install` there are no-ops.
@@ -184,7 +202,7 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    all `local-ci` runs, so databases do not pile up while their tests wait
    for CPU.
 4. **Report.** One line per job, the tail of each failing step, where the logs
-   are, and the overall state: `success`, `failure` or `error`. A job that
+   are, and the overall state: `success`, `failure`, `error`, `incomplete` (parts that cannot be reproduced here were skipped, or a workflow could not be run at all; `--json` lists them under `completeness.incomplete` and the exit code is 3) or `no_work` (nothing is triggered). `success` is only for a run whose result has everything the plan expects. A job that
    waited a second or more for something says what it waited for and how long
    it really ran: `PASS  ci.yml › e2e  3m00s (ran 2m20s · waited slot 5m00s, queue 40s)`.
    The job's `time` in `result.json` and in `--json` has the same split, in
@@ -232,13 +250,75 @@ they end.
   and every place the job uses it is rewritten the same way. `docker compose -p
   <name>` and `COMPOSE_PROJECT_NAME=<name>` get a suffix of the run, so two runs
   never share a project and the clean-up never stops one you started yourself.
-- `uses:` — `actions/checkout`, caches and artifacts are skipped; `setup-node`,
+- `uses:` — `actions/upload-artifact@v4` and `actions/download-artifact@v4`
+  run for real within one run (next section); `actions/checkout` and caches
+  are skipped; `setup-node`,
   `setup-python`, `setup-go`, `setup-java`, `setup-ruby`, `flutter-action`,
   `setup-dart` and `rust-toolchain` check that the tool is installed and warn
   when its version differs. Other actions are skipped and listed under
   `not covered`.
 
-Not covered: steps that read `secrets.*` or `github.token`, steps that push,
+### Artifacts (`upload-artifact@v4`, `download-artifact@v4`)
+
+Within one workflow run, an upload copies its files into the area of its
+workflow (`<run dir>/artifacts/<workflow>/<name>/v<N>/`, `<workflow>` being the
+workflow file's path made safe as a directory name), read-only, and writes a
+receipt (name, each file's relative path, size and SHA-256, the plan digest,
+the attempt and the job) before the step completes. A download reads the
+receipt, checks every file against it and only then places the files, so a job
+that `needs` the uploading job gets exactly what was uploaded. As on GitHub,
+artifacts belong to a workflow run: two workflows may each upload a `coverage`
+without a conflict, and a job cannot download what a job of another workflow
+uploaded (it fails as not found, `pattern` included). A run is not a `success` while an
+artifact its plan requires (a literal name, a step that always runs — no `if:`,
+or one that is only `always()`, `success()`, `!cancelled()` or `true` — and
+`if-no-files-found: error`) has no receipt.
+
+A step local-ci cannot run (the table below) does not stop planning: the jobs
+of that workflow that the run would start (jobs a `--job` filter leaves out are
+not looked at; jobs whose `if:` is decided when they run are) are not run and
+are reported as an `error`, in the output and in `--json`, naming the option,
+the workflow, the job and the step. The other workflows run as usual.
+
+Units that use these actions are kept in the results cache. A kept result
+carries the artifacts its unit uploaded (receipt and files); reusing it puts
+them into the area of its workflow in the run, every file checked against its receipt first
+(the receipt then carries this run's plan digest and attempt, and
+`restored_from` says which attempt made it), and a file that does not match
+makes it a miss: the unit runs again. A unit that downloads is reused only when
+each artifact it took (named literally) is, in this run and workflow, the same artifact
+(same files, sizes and SHA-256) the result was kept against, which is the case
+when the unit that uploads it is reused too. A download by `pattern`, or by a
+name that is an expression, is never taken from the cache.
+
+| | Supported | Not supported (the workflow's jobs fail before they run) |
+|---|---|---|
+| Action | `actions/upload-artifact@v4`, `actions/download-artifact@v4`; a 40-character commit SHA is run as v4 (its version cannot be checked, so the run warns once) | other major versions (`@v3`, `@v5`), sub-actions such as `upload-artifact/merge` |
+| `name` | upload: a name without `/ \ : " < > \| * ?`, default `artifact`; download: one artifact by name | |
+| `path` (upload) | several lines, `*` `?` `**` globs, `!` exclusions, a directory takes what is under it; stored relative to the common ancestor of the lines; hidden files only with `include-hidden-files: true` | an absolute path, `..`, a backslash |
+| Multiple files | yes (sorted, each with its own size and SHA-256) | symlinks are not followed or uploaded |
+| `if-no-files-found` | `warn` (default: the step passes with a warning), `error` (the step fails), `ignore` | other values |
+| `overwrite` | a second upload of a name is a conflict by default; `overwrite: true` records a new version, and a download takes the newest | |
+| Matrix | the name must read every key of the matrix (`name: report-${{ matrix.os }}-${{ matrix.node }}`; keys that `include` only adds to a variant are not asked for) or `${{ strategy.job-index }}`; with or without `overwrite` | a name that leaves a key out, so two variants would upload one name; one that holds the whole matrix (`${{ matrix }}`, `toJSON(matrix)`), which is JSON and always fails |
+| `path` (download) | a directory under the workspace; the default is the workspace itself | an absolute path, `..`, a path through a symlink |
+| `pattern`, `merge-multiple` | yes: without `merge-multiple` each artifact goes to `<path>/<name>/`; two artifacts writing one file is an error | |
+| `retention-days` | 1 to 90, recorded in the receipt (local runs are kept until pruned) | |
+| `compression-level` | 0 to 9: accepted, no effect (files are stored as they are); recorded in the receipt | other values |
+| Across runs, GitHub's side | | `run-id`, `repository`, `github-token`, `artifact-ids`, `skip-decompress` and any other option |
+
+A download does not wait for the uploading job to finish: it needs the receipt
+only, so it must run after the job that uploads (`needs:`); a download with no
+receipt is an error that says so. Moving artifacts to and from another host is
+not part of local-ci.
+
+A step whose script holds `github.token` is run with bash, sh or python (the
+default shell is bash); the script is handed over a pipe and never written to a
+file. With another shell (`shell: pwsh {0}`, `shellcheck {0} && bash {0}`) such
+a step is not run and the run is an `error`. The value is replaced by `***` in
+logs, labels and notes; a changed form of it (base64, say) is not hidden.
+
+Not covered: steps that read a secret other than `github.token` (which gets
+this machine's `gh auth token`, never written to a file of the run), steps that push,
 publish or deploy (`git push`, `gh release`, `npm publish`, `aws`, `kubectl`,
 `terraform apply`, ...), steps that install system packages (`sudo`,
 `apt-get`, `brew install`, ...), `container:` jobs and reusable workflows. A
@@ -248,7 +328,7 @@ into a prefix of the run, so neither changes your machine.
 ## Working with other tools
 
 - **[canirun](https://github.com/t09tanaka/canirun)**: when it is installed,
-  every `run:` step outside setup is wrapped in `canirun exec`, so heavy steps
+  every `run:` step, setup included, is wrapped in `canirun exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
 - **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
   `.portool.toml`, each exclusive job without `services:` asks portool for a
@@ -257,6 +337,37 @@ into a prefix of the run, so neither changes your machine.
   a script that falls back to a fixed port (`TEST_PORT ?? 4000`) uses one no
   other worktree has. The workflow's own `env` still wins. The block is given
   back when the copy is removed. `--no-portool` turns this off.
+
+## Capturing a working directory (library)
+
+`source::capture_source` fixes the input of a run as the working directory is
+right now (staged and unstaged changes, untracked files, deletions, modes,
+symlinks, submodules, LFS payloads) in a private store, and describes it in a
+`SourceManifest`. The repository itself is only read.
+
+- The first capture of a repository copies the history of `HEAD` into a
+  private bare repository under the store, so a rewrite or `git gc` of the
+  original cannot break an export later; the next captures fetch only what is
+  new.
+- The manifest records the settings that turned the captured bytes into Git's
+  blobs (`core.autocrlf`, `core.eol`, `core.safecrlf`, the attribute rules that
+  are not in the tree, and the `filter.<name>.*` definitions in use). When the
+  repository a run happens in already reads the same values (a run in the
+  original itself always does) nothing is written. A worker whose settings
+  differ repeats them in its worktree only (`extensions.worktreeConfig` is the
+  one switch written to its shared config, and only in a clone that was not
+  captured from); if the original's own settings changed after the capture the
+  run stops with `SourceError::OriginalConfigChanged` instead of writing to
+  it. Either way `git status` agrees with the commit. One known limit: Git
+  reads `info/attributes` before `.gitattributes`, but a worker repeats those
+  rules where Git reads them last, so when they disagree about a path the
+  result is `SourceError::WorkspaceNotClean`, never silently different
+  content. A worker without the program of a filter the capture ran gets
+  `SourceError::FilterMissing` and can be left out; a workspace that Git still
+  sees as changed is `SourceError::WorkspaceNotClean`.
+- Not supported yet: shallow clones (`git fetch --unshallow` first) and
+  repositories that use SHA-256 object names. Both are refused with an
+  explicit error.
 
 ## Files
 
@@ -267,6 +378,41 @@ The cache directory is `~/Library/Caches/local-ci` on macOS and
 runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
 `result.json`), the results that may be reused (`results/<repo>/`, a day at
 most), and the locks.
+
+## Development
+
+```sh
+cargo test
+./scripts/coverage-gate.sh   # 100% line coverage on the pure modules
+```
+
+The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
+`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`) are gated on 100% line coverage over the whole test suite.
+All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
+component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
+
+```sh
+export LLVM_COV=~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-cov
+export LLVM_PROFDATA=~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-profdata
+```
+
+Mutation testing uses [cargo-schemata](https://crates.io/crates/cargo-schemata), which reruns the
+tests once per mutant. Each module is checked against the test targets that pin it (the exact
+commands are in `.github/workflows/ci.yml`):
+
+```sh
+cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
+cargo schemata --file src/artifact.rs -- --lib artifact
+```
+
+`cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is
+inside the repository. Tests that need "not a git repository" therefore set
+`GIT_CEILING_DIRECTORIES`.
+
+`cargo schemata --file` exits 0 when the glob matches nothing, so CI first runs
+`scripts/mutation-targets-check.sh <file>...` (built on `--list`) and fails if any target file
+produces no mutants, for example after a rename.
 
 ## License
 
