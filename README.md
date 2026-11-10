@@ -381,7 +381,7 @@ commands are in `.github/workflows/ci.yml`):
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
 cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
-cargo schemata --file src/artifact.rs -- --lib artifact::
+cargo schemata --file src/artifact.rs -- --lib artifact
 ```
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is
