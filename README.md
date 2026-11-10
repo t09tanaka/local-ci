@@ -324,6 +324,36 @@ runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
 `result.json`), the results that may be reused (`results/<repo>/`, a day at
 most), and the locks.
 
+## Development
+
+```sh
+cargo test
+./scripts/coverage-gate.sh   # 100% line coverage on the pure modules
+```
+
+The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
+`src/dag.rs`, `src/frozen.rs`) are gated on 100% line coverage over the whole test suite.
+All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
+component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
+
+```sh
+export LLVM_COV=~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-cov
+export LLVM_PROFDATA=~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-profdata
+```
+
+Mutation testing uses [cargo-schemata](https://crates.io/crates/cargo-schemata), which reruns the
+tests once per mutant. Each module is checked against the test targets that pin it (the exact
+commands are in `.github/workflows/ci.yml`):
+
+```sh
+cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
+```
+
+`cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is
+inside the repository. Tests that need "not a git repository" therefore set
+`GIT_CEILING_DIRECTORIES`.
+
 ## License
 
 MIT

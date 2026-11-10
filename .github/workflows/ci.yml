@@ -44,3 +44,43 @@ jobs:
         with:
           toolchain: "1.89"
       - run: cargo check --all-targets
+
+  coverage:
+    name: coverage gate (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: 100% line coverage on matrix / filter / gate / dag / frozen
+        run: ./scripts/coverage-gate.sh
+
+  # Each mutant reruns the tests, so a module is checked against the test
+  # targets that pin it. dag.rs is covered (above) but not mutation-gated yet:
+  # its survivors need more tests and a whole-suite run takes about 25 minutes.
+  mutants-pure:
+    name: mutation gate (matrix, filter, gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: zero survivors in matrix / filter / source gate
+        run: cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+
+  mutants-frozen:
+    name: mutation gate (frozen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: zero survivors in frozen
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
