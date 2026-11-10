@@ -43,6 +43,12 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// A `secret_files` capture needs a key of at least this many bytes: an empty
 /// or short key makes the recorded HMACs a guessable fingerprint of the file.
 pub const MIN_SECRET_KEY: usize = 16;
+/// The most one secret file may hold (1 MiB). A secret file is read into
+/// memory and written into the bundle as a whole; it is a key or a small
+/// configuration file, not data.
+pub const MAX_SECRET_FILE_BYTES: u64 = 1 << 20;
+/// The most the secret files of one capture may hold together (8 MiB).
+pub const MAX_SECRET_TOTAL_BYTES: u64 = 8 << 20;
 
 /// Captures are retried this many times in all before `SOURCE_BUSY`.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -186,7 +192,9 @@ pub struct SourceManifest {
 #[derive(Debug, Clone)]
 pub struct SourceSnapshot {
     pub manifest: SourceManifest,
-    /// The secret files, kept apart from the store (0600), when there are any.
+    /// The secret files, kept apart from the objects (0600), when there are
+    /// any: `<store>/secrets/<source_id>.json`, or
+    /// [`CaptureOptions::secret_bundle`] when that is set.
     pub secrets: Option<PathBuf>,
     /// Things worth saying that did not stop the capture.
     pub warnings: Vec<String>,
@@ -228,6 +236,34 @@ pub struct CaptureOptions {
     pub secret_files: Vec<SecretSpec>,
     /// The key of the `secret_files` HMACs.
     pub secret_key: Vec<u8>,
+    /// Where the secret files are looked for, when that is not the directory
+    /// that is captured: the working tree a commit was checked out from (the
+    /// capture itself then runs in a clean checkout, which has none of them).
+    /// Any directory inside that working tree; the globs are relative to its
+    /// top. The files are chosen, read and checked there exactly as a
+    /// worktree capture does in its own directory. A file of this tree that
+    /// the captured index tracks is commit content and is not taken. A file
+    /// that this tree tracks and the captured index does not (it was added
+    /// after the commit, or belongs to another branch) is in neither place:
+    /// it is not content of the commit and, being tracked where it is, not a
+    /// secret file either. A warning names it; a `required` declaration that
+    /// matches nothing else still fails. A secret file is at most
+    /// [`MAX_SECRET_FILE_BYTES`], and those of a capture together at most
+    /// [`MAX_SECRET_TOTAL_BYTES`] ([`SourceError::SecretTooLarge`]). Only
+    /// for [`capture_source`]; [`capture_directory`] refuses it when there
+    /// are `secret_files`. Without `secret_files` it has no effect.
+    pub secret_root: Option<PathBuf>,
+    /// Write the secret bundle here instead of `<store>/secrets/<source_id>.json`
+    /// (a path of the run, so that two captures of the same source do not
+    /// share a file). The file is created, never replaced: a path that exists
+    /// and a parent directory that does not are both
+    /// [`SourceError::SecretBundlePath`]. When the capture fails after the
+    /// file was written, it is removed again. Nothing is written when no
+    /// secret file was found. The directory has to be on a filesystem with
+    /// hard links, and a process that is killed during the write can leave a
+    /// `.secrets.tmp-*` file (0600, the secret files in plain) in it, which
+    /// the caller sweeps: see [`SecretBundle::save_new`].
+    pub secret_bundle: Option<PathBuf>,
     pub max_attempts: u32,
     pub hook: Option<Hook>,
 }
@@ -241,6 +277,8 @@ impl Default for CaptureOptions {
             exclude: vec![],
             secret_files: vec![],
             secret_key: vec![],
+            secret_root: None,
+            secret_bundle: None,
             max_attempts: MAX_ATTEMPTS,
             hook: None,
         }
@@ -287,6 +325,16 @@ pub enum SourceError {
     Corrupt { what: String },
     /// `secret_files` is declared with a key that is empty or too short.
     SecretKeyTooShort { len: usize },
+    /// The secret bundle cannot be written where
+    /// [`CaptureOptions::secret_bundle`] says: the file is already there, or
+    /// its directory is not.
+    SecretBundlePath { path: String, why: String },
+    /// A secret file is too large to be one: `path` holds `size` bytes, above
+    /// [`MAX_SECRET_FILE_BYTES`], or it is the file with which the secret
+    /// files of the capture come to `size` bytes together, above
+    /// [`MAX_SECRET_TOTAL_BYTES`]. `limit` is the one of the two that was
+    /// passed. The capture fails; the file is never left out instead.
+    SecretTooLarge { path: String, size: u64, limit: u64 },
     /// A shallow clone: its history is not all there to copy.
     ShallowClone,
     /// A repository that does not use SHA-1 object names.
@@ -334,6 +382,13 @@ impl fmt::Display for SourceError {
                 write!(f, "{path}: unmerged; resolve the merge before capturing")
             }
             SourceError::Corrupt { what } => write!(f, "source store: {what}"),
+            SourceError::SecretBundlePath { path, why } => {
+                write!(f, "cannot write the secret bundle to {path}: {why}")
+            }
+            SourceError::SecretTooLarge { path, size, limit } => write!(
+                f,
+                "secret file {path} is too large: {size} bytes with a limit of {limit} (per file {MAX_SECRET_FILE_BYTES}, per capture {MAX_SECRET_TOTAL_BYTES}); narrow secret_files or exclude it"
+            ),
             SourceError::SecretKeyTooShort { len } => write!(
                 f,
                 "secret_files needs a secret key of at least {MIN_SECRET_KEY} bytes (got {len})"

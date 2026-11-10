@@ -1,10 +1,13 @@
 //! `secret_files`: ignored files a run needs (a test `.env`), kept out of the
 //! store and the manifest.
 
-use super::store::{hex, unhex, write_atomic, RelPath};
+use super::store::{hex, tmp_name, unhex, write_atomic, RelPath};
+use super::SourceError;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// HMAC-SHA256 (RFC 2104).
@@ -90,9 +93,91 @@ impl SecretBundle {
         write_atomic(path, &serde_json::to_vec(self)?, 0o600)
     }
 
+    /// Save with mode 0600 at a path that must not exist yet, in a directory
+    /// that must: nothing is replaced and no directory is made. The file
+    /// appears complete or not at all.
+    ///
+    /// The content is first written to `.secrets.tmp-<pid>-<n>` in the same
+    /// directory (0600) and then linked to `path`, since a link, unlike a
+    /// rename, fails when the name is taken. Two things follow:
+    ///
+    /// - A process that is killed between that write and the removal of the
+    ///   temporary file leaves it behind: a 0600 file with the secret files
+    ///   in plain. Nothing here removes the leftovers of an earlier process;
+    ///   a caller that keeps the directory sweeps `.secrets.tmp-*` out of it.
+    /// - The directory has to be on a filesystem with hard links. Where there
+    ///   are none the write is refused ([`SourceError::SecretBundlePath`],
+    ///   saying so), and nothing is left there.
+    pub fn save_new(&self, path: &Path) -> Result<()> {
+        let dir = check_new_path(path)?;
+        let refused = |why: String| -> anyhow::Error {
+            SourceError::SecretBundlePath {
+                path: path.display().to_string(),
+                why,
+            }
+            .into()
+        };
+        let tmp = tmp_name(dir, "secrets");
+        let res = (|| -> Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&serde_json::to_vec(self)?)?;
+            f.sync_all()?;
+            // a link, unlike a rename, fails when the name is taken
+            std::fs::hard_link(&tmp, path).map_err(|e| refused(link_refusal(&e)))
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        res
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         serde_json::from_slice(&std::fs::read(path)?).context("not a secret bundle")
     }
+}
+
+/// Why the link that puts a new bundle in place failed, in words that say
+/// what to do about it.
+fn link_refusal(e: &std::io::Error) -> String {
+    let code = e.raw_os_error();
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        "the file already exists".into()
+    } else if code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP) {
+        "the filesystem of its directory has no hard links, which the write needs so that it never replaces a file; use a directory on another filesystem".into()
+    } else if code == Some(libc::EPERM) {
+        "a hard link is not supported or not permitted in its directory (the write needs one so that it never replaces a file); use another directory".into()
+    } else {
+        format!("the file could not be linked into place: {e}")
+    }
+}
+
+/// The directory of a bundle that [`SecretBundle::save_new`] may write:
+/// refused when `path` exists (as anything, a dangling symlink included) or
+/// its directory does not.
+pub(crate) fn check_new_path(path: &Path) -> Result<&Path> {
+    let refused = |why: &str| -> anyhow::Error {
+        SourceError::SecretBundlePath {
+            path: path.display().to_string(),
+            why: why.into(),
+        }
+        .into()
+    };
+    if path.file_name().is_none() {
+        return Err(refused("not the path of a file"));
+    }
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        return Err(refused("its directory does not exist"));
+    }
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(refused("the file already exists"));
+    }
+    Ok(dir)
 }
 
 #[cfg(test)]
@@ -134,5 +219,110 @@ mod debug_tests {
         assert!(shown.contains(".env"));
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains(&hex(b"hunter2-token")));
+    }
+}
+
+#[cfg(test)]
+mod save_new_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn bundle() -> SecretBundle {
+        SecretBundle::new(vec![(RelPath::new(".env"), 0o600, b"TOKEN=1\n".to_vec())])
+    }
+
+    fn why(e: anyhow::Error) -> String {
+        match e.downcast_ref::<SourceError>() {
+            Some(SourceError::SecretBundlePath { why, .. }) => why.clone(),
+            other => panic!("{other:?}: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn a_link_that_fails_says_what_is_wrong_with_the_directory() {
+        let of = |code: i32| link_refusal(&std::io::Error::from_raw_os_error(code));
+        assert_eq!(of(libc::EEXIST), "the file already exists");
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(of(code).contains("has no hard links"), "{}", of(code));
+            assert!(of(code).contains("another filesystem"), "{}", of(code));
+        }
+        assert!(of(libc::EPERM).starts_with("a hard link is not supported or not permitted"));
+        // anything else keeps what the system said, as a sentence
+        let other = of(libc::EIO);
+        assert!(
+            other.starts_with("the file could not be linked into place: "),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn a_new_file_is_written_whole_at_0600_and_no_temporary_file_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("b.json");
+        bundle().save_new(&path).unwrap();
+        assert_eq!(SecretBundle::load(&path).unwrap(), bundle());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_existing_name_is_never_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("b.json");
+        std::fs::write(&path, "kept").unwrap();
+        assert_eq!(
+            why(bundle().save_new(&path).unwrap_err()),
+            "the file already exists"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");
+        // a directory and a dangling symlink are names that are taken, too
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(
+            why(bundle().save_new(&dir).unwrap_err()),
+            "the file already exists"
+        );
+        let link = tmp.path().join("l");
+        std::os::unix::fs::symlink(tmp.path().join("target"), &link).unwrap();
+        assert_eq!(
+            why(bundle().save_new(&link).unwrap_err()),
+            "the file already exists"
+        );
+        assert!(!tmp.path().join("target").exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn the_directory_has_to_be_there_and_the_path_has_to_name_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing/b.json");
+        assert_eq!(
+            why(bundle().save_new(&path).unwrap_err()),
+            "its directory does not exist"
+        );
+        assert!(!tmp.path().join("missing").exists());
+        // a file where the directory should be
+        std::fs::write(tmp.path().join("f"), "").unwrap();
+        let under_file = tmp.path().join("f/b.json");
+        assert_eq!(
+            why(bundle().save_new(&under_file).unwrap_err()),
+            "its directory does not exist"
+        );
+        for no_name in ["/", ""] {
+            assert_eq!(
+                why(bundle().save_new(Path::new(no_name)).unwrap_err()),
+                "not the path of a file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_file_name_is_a_file_of_the_current_directory() {
+        // only the check: the directory of a relative name is `.`
+        assert_eq!(
+            check_new_path(Path::new("l1c-no-such-bundle.json")).unwrap(),
+            Path::new(".")
+        );
     }
 }
