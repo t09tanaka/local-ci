@@ -3493,3 +3493,156 @@ fn a_bundle_at_a_chosen_path_does_not_outlive_a_capture_that_fails() {
     capture_source(&f.ctx(), &f.dir, &o).unwrap_err();
     assert_eq!(names_in(&f.home.join("sources/secrets")).len(), 1);
 }
+
+#[test]
+fn a_secret_file_that_is_too_large_fails_the_capture_and_is_not_skipped() {
+    use local_ci::source::{MAX_SECRET_FILE_BYTES, MAX_SECRET_TOTAL_BYTES};
+    let p = plain_with_secrets();
+    let c = ctx(&p.home);
+    let store = p.home.join("sources");
+    let big = std::fs::File::create(p.dir.join("conf/huge.key")).unwrap();
+    big.set_len(MAX_SECRET_FILE_BYTES + 1).unwrap();
+    // optional or not: it is there, so it is not a declaration without a file
+    for required in [true, false] {
+        let o = secret_opts(vec![spec(".env", true), spec("conf/*.key", required)]);
+        let err = capture_directory(&c, &p.dir, &o).unwrap_err();
+        assert_eq!(
+            source_error(&err),
+            &SourceError::SecretTooLarge {
+                path: "conf/huge.key".into(),
+                size: MAX_SECRET_FILE_BYTES + 1,
+                limit: MAX_SECRET_FILE_BYTES
+            }
+        );
+        assert!(format!("{err:#}").contains("conf/huge.key is too large"));
+    }
+    assert!(published(&store).is_empty());
+    assert!(names_in(&store.join("secrets")).is_empty());
+    assert_no_trace(&p.home, "tr0ub4dor", None);
+
+    // each file is within its limit, all of them together are not: the same
+    // error, with the limit of the capture, in a repository as well
+    std::fs::remove_file(p.dir.join("conf/huge.key")).unwrap();
+    let f = fixture();
+    std::fs::create_dir_all(f.dir.join("keys")).unwrap();
+    let n = MAX_SECRET_TOTAL_BYTES / MAX_SECRET_FILE_BYTES;
+    for root in [&p.dir, &f.dir] {
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        for i in 0..n {
+            let part = std::fs::File::create(root.join(format!("keys/{i}.pem"))).unwrap();
+            part.set_len(MAX_SECRET_FILE_BYTES).unwrap();
+        }
+        std::fs::write(root.join("keys/z.pem"), "1").unwrap();
+    }
+    let o = secret_opts(vec![spec("keys/*.pem", true)]);
+    let want = SourceError::SecretTooLarge {
+        path: "keys/z.pem".into(),
+        size: MAX_SECRET_TOTAL_BYTES + 1,
+        limit: MAX_SECRET_TOTAL_BYTES,
+    };
+    let err = capture_directory(&c, &p.dir, &o).unwrap_err();
+    assert_eq!(source_error(&err), &want);
+    let err = capture_source(&f.ctx(), &f.dir, &o).unwrap_err();
+    assert_eq!(source_error(&err), &want);
+    assert!(published(&f.home.join("sources")).is_empty());
+
+    // exactly the limit of the capture is taken
+    std::fs::remove_file(p.dir.join("keys/z.pem")).unwrap();
+    let snap = capture_directory(&c, &p.dir, &o).unwrap();
+    assert_eq!(snap.manifest.secret_files.len() as u64, n);
+}
+
+#[test]
+fn a_file_only_the_secret_root_tracks_is_said_to_be_in_neither_place() {
+    let (f, clone) = with_clone();
+    let c = f.ctx();
+    // committed in the original after the clone was made: the captured
+    // commit does not have it, and where it is, it is not untracked
+    std::fs::create_dir_all(f.dir.join("conf")).unwrap();
+    std::fs::write(f.dir.join("conf/later.key"), KEY_SECRET).unwrap();
+    git(&f.dir, &["add", "conf/later.key"]);
+    git(&f.dir, &["commit", "-qm", "later"]);
+    std::fs::write(f.dir.join(".env"), ROOT_SECRET).unwrap();
+
+    let mut o = secret_opts(vec![
+        spec(".env", true),
+        spec("conf/*.key", false),
+        spec("nothing.pem", false),
+    ]);
+    o.secret_root = Some(f.dir.clone());
+    let snap = capture_source(&c, &clone, &o).unwrap();
+    let m = &snap.manifest;
+    assert_eq!(secret_paths(m), [".env"]);
+    assert!(!entry_paths(m).contains(&"conf/later.key".to_string()));
+    assert_eq!(
+        snap.warnings,
+        [
+            "conf/later.key is tracked in the working tree of secret_root but not in the captured commit, so it is neither content of the source nor a secret file",
+            "secret_files \"nothing.pem\" matches no file",
+        ]
+    );
+    assert_no_trace(&f.home.join("sources"), "zebra-crossing", None);
+
+    // it does not stand in for a required file
+    o.secret_files = vec![spec("conf/*.key", true)];
+    let err = capture_source(&c, &clone, &o).unwrap_err();
+    assert_eq!(
+        source_error(&err),
+        &SourceError::RequiredSecretMissing {
+            glob: "conf/*.key".into()
+        }
+    );
+}
+
+#[test]
+fn a_secret_file_is_not_written_through_a_symlink_the_commit_made() {
+    use local_ci::source::{RelPath, SecretEntry};
+    let f = fixture();
+    let c = f.ctx();
+    // the commit has `conf` as a symlink to a directory outside the
+    // workspace; the secret path below it comes from another tree
+    let outside = f.home.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.dir.join("conf")).unwrap();
+    std::os::unix::fs::symlink("sub dir", f.dir.join("inside")).unwrap();
+    git(&f.dir, &["add", "conf", "inside"]);
+    git(&f.dir, &["commit", "-qm", "links"]);
+    let mut o = opts();
+    o.secret_key = KEY.to_vec();
+    let m = capture_source(&c, &f.dir, &o).unwrap().manifest;
+    let dest = f.home.join("ws");
+    materialize_source(&c, &m, &dest).unwrap();
+    assert!(dest.join("conf").is_symlink());
+
+    for path in ["conf/prod.key", "inside/prod.key"] {
+        let path = RelPath::new(path);
+        let mut with_secret = m.clone();
+        with_secret.secret_files = vec![SecretEntry {
+            hmac: secret_digest(KEY, &path, b"S=1\n"),
+            path: path.clone(),
+        }];
+        let bundle = SecretBundle::new(vec![(path.clone(), 0o600, b"S=1\n".to_vec())]);
+        let err = materialize_secrets(&with_secret, &bundle, KEY, &dest).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<SourceError>(),
+                Some(SourceError::UnsafePath { .. })
+            ),
+            "{err:#}"
+        );
+    }
+    assert!(names_in(&outside).is_empty());
+    assert!(!dest.join("sub dir/prod.key").exists());
+
+    // the file itself: a symlink of the commit at the secret path is not
+    // written through either
+    let path = RelPath::new("link");
+    let mut with_secret = m.clone();
+    with_secret.secret_files = vec![SecretEntry {
+        hmac: secret_digest(KEY, &path, b"S=1\n"),
+        path: path.clone(),
+    }];
+    let bundle = SecretBundle::new(vec![(path, 0o600, b"S=1\n".to_vec())]);
+    assert!(materialize_secrets(&with_secret, &bundle, KEY, &dest).is_err());
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a\n");
+}

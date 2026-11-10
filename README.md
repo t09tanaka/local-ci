@@ -435,18 +435,25 @@ workspace after checking each against its HMAC.
   with an error; it is neither followed nor skipped. A `required` declaration
   that matches nothing stops it too (`SourceError::RequiredSecretMissing`); an
   optional one is a warning.
+- A secret file is at most 1 MiB and those of one capture together at most
+  8 MiB; above either the capture stops with `SourceError::SecretTooLarge`
+  (the file is not skipped).
 - `secret_root`: take the secret files from another working tree than the one
   that is captured. This is for the capture of a commit, which runs in a clean
   checkout that has none of them: point it at the tree the commit came from.
   The files are chosen, read and re-checked there by the same rules, and a
   file there that the captured commit tracks is left out as commit content.
+  A file that tree tracks and the captured commit does not is in neither
+  place (not content, not a secret file); a warning names it.
   Only for `capture_source`.
 - `secret_bundle`: write the bundle to this path instead of
   `<store>/secrets/<source_id>.json`, which two captures of the same source
   share. The file is created, never replaced, and its directory is not made:
   either case is `SourceError::SecretBundlePath`, and a capture that fails
   after writing it removes it. Nothing is written when no secret file was
-  found.
+  found. The directory has to be on a filesystem with hard links. A process
+  killed during the write can leave a `.secrets.tmp-*` file (0600, the secret
+  files in plain) next to the path: sweep those when you keep the directory.
 
 ## Files
 

@@ -209,6 +209,10 @@ struct Selection {
     /// Tracked files a `secret_files` glob matches: they are commit content,
     /// so they are taken as such (declaration index, path).
     tracked_secrets: Vec<(usize, RelPath)>,
+    /// With a `secret_root`: files a declaration matches that the working
+    /// tree there tracks and the captured index does not. They are not in
+    /// the capture at all, neither as content nor as a secret file.
+    tracked_elsewhere: Vec<(usize, RelPath)>,
 }
 
 impl Meta {
@@ -357,6 +361,7 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
     let mut secret = vec![];
     let mut secret_paths = BTreeSet::new();
     let mut tracked_secrets = vec![];
+    let mut tracked_elsewhere = vec![];
     let secret_root = o.secret_root.as_deref().unwrap_or(root);
     if !o.secrets.is_empty() {
         for p in tracked
@@ -389,6 +394,13 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
                     }
                     !is_tracked
                 });
+                // and what only that tree tracks is in neither place
+                let there: Vec<RelPath> = split_z(&og(ctx, from, &["ls-files", "-z"])?)
+                    .into_iter()
+                    .map(|rec| RelPath(rec.to_vec()))
+                    .filter(|p| !tracked_set.contains(p))
+                    .collect();
+                tracked_elsewhere = pick_secrets(o, there.iter());
                 picked
             }
         };
@@ -431,6 +443,7 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
         },
         index_bytes,
         tracked_secrets,
+        tracked_elsewhere,
     })
 }
 
@@ -712,51 +725,130 @@ fn ingest(
     }))
 }
 
+/// `name` in the directory `dir`, never through a symlink at `name`.
+fn open_at(dir: &std::fs::File, name: &[u8], flags: libc::c_int) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(name)?;
+    // SAFETY: `name` is a NUL-terminated string that outlives the call, and
+    // the descriptor that comes back is owned by nothing else.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Exactly `size` bytes of `f`, which is `p`: a file that holds more by now
+/// (or less) changed while it was read. Never more than `size + 1` bytes are
+/// taken, however much the file has grown.
+fn read_sized(f: &mut impl std::io::Read, size: u64, p: &RelPath) -> Result<Vec<u8>> {
+    let mut bytes = vec![];
+    let mut limited = std::io::Read::take(f, size + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 != size {
+        return Err(unstable(format!("{} changed while read", p.display())));
+    }
+    Ok(bytes)
+}
+
 /// One secret file of `root`: `None` when it is gone. Only a regular file
 /// that is really below `root` is read: a symlink (the file itself or a
 /// directory above it), a FIFO or a device is an error, never skipped and
-/// never followed.
-fn read_secret(root: &Path, p: &RelPath, st: &Option<Stat>) -> Result<Option<(u32, Vec<u8>)>> {
+/// never followed. The directories above it are opened one by one from
+/// `root`, each without following a symlink, and the file is opened in the
+/// last of them, so nothing that is swapped in on the way is gone through;
+/// what was opened has to be the very file that was listed (`st`).
+///
+/// A file above [`MAX_SECRET_FILE_BYTES`], or one that takes `total` (the
+/// bytes of the secret files read so far in this capture) above
+/// [`MAX_SECRET_TOTAL_BYTES`], is [`SourceError::SecretTooLarge`], said
+/// before the file is opened.
+fn read_secret(
+    root: &Path,
+    p: &RelPath,
+    st: &Option<Stat>,
+    total: &mut u64,
+) -> Result<Option<(u32, Vec<u8>)>> {
     let Some(st) = st else { return Ok(None) };
     super::store::check_safe(p)?;
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(root)?;
     for a in p.ancestors() {
-        let real_dir = std::fs::symlink_metadata(root.join(a.to_path()))
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if !real_dir {
-            return Err(SourceError::UnsafePath {
-                path: p.display(),
-                why: format!("{} is not a directory (a symlink or a file)", a.display()),
+        let name = a.0.rsplit(|&b| b == b'/').next().unwrap();
+        dir = match open_at(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(unstable(format!("{} vanished", p.display())))
             }
-            .into());
-        }
+            // a symlink is ELOOP or ENOTDIR, by platform; a file is ENOTDIR
+            Err(_) => {
+                return Err(SourceError::UnsafePath {
+                    path: p.display(),
+                    why: format!("{} is not a directory (a symlink or a file)", a.display()),
+                }
+                .into())
+            }
+        };
     }
-    let full = root.join(p.to_path());
-    let meta = std::fs::symlink_metadata(&full)?;
-    if !meta.file_type().is_file() {
-        return Err(SourceError::UnsupportedFileType {
+    let not_regular = || -> anyhow::Error {
+        SourceError::UnsupportedFileType {
             path: p.display(),
             kind: "non-regular secret file".into(),
         }
+        .into()
+    };
+    // by what was listed, before anything is opened: a FIFO or a device is
+    // not opened at all
+    // (S_IFMT and S_IFREG, whose integer type differs by platform)
+    if st.mode & 0o170000 != 0o100000 {
+        return Err(not_regular());
+    }
+    if st.size > MAX_SECRET_FILE_BYTES {
+        return Err(SourceError::SecretTooLarge {
+            path: p.display(),
+            size: st.size,
+            limit: MAX_SECRET_FILE_BYTES,
+        }
         .into());
     }
-    if Stat::of(&meta) != *st {
+    if *total + st.size > MAX_SECRET_TOTAL_BYTES {
+        return Err(SourceError::SecretTooLarge {
+            path: p.display(),
+            size: *total + st.size,
+            limit: MAX_SECRET_TOTAL_BYTES,
+        }
+        .into());
+    }
+    let name = p.0.rsplit(|&b| b == b'/').next().unwrap();
+    let mut f = match open_at(&dir, name, libc::O_RDONLY | libc::O_NONBLOCK) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(unstable(format!("{} vanished", p.display())))
+        }
+        // a symlink: ELOOP (EMLINK on some systems)
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) => {
+            return Err(not_regular())
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // the whole stat, not only which file it is: the size that was checked
+    // above is the size of what is read
+    if Stat::of(&f.metadata()?) != *st {
         return Err(unstable(format!("{} changed", p.display())));
     }
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&full)?;
-    let opened = f.metadata()?;
-    if opened.ino() != st.ino || opened.dev() != st.dev {
-        return Err(unstable(format!("{} was replaced", p.display())));
-    }
-    let mut bytes = vec![];
-    std::io::Read::read_to_end(&mut f, &mut bytes)?;
-    let after = std::fs::symlink_metadata(&full)?;
-    if Stat::of(&after) != *st || bytes.len() as u64 != st.size {
+    let bytes = read_sized(&mut f, st.size, p)?;
+    if Stat::of(&f.metadata()?) != *st {
         return Err(unstable(format!("{} changed while read", p.display())));
     }
+    *total += st.size;
     Ok(Some((0o600, bytes)))
 }
 
@@ -1698,8 +1790,11 @@ fn read_all(
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut secrets = vec![];
+    // of this attempt: the next one starts from nothing
+    let mut secret_bytes = 0u64;
     for (i, p) in &meta.secret {
-        if let Some((mode, bytes)) = read_secret(secret_root, p, &meta.secret_stats[p])? {
+        let st = &meta.secret_stats[p];
+        if let Some((mode, bytes)) = read_secret(secret_root, p, st, &mut secret_bytes)? {
             secrets.push((*i, p.clone(), mode, bytes));
         }
     }
@@ -1913,8 +2008,13 @@ fn finish(
             .filter(|s| !s.is_empty())
     });
 
-    let (secret_files, bundle_files) =
-        secret_entries(opts, p.read.secrets, &p.sel.tracked_secrets, &mut warnings)?;
+    let (secret_files, bundle_files) = secret_entries(
+        opts,
+        p.read.secrets,
+        &p.sel.tracked_secrets,
+        &p.sel.tracked_elsewhere,
+        &mut warnings,
+    )?;
 
     let entries = p.read.entries;
     let mut submodules: Vec<SubmoduleRef> = p.submodules.into_iter().map(|s| s.0).collect();
@@ -1985,16 +2085,25 @@ type BundleFile = (RelPath, u32, Vec<u8>);
 
 /// The manifest entries and the bundle content of the secret files that were
 /// read. A declaration that matched nothing fails the capture when it is
-/// `required` and is a warning otherwise.
+/// `required` and is a warning otherwise. `elsewhere` are the files that
+/// only the working tree of a `secret_root` tracks: they are in neither
+/// place, which the warning says instead of "matches no file".
 fn secret_entries(
     opts: &CaptureOptions,
     read: Vec<(usize, RelPath, u32, Vec<u8>)>,
     tracked: &[(usize, RelPath)],
+    elsewhere: &[(usize, RelPath)],
     warnings: &mut Vec<String>,
 ) -> Result<(Vec<SecretEntry>, Vec<BundleFile>)> {
     for (_, path) in tracked {
         warnings.push(format!(
             "{} is tracked, so it is commit content and not a secret file",
+            path.display()
+        ));
+    }
+    for (_, path) in elsewhere {
+        warnings.push(format!(
+            "{} is tracked in the working tree of secret_root but not in the captured commit, so it is neither content of the source nor a secret file",
             path.display()
         ));
     }
@@ -2006,7 +2115,9 @@ fn secret_entries(
                 }
                 .into());
             }
-            warnings.push(format!("secret_files {:?} matches no file", spec.glob));
+            if elsewhere.iter().all(|s| s.0 != i) {
+                warnings.push(format!("secret_files {:?} matches no file", spec.glob));
+            }
         }
     }
     let mut secret_files = vec![];
@@ -2093,7 +2204,7 @@ pub fn capture_directory(
             Ok((_meta, read, lfs)) => {
                 let entries = read.entries;
                 let (secret_files, bundle_files) =
-                    secret_entries(opts, read.secrets, &[], &mut warnings)?;
+                    secret_entries(opts, read.secrets, &[], &[], &mut warnings)?;
                 let m = seal_manifest(SourceManifest {
                     schema_version: SCHEMA_VERSION,
                     source_id: String::new(),
@@ -2146,7 +2257,7 @@ mod read_secret_tests {
         let st = std::fs::metadata(root.join(p.to_path()))
             .ok()
             .map(|m| Stat::of(&m));
-        let e = read_secret(root, &p, &st).unwrap_err();
+        let e = read_secret(root, &p, &st, &mut 0).unwrap_err();
         e.downcast_ref::<SourceError>()
             .unwrap_or_else(|| panic!("{e:#}"))
             .clone()
@@ -2159,11 +2270,11 @@ mod read_secret_tests {
         std::fs::create_dir_all(root.join("conf/deep")).unwrap();
         std::fs::write(root.join("conf/deep/a.key"), "k1\n").unwrap();
         let p = RelPath::new("conf/deep/a.key");
-        let got = read_secret(root, &p, &lstat(root, &p)).unwrap();
+        let got = read_secret(root, &p, &lstat(root, &p), &mut 0).unwrap();
         assert_eq!(got, Some((0o600, b"k1\n".to_vec())));
         // gone when it was listed: nothing, and `required` decides
         assert_eq!(
-            read_secret(root, &RelPath::new("conf/none"), &None).unwrap(),
+            read_secret(root, &RelPath::new("conf/none"), &None, &mut 0).unwrap(),
             None
         );
     }
@@ -2229,7 +2340,145 @@ mod read_secret_tests {
         let st = lstat(root, &p);
         std::fs::write(root.join("b.key"), "two\n").unwrap();
         std::fs::rename(root.join("b.key"), root.join("a.key")).unwrap();
-        let e = read_secret(root, &p, &st).unwrap_err();
+        let e = read_secret(root, &p, &st, &mut 0).unwrap_err();
         assert!(e.downcast_ref::<Unstable>().is_some(), "{e:#}");
+    }
+
+    fn sized(root: &Path, name: &str, len: u64) -> RelPath {
+        let f = std::fs::File::create(root.join(name)).unwrap();
+        f.set_len(len).unwrap();
+        RelPath::new(name)
+    }
+
+    #[test]
+    fn a_file_above_the_limit_is_refused_and_one_at_the_limit_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let at = sized(root, "at.key", MAX_SECRET_FILE_BYTES);
+        let over = sized(root, "over.key", MAX_SECRET_FILE_BYTES + 1);
+        let mut total = 0;
+        let got = read_secret(root, &at, &lstat(root, &at), &mut total).unwrap();
+        assert_eq!(got.unwrap().1.len() as u64, MAX_SECRET_FILE_BYTES);
+        assert_eq!(total, MAX_SECRET_FILE_BYTES);
+        let e = read_secret(root, &over, &lstat(root, &over), &mut total).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<SourceError>(),
+            Some(&SourceError::SecretTooLarge {
+                path: "over.key".into(),
+                size: MAX_SECRET_FILE_BYTES + 1,
+                limit: MAX_SECRET_FILE_BYTES
+            })
+        );
+        // nothing of it was counted
+        assert_eq!(total, MAX_SECRET_FILE_BYTES);
+    }
+
+    #[test]
+    fn the_files_of_one_capture_are_refused_when_they_pass_the_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let big = sized(root, "big.key", MAX_SECRET_FILE_BYTES);
+        let one = sized(root, "one.key", 1);
+        let st = lstat(root, &big);
+        let mut total = 0;
+        for _ in 0..MAX_SECRET_TOTAL_BYTES / MAX_SECRET_FILE_BYTES {
+            read_secret(root, &big, &st, &mut total).unwrap().unwrap();
+        }
+        // exactly the limit is still fine; one byte more is not
+        assert_eq!(total, MAX_SECRET_TOTAL_BYTES);
+        let e = read_secret(root, &one, &lstat(root, &one), &mut total).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<SourceError>(),
+            Some(&SourceError::SecretTooLarge {
+                path: "one.key".into(),
+                size: MAX_SECRET_TOTAL_BYTES + 1,
+                limit: MAX_SECRET_TOTAL_BYTES
+            })
+        );
+        assert_eq!(total, MAX_SECRET_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn a_file_that_grew_after_it_was_listed_is_a_change_and_is_not_read_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.key"), "one\n").unwrap();
+        let p = RelPath::new("a.key");
+        let st = lstat(root, &p);
+        // appended in place: the same file, more bytes
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("a.key"))
+            .unwrap();
+        f.write_all(&vec![b'x'; 4 * MAX_SECRET_FILE_BYTES as usize])
+            .unwrap();
+        drop(f);
+        let mut total = 0;
+        let e = read_secret(root, &p, &st, &mut total).unwrap_err();
+        assert!(e.downcast_ref::<Unstable>().is_some(), "{e:#}");
+        assert_eq!(total, 0);
+    }
+
+    /// A reader that counts what is asked of it.
+    struct Endless(u64);
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            buf.fill(7);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn a_file_that_grows_while_it_is_read_is_cut_one_byte_past_its_size() {
+        let p = RelPath::new("a.key");
+        // it grows without end: one byte past the size is all that is taken
+        let mut grows = Endless(0);
+        let e = read_sized(&mut grows, 10, &p).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<Unstable>().map(|u| u.0.as_str()),
+            Some("a.key changed while read")
+        );
+        assert_eq!(grows.0, 11);
+        // shorter than listed is a change too
+        let e = read_sized(&mut &b"12345"[..], 10, &p).unwrap_err();
+        assert!(e.downcast_ref::<Unstable>().is_some(), "{e:#}");
+        assert_eq!(read_sized(&mut &b"12345"[..], 5, &p).unwrap(), b"12345");
+        assert_eq!(read_sized(&mut &b""[..], 0, &p).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_directory_that_is_swapped_for_a_symlink_after_the_listing_is_not_gone_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("conf/a.key"), "in\n").unwrap();
+        std::fs::write(outside.join("a.key"), "out\n").unwrap();
+        let p = RelPath::new("conf/a.key");
+        let st = lstat(&root, &p);
+        std::fs::rename(root.join("conf"), root.join("was")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("conf")).unwrap();
+        let e = read_secret(&root, &p, &st, &mut 0).unwrap_err();
+        assert!(
+            matches!(
+                e.downcast_ref::<SourceError>(),
+                Some(SourceError::UnsafePath { .. })
+            ),
+            "{e:#}"
+        );
+        // a FIFO is refused by what was listed, without being opened
+        let fifo = std::ffi::CString::new(root.join("was/p.key").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let p = RelPath::new("was/p.key");
+        let e = read_secret(&root, &p, &lstat(&root, &p), &mut 0).unwrap_err();
+        assert!(
+            matches!(
+                e.downcast_ref::<SourceError>(),
+                Some(SourceError::UnsupportedFileType { .. })
+            ),
+            "{e:#}"
+        );
     }
 }

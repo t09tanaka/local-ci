@@ -96,6 +96,18 @@ impl SecretBundle {
     /// Save with mode 0600 at a path that must not exist yet, in a directory
     /// that must: nothing is replaced and no directory is made. The file
     /// appears complete or not at all.
+    ///
+    /// The content is first written to `.secrets.tmp-<pid>-<n>` in the same
+    /// directory (0600) and then linked to `path`, since a link, unlike a
+    /// rename, fails when the name is taken. Two things follow:
+    ///
+    /// - A process that is killed between that write and the removal of the
+    ///   temporary file leaves it behind: a 0600 file with the secret files
+    ///   in plain. Nothing here removes the leftovers of an earlier process;
+    ///   a caller that keeps the directory sweeps `.secrets.tmp-*` out of it.
+    /// - The directory has to be on a filesystem with hard links. Where there
+    ///   are none the write is refused ([`SourceError::SecretBundlePath`],
+    ///   saying so), and nothing is left there.
     pub fn save_new(&self, path: &Path) -> Result<()> {
         let dir = check_new_path(path)?;
         let refused = |why: String| -> anyhow::Error {
@@ -115,10 +127,7 @@ impl SecretBundle {
             f.write_all(&serde_json::to_vec(self)?)?;
             f.sync_all()?;
             // a link, unlike a rename, fails when the name is taken
-            std::fs::hard_link(&tmp, path).map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => refused("the file already exists".into()),
-                _ => refused(e.to_string()),
-            })
+            std::fs::hard_link(&tmp, path).map_err(|e| refused(link_refusal(&e)))
         })();
         let _ = std::fs::remove_file(&tmp);
         res
@@ -126,6 +135,21 @@ impl SecretBundle {
 
     pub fn load(path: &Path) -> Result<Self> {
         serde_json::from_slice(&std::fs::read(path)?).context("not a secret bundle")
+    }
+}
+
+/// Why the link that puts a new bundle in place failed, in words that say
+/// what to do about it.
+fn link_refusal(e: &std::io::Error) -> String {
+    let code = e.raw_os_error();
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        "the file already exists".into()
+    } else if code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP) {
+        "the filesystem of its directory has no hard links, which the write needs so that it never replaces a file; use a directory on another filesystem".into()
+    } else if code == Some(libc::EPERM) {
+        "a hard link is not supported or not permitted in its directory (the write needs one so that it never replaces a file); use another directory".into()
+    } else {
+        format!("the file could not be linked into place: {e}")
     }
 }
 
@@ -212,6 +236,23 @@ mod save_new_tests {
             Some(SourceError::SecretBundlePath { why, .. }) => why.clone(),
             other => panic!("{other:?}: {e:#}"),
         }
+    }
+
+    #[test]
+    fn a_link_that_fails_says_what_is_wrong_with_the_directory() {
+        let of = |code: i32| link_refusal(&std::io::Error::from_raw_os_error(code));
+        assert_eq!(of(libc::EEXIST), "the file already exists");
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(of(code).contains("has no hard links"), "{}", of(code));
+            assert!(of(code).contains("another filesystem"), "{}", of(code));
+        }
+        assert!(of(libc::EPERM).starts_with("a hard link is not supported or not permitted"));
+        // anything else keeps what the system said, as a sentence
+        let other = of(libc::EIO);
+        assert!(
+            other.starts_with("the file could not be linked into place: "),
+            "{other}"
+        );
     }
 
     #[test]

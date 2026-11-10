@@ -21,6 +21,12 @@
     commit content and is left out with the usual warning. Files of the
     checkout itself that a declaration matches are still kept out of the
     source, and are not the secret. `capture_directory` refuses the option.
+    A file that tree tracks and the captured commit does not (added after
+    the commit, or on another branch) is in neither place: not content, and
+    not a secret file since it is tracked where it is. The warning of an
+    optional declaration names it and says so instead of "matches no file";
+    a `required` declaration that matches nothing else is still
+    `RequiredSecretMissing`.
   - `CaptureOptions::secret_bundle: Option<PathBuf>` writes the secret bundle
     to a path of the caller's (one per run) instead of
     `<store>/secrets/<source_id>.json`. The file is created at 0600 and never
@@ -29,17 +35,36 @@
     `SourceError::SecretBundlePath { path, why }`, said before anything is
     read and checked again at the write. When the capture fails after the
     file was written, it is removed. `SecretBundle::save_new` is that write.
-    With the option unset nothing changes.
+    With the option unset nothing changes. Two caveats of that write: the
+    content goes through a temporary `.secrets.tmp-<pid>-<n>` (0600, the
+    secret files in plain) in the same directory, which a process killed
+    mid-write leaves behind, so a caller that keeps the directory sweeps
+    `.secrets.tmp-*`; and the directory has to be on a filesystem with hard
+    links (the error says so where there are none).
   - A secret file is now read only when every directory above it, below the
     root, is a real directory (`SourceError::UnsafePath` otherwise), and
     through a descriptor that does not follow a symlink; a symlink, a FIFO or
     a device at the path was an error before and still is, now also for a
     FIFO, socket or device inside an ignored directory, which used to pass
-    for a file that is not there.
+    for a file that is not there. The directories are opened one by one from
+    the root (`openat`, no symlink followed) and the file is opened in the
+    last of them, so a directory swapped for a symlink between the check and
+    the read is not gone through; the opened file has to have the whole stat
+    of the one that was listed.
+  - A secret file is at most 1 MiB (`source::MAX_SECRET_FILE_BYTES`) and
+    those of one capture together at most 8 MiB
+    (`source::MAX_SECRET_TOTAL_BYTES`). Above either, the capture fails with
+    the new `SourceError::SecretTooLarge { path, size, limit }` before the
+    file is opened; it is never skipped. `limit` says which of the two was
+    passed; for the total, `size` is the sum up to and including `path`.
+    A file is read to at most one byte past the size it was listed with, so
+    one that grows meanwhile is a change (retried, then `SOURCE_BUSY`), not
+    an unbounded read. Before, a secret file of any size was read into memory.
   This is a breaking change for external code: `CaptureOptions` has two new
   public fields, so a struct literal without `..CaptureOptions::default()`
   adds `secret_root: None, secret_bundle: None`, and an exhaustive `match` on
-  `SourceError` adds the `SecretBundlePath` arm.
+  `SourceError` adds the `SecretBundlePath` and `SecretTooLarge` arms. A
+  capture whose secret files are above the new limits now fails.
 - `exec::Opts` has a new field `executor: Option<Arc<dyn StepExecutor>>`
   (`src/step_executor.rs`). When set, every step is handed to it as a
   `StepRequest` (key, argv, cwd, env, log, timeout, script pipe, cancel
