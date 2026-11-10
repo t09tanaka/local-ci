@@ -110,6 +110,7 @@ fn opts(cache: &Path) -> Opts {
     Opts {
         parallel: 2,
         traffic_controller: None,
+        executor: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,

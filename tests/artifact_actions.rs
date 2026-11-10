@@ -124,6 +124,7 @@ fn lab_opts(tmp: &common::Tmp, parallel: usize) -> Opts {
     Opts {
         parallel,
         traffic_controller: None,
+        executor: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,

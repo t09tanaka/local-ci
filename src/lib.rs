@@ -24,6 +24,7 @@ mod run;
 mod script;
 pub mod setup;
 pub mod source;
+pub mod step_executor;
 pub mod task;
 pub mod template;
 pub mod tree;
@@ -38,6 +39,7 @@ pub use run::{
     publish_target, resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions,
     RunReport, Target,
 };
+pub use step_executor::{ScriptPipe, StepExecutor, StepExit, StepRequest};
 pub use task::{
     aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,
 };

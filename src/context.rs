@@ -48,11 +48,18 @@ impl CancelHandle {
         self.0.cancelled.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn track_pgid(&self, pg: i32) {
+    /// Make [`CancelHandle::cancel`] signal this process group until it is
+    /// untracked. `pg` must be the pid of a process group leader and greater
+    /// than 1: anything else is ignored, so that `killpg(0)` or `killpg(1)`
+    /// can never signal local-ci's own group or init's.
+    pub fn track_pgid(&self, pg: i32) {
+        if pg <= 1 {
+            return;
+        }
         self.0.pgids.lock().unwrap().push(pg);
     }
 
-    pub(crate) fn untrack_pgid(&self, pg: i32) {
+    pub fn untrack_pgid(&self, pg: i32) {
         self.0.pgids.lock().unwrap().retain(|&p| p != pg);
     }
 
@@ -221,5 +228,18 @@ mod tests {
         let ctx = ExecContext::new([("ONLY".to_string(), "1".to_string())].into());
         let out = ctx.command("/usr/bin/env").output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ONLY=1\n");
+    }
+
+    #[test]
+    fn only_a_group_leader_pid_above_one_is_tracked() {
+        let c = CancelHandle::new();
+        for pg in [i32::MIN, -1, 0, 1] {
+            c.track_pgid(pg);
+        }
+        assert!(c.0.pgids.lock().unwrap().is_empty());
+        c.track_pgid(2);
+        assert_eq!(*c.0.pgids.lock().unwrap(), vec![2]);
+        c.untrack_pgid(2);
+        assert!(c.0.pgids.lock().unwrap().is_empty());
     }
 }
