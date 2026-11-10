@@ -330,7 +330,6 @@ into a prefix of the run, so neither changes your machine.
 - **[task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller)**: when it is installed,
   every `run:` step, setup included, is wrapped in `task-traffic-controller exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
-  The old name `canirun` is still found when the new one is not installed, for now.
 - **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
   `.portool.toml`, each exclusive job without `services:` asks portool for a
   port block of its own

@@ -816,59 +816,42 @@ fn fake_controller(d: &Demo, bin: &Path, name: &str) {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn run_with_controllers(names: &[&str]) -> (Demo, Output) {
-    let d = demo("app/lib.sh");
-    let bin = d.home.join("bin");
-    for n in names {
-        fake_controller(&d, &bin, n);
-    }
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let o = local_ci_path(
-        &d,
-        &path,
-        &["run", "--no-status", "--no-cache", "-j", "lint"],
-    );
-    (d, o)
-}
-
 #[test]
-fn the_new_controller_name_is_preferred_over_the_old_one() {
-    let (d, o) = run_with_controllers(&["task-traffic-controller", "canirun"]);
-    assert!(o.status.success(), "{}", stdout(&o));
-    assert!(d.home.join("task-traffic-controller.argv").is_file());
-    assert!(!d.home.join("canirun.argv").exists());
-}
-
-#[test]
-fn the_old_controller_name_is_used_when_it_is_the_only_one() {
-    let (d, o) = run_with_controllers(&["canirun"]);
-    assert!(o.status.success(), "{}", stdout(&o));
-    assert!(d.home.join("canirun.argv").is_file());
-}
-
-#[test]
-fn no_controller_flag_has_an_old_name_that_help_does_not_show() {
-    for flag in ["--no-traffic-controller", "--no-canirun"] {
+fn the_controller_is_found_by_its_new_name_only() {
+    for (name, used) in [("task-traffic-controller", true), ("canirun", false)] {
         let d = demo("app/lib.sh");
         let bin = d.home.join("bin");
-        fake_controller(&d, &bin, "task-traffic-controller");
+        fake_controller(&d, &bin, name);
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let o = local_ci_path(
             &d,
             &path,
-            &["run", "--no-status", "--no-cache", flag, "-j", "lint"],
+            &["run", "--no-status", "--no-cache", "-j", "lint"],
         );
-        assert!(o.status.success(), "{flag}: {}", stdout(&o));
-        assert!(
-            !d.home.join("task-traffic-controller.argv").exists(),
-            "{flag}"
-        );
+        assert!(o.status.success(), "{name}: {}", stdout(&o));
+        assert_eq!(d.home.join(format!("{name}.argv")).exists(), used, "{name}");
     }
+}
+
+#[test]
+fn only_the_new_no_controller_flag_exists() {
+    let d = demo("app/lib.sh");
+    let bin = d.home.join("bin");
+    fake_controller(&d, &bin, "task-traffic-controller");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let args = |f| ["run", "--no-status", "--no-cache", f, "-j", "lint"];
+    let o = local_ci_path(&d, &path, &args("--no-traffic-controller"));
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(!d.home.join("task-traffic-controller.argv").exists());
+    let o = local_ci_path(&d, &path, &args("--no-canirun"));
+    assert!(!o.status.success());
     let help = Command::new(env!("CARGO_BIN_EXE_local-ci"))
         .args(["run", "--help"])
         .output()
         .unwrap();
     let help = stdout(&help);
-    assert!(help.contains("--no-traffic-controller"), "{help}");
-    assert!(!help.contains("canirun"), "{help}");
+    assert!(
+        help.contains("--no-traffic-controller") && !help.contains("canirun"),
+        "{help}"
+    );
 }

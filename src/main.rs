@@ -78,7 +78,7 @@ struct RunArgs {
     #[arg(long)]
     parallel: Option<usize>,
     /// Do not wrap steps in `task-traffic-controller exec`
-    #[arg(long, alias = "no-canirun")]
+    #[arg(long)]
     no_traffic_controller: bool,
     /// Do not give jobs that start containers or test servers a port block from portool
     #[arg(long)]

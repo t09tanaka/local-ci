@@ -370,21 +370,19 @@ pub fn compose_projects(script: &str) -> Vec<String> {
     out
 }
 
-/// The line prefixes task-traffic-controller puts on its own output: its name,
-/// and the old name `canirun` it still answers to. The one place that knows them.
-const CONTROLLER_PREFIXES: [&str; 2] = ["task-traffic-controller: ", "canirun: "];
+/// The prefix task-traffic-controller puts on its own output lines. The one
+/// place that knows it.
+const CONTROLLER_PREFIX: &str = "task-traffic-controller: ";
 
 /// A line of task-traffic-controller's own output, not the command's.
 fn is_controller_line(line: &str) -> bool {
-    CONTROLLER_PREFIXES.iter().any(|p| line.starts_with(p))
+    line.starts_with(CONTROLLER_PREFIX)
 }
 
 /// Its ledger lock timing out, so the command never ran.
 fn is_ledger_timeout_line(line: &str) -> bool {
-    CONTROLLER_PREFIXES.iter().any(|p| {
-        line.strip_prefix(p)
-            .is_some_and(|r| r.starts_with("ledger: timed out"))
-    })
+    line.strip_prefix(CONTROLLER_PREFIX)
+        .is_some_and(|r| r.starts_with("ledger: timed out"))
 }
 
 /// The log written since `from` holds only task-traffic-controller's own lines, ending in its
@@ -3690,19 +3688,15 @@ mod tests {
     }
 
     #[test]
-    fn both_names_prefix_the_controllers_own_lines() {
-        for p in ["task-traffic-controller", "canirun"] {
-            assert!(is_controller_line(&format!("{p}: waiting 0:00 (queue)")));
-            assert!(is_ledger_timeout_line(&format!(
-                "{p}: ledger: timed out after 10s"
-            )));
-            assert!(!is_ledger_timeout_line(&format!("{p}: waiting")));
-            let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("l");
-            fs::write(&log, format!("{p}: ledger: timed out after 10s\n")).unwrap();
-            assert!(ledger_timed_out(&log, 0));
-        }
-        assert!(!is_controller_line("npm ERR! canirun: x"));
+    fn only_the_controllers_prefix_marks_its_own_lines() {
+        let p = "task-traffic-controller";
+        assert!(is_controller_line(&format!("{p}: waiting 0:00 (queue)")));
+        assert!(is_ledger_timeout_line(&format!(
+            "{p}: ledger: timed out after 10s"
+        )));
+        assert!(!is_ledger_timeout_line(&format!("{p}: waiting")));
+        assert!(!is_controller_line("canirun: waiting"));
+        assert!(!is_ledger_timeout_line("canirun: ledger: timed out"));
         assert!(!is_ledger_timeout_line("ledger: timed out"));
     }
 

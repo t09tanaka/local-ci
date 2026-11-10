@@ -697,7 +697,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         let traffic_controller = if a.no_traffic_controller {
             None
         } else {
-            ctx.find_traffic_controller()
+            ctx.find_tool("task-traffic-controller")
         };
         let parallel = a.parallel.unwrap_or(if traffic_controller.is_some() {
             fp.units.len().clamp(1, 16)

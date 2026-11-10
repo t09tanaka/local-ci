@@ -195,12 +195,6 @@ impl ExecContext {
     }
 
     /// An executable on this context's `PATH`, or in `~/.cargo/bin`.
-    /// `task-traffic-controller`, else its old name `canirun`.
-    pub fn find_traffic_controller(&self) -> Option<PathBuf> {
-        self.find_tool("task-traffic-controller")
-            .or_else(|| self.find_tool("canirun"))
-    }
-
     pub fn find_tool(&self, name: &str) -> Option<PathBuf> {
         for d in self.var("PATH").unwrap_or("").split(':') {
             if d.is_empty() {
@@ -221,42 +215,11 @@ impl ExecContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::Path};
 
     #[test]
     fn a_command_sees_the_context_env_and_not_the_processs() {
         let ctx = ExecContext::new([("ONLY".to_string(), "1".to_string())].into());
         let out = ctx.command("/usr/bin/env").output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ONLY=1\n");
-    }
-
-    #[test]
-    fn the_new_controller_name_wins_over_the_old_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let mk = |n: &str| fs::write(dir.path().join(n), "").unwrap();
-        let env = |home: &Path| {
-            ExecContext::new(
-                [
-                    (
-                        "PATH".to_string(),
-                        dir.path().to_string_lossy().into_owned(),
-                    ),
-                    ("HOME".to_string(), home.to_string_lossy().into_owned()),
-                ]
-                .into(),
-            )
-        };
-        let nowhere = dir.path().join("nohome");
-        assert_eq!(env(&nowhere).find_traffic_controller(), None);
-        mk("canirun");
-        assert_eq!(
-            env(&nowhere).find_traffic_controller(),
-            Some(dir.path().join("canirun"))
-        );
-        mk("task-traffic-controller");
-        assert_eq!(
-            env(&nowhere).find_traffic_controller(),
-            Some(dir.path().join("task-traffic-controller"))
-        );
     }
 }
