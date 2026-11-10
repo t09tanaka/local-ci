@@ -31,16 +31,44 @@ struct RawSource {
     secret_files: Option<Vec<RawSecret>>,
 }
 
-/// `"glob"` or `{ glob = "...", required = true }`.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// `"glob"` or `{ glob = "...", required = true }`. The table form refuses a
+/// key it does not know: `requird = true` must not read as `required = false`.
+#[derive(Debug)]
 enum RawSecret {
     Glob(String),
-    Full {
-        glob: String,
-        #[serde(default)]
-        required: bool,
-    },
+    Full { glob: String, required: bool },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecretTable {
+    glob: String,
+    #[serde(default)]
+    required: bool,
+}
+
+impl<'de> Deserialize<'de> for RawSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = RawSecret;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a glob, or a table with `glob` and `required`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RawSecret, E> {
+                Ok(RawSecret::Glob(v.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, m: A) -> Result<RawSecret, A::Error> {
+                let t =
+                    RawSecretTable::deserialize(serde::de::value::MapAccessDeserializer::new(m))?;
+                Ok(RawSecret::Full {
+                    glob: t.glob,
+                    required: t.required,
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// `[source]`: what a capture of the working directory takes and leaves.
@@ -240,6 +268,34 @@ mod tests {
         ] {
             assert!(parse(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn secret_files_take_a_glob_or_a_table_and_refuse_a_typo() {
+        let c = parse(
+            "[source]\nsecret_files = [\".env\", { glob = \".env.test\", required = true }, { glob = \"x\" }]\n",
+        )
+        .unwrap();
+        let got: Vec<(&str, bool)> = c
+            .source
+            .secret_files
+            .iter()
+            .map(|s| (s.glob.as_str(), s.required))
+            .collect();
+        assert_eq!(got, [(".env", false), (".env.test", true), ("x", false)]);
+        for text in [
+            "[source]\nsecret_files = [{ glob = \".env\", requird = true }]",
+            "[source]\nsecret_files = [{ required = true }]",
+            "[source]\nsecret_files = [5]",
+        ] {
+            let e = format!("{:#}", parse(text).unwrap_err());
+            assert!(e.starts_with(".local-ci.toml: "), "{text}: {e}");
+        }
+        let e = format!(
+            "{:#}",
+            parse("[source]\nsecret_files = [{ glob = \".env\", requird = true }]").unwrap_err()
+        );
+        assert!(e.contains("unknown field `requird`"), "{e}");
     }
 
     #[test]

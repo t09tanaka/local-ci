@@ -1547,6 +1547,116 @@ fn a_tracked_file_that_matches_secret_files_is_commit_content_and_warns() {
     publishable(&c, &f.dir, &SourceInfo::of(m), &head).unwrap();
 }
 
+fn clone_of(f: &Fixture, name: &str) -> PathBuf {
+    let fresh = f.home.join(name);
+    git(
+        f.dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    fresh
+}
+
+fn has(dir: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", sha])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn the_index_tree_reaches_the_worker_so_that_what_was_staged_can_be_told() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let itree = m.index_tree.clone().unwrap();
+    let head = m.original_head.clone().unwrap();
+    let fresh = clone_of(&f, "fresh");
+    assert!(!has(&fresh, &format!("{itree}^{{tree}}")));
+
+    let bundle = export_objects(&c, &m).unwrap();
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    assert!(has(&fresh, &format!("{itree}^{{tree}}")));
+    // `git diff --cached` of the original, from the worker
+    let staged = git_out(&fresh, &["diff", "--name-only", &head, &itree]);
+    assert_eq!(staged, "staged.txt\nstaged_then_changed.txt");
+    let want = git_out(&f.dir, &["diff", "--cached", "--name-only"]);
+    assert_eq!(staged, want);
+    // a commit of its own, with no parent, under a ref of its own
+    let r = format!("refs/local-ci/index/{}", m.source_id);
+    assert_eq!(
+        git_out(&fresh, &["rev-parse", &format!("{r}^{{tree}}")]),
+        itree
+    );
+    assert_eq!(git_out(&fresh, &["rev-list", "--count", &r]), "1");
+    assert!(!git_out(&f.dir, &["for-each-ref"]).contains("local-ci"));
+
+    // exporting again, also from several threads at once, gives a bundle that
+    // imports the same way
+    let results: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4).map(|_| s.spawn(|| export_objects(&c, &m))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let again = clone_of(&f, "again");
+    for r in results {
+        import_objects(&c, &again, &r.unwrap(), &m).unwrap();
+    }
+    assert!(has(&again, &format!("{itree}^{{tree}}")));
+}
+
+#[test]
+fn a_bundle_without_the_index_tree_is_not_taken_for_the_capture() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let private = private_repo_of(&f.home);
+    // only the snapshot, as a bundle made without the index commit has it
+    let old = f.home.join("old.bundle");
+    git(
+        &private,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            old.to_str().unwrap(),
+            &format!("refs/local-ci/snapshots/{}", m.source_id),
+        ],
+    );
+    let fresh = clone_of(&f, "fresh");
+    let err = import_objects(&c, &fresh, &old, &m).unwrap_err();
+    assert!(format!("{err}").contains("no index tree"), "{err}");
+
+    // the manifest names a tree that is not the one the bundle carries
+    let bundle = export_objects(&c, &m).unwrap();
+    let mut other = m.clone();
+    other.index_tree = other.worktree_tree.clone();
+    let other = seal_manifest(other);
+    let err = import_objects(&c, &fresh, &bundle, &other).unwrap_err();
+    assert!(format!("{err}").contains("index tree"), "{err}");
+    // an index tree that is not in the store cannot be exported
+    let mut gone = m.clone();
+    gone.index_tree = Some("0123456789012345678901234567890123456789".into());
+    let err = export_objects(&c, &gone).unwrap_err();
+    assert!(format!("{err:#}").contains("index tree"), "{err:#}");
+    // and one that is not an id at all is refused before git sees it
+    let mut odd = m.clone();
+    odd.index_tree = Some("--output=x".into());
+    let odd = seal_manifest(odd);
+    assert!(format!("{}", export_objects(&c, &odd).unwrap_err()).contains("not a tree id"));
+    assert!(
+        format!("{}", import_objects(&c, &fresh, &bundle, &odd).unwrap_err())
+            .contains("not a tree id")
+    );
+}
+
 #[test]
 fn a_manifest_that_is_not_verified_or_names_odd_ids_is_not_imported() {
     let f = fixture();

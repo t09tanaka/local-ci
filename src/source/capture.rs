@@ -1446,6 +1446,23 @@ fn index_tree(
 }
 
 fn synthetic_commit(ctx: &ExecContext, git_dir: &Path, tree: &str, parent: &str) -> Result<String> {
+    fixed_commit(ctx, git_dir, tree, Some(parent), "local-ci source snapshot")
+}
+
+/// A commit with no parent that holds the index tree, so that a bundle can
+/// carry the tree (a bundle holds commits, not bare trees). The same tree is
+/// the same commit.
+pub(super) fn index_commit(ctx: &ExecContext, git_dir: &Path, tree: &str) -> Result<String> {
+    fixed_commit(ctx, git_dir, tree, None, "local-ci index snapshot")
+}
+
+fn fixed_commit(
+    ctx: &ExecContext,
+    git_dir: &Path,
+    tree: &str,
+    parent: Option<&str>,
+    message: &str,
+) -> Result<String> {
     // fixed author and dates: the same content is the same commit
     let who = OsStr::new("local-ci");
     let mail = OsStr::new("local-ci@localhost");
@@ -1458,20 +1475,12 @@ fn synthetic_commit(ctx: &ExecContext, git_dir: &Path, tree: &str, parent: &str)
         ("GIT_COMMITTER_EMAIL", mail),
         ("GIT_COMMITTER_DATE", date),
     ];
-    let out = pg(
-        ctx,
-        git_dir,
-        &[
-            "commit-tree",
-            tree,
-            "-p",
-            parent,
-            "-m",
-            "local-ci source snapshot",
-        ],
-        &env,
-        None,
-    )?;
+    let mut args = vec!["commit-tree", tree];
+    if let Some(p) = parent {
+        args.extend(["-p", p]);
+    }
+    args.extend(["-m", message]);
+    let out = pg(ctx, git_dir, &args, &env, None)?;
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 

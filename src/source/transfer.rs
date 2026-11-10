@@ -29,7 +29,20 @@ fn check_ids(m: &SourceManifest) -> Result<()> {
             bail!("not a commit id: {sha:?}");
         }
     }
+    if let Some(t) = m
+        .index_tree
+        .iter()
+        .chain(m.worktree_tree.iter())
+        .find(|t| !is_hex40(t))
+    {
+        bail!("not a tree id: {t:?}");
+    }
     Ok(())
+}
+
+/// The ref that holds the commit wrapped around the index tree of a source.
+fn index_ref(source_id: &str) -> String {
+    format!("refs/local-ci/index/{source_id}")
 }
 
 fn snapshot_ref(source_id: &str) -> String {
@@ -89,6 +102,22 @@ pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -
     };
     let dir = holder(ctx, store, m)?;
     let mut refs = vec![snapshot_ref(&m.source_id)];
+    // The index tree (what is staged) goes along in a commit of its own, so
+    // that the worker can tell what was staged (`git diff --cached`).
+    if let Some(tree) = &m.index_tree {
+        pg(
+            ctx,
+            &dir,
+            &["cat-file", "-e", &format!("{tree}^{{tree}}")],
+            &[],
+            None,
+        )
+        .with_context(|| format!("the index tree of {} is not in this store", m.source_id))?;
+        let c = super::capture::index_commit(ctx, &dir, tree)?;
+        let r = index_ref(&m.source_id);
+        pg(ctx, &dir, &["update-ref", &r, &c], &[], None)?;
+        refs.push(r);
+    }
     for sub in dirty_submodules(store, m)? {
         let r = snapshot_ref(&sub.source_id);
         let from = holder(ctx, store, &sub)?;
@@ -161,21 +190,15 @@ pub fn import_objects(
     )
     .context("the bundle does not fit this clone (its base is missing)")?;
     // the snapshot of `m`, and those of its dirty submodules
-    let refspec = "+refs/local-ci/snapshots/*:refs/local-ci/snapshots/*";
-    git_run(
-        ctx,
-        &pre,
-        &[
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--no-write-fetch-head",
-            &bundle.to_string_lossy(),
-            refspec,
-        ],
-        &[],
-        None,
-    )?;
+    let refspecs = [
+        "+refs/local-ci/snapshots/*:refs/local-ci/snapshots/*",
+        "+refs/local-ci/index/*:refs/local-ci/index/*",
+    ];
+    let mut fetch = vec!["fetch", "-q", "--no-tags", "--no-write-fetch-head"];
+    let bundle_path = bundle.to_string_lossy();
+    fetch.push(&bundle_path);
+    fetch.extend(refspecs);
+    git_run(ctx, &pre, &fetch, &[], None)?;
     let got = String::from_utf8_lossy(&git_run(
         ctx,
         &pre,
@@ -198,6 +221,31 @@ pub fn import_objects(
         if &t != tree {
             return Err(SourceError::Corrupt {
                 what: format!("commit {commit} has tree {t}, the manifest says {tree}"),
+            }
+            .into());
+        }
+    }
+    // the index tree came along (in the commit of its own ref) and is the one
+    // the manifest names
+    if let Some(tree) = &m.index_tree {
+        let c = git_run(
+            ctx,
+            &pre,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", index_ref(&m.source_id)),
+            ],
+            &[],
+            None,
+        )
+        .map_err(|_| SourceError::Corrupt {
+            what: format!("the bundle has no index tree for {}", m.source_id),
+        })?;
+        let got = String::from_utf8_lossy(&c).trim().to_string();
+        if &got != tree {
+            return Err(SourceError::Corrupt {
+                what: format!("the index tree is {got}, the manifest says {tree}"),
             }
             .into());
         }
