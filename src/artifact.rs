@@ -101,6 +101,32 @@ pub fn stored_rel(path: &str) -> Result<String, String> {
     Ok(rel)
 }
 
+/// `path` without the workspace in front: `<workspace>/x` is `x` and the
+/// workspace itself is the root (empty). A path that is not under the
+/// workspace is taken as it is, so an absolute one is refused by
+/// [`normalize_rel`]. Upload and download both read their paths this way.
+pub fn workspace_rel(path: &str, workspace: &str) -> Result<String, String> {
+    let ws = workspace.trim_end_matches('/');
+    let inside = if ws.is_empty() {
+        path
+    } else if path == ws {
+        ""
+    } else {
+        path.strip_prefix(ws)
+            .and_then(|r| r.strip_prefix('/'))
+            .unwrap_or(path)
+    };
+    normalize_rel(inside)
+}
+
+/// The name an artifact step has once its expressions are expanded. Every
+/// name that reaches the file system passes here, whether or not the plan
+/// could check it: a name that still holds `${{` is not exempt.
+pub fn runtime_name(name: &str) -> Result<String, String> {
+    validate_name(name)?;
+    normalize_rel(name)
+}
+
 /// One line of an upload's `path:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
@@ -122,14 +148,7 @@ pub fn path_lines(input: &str, workspace: &str) -> Result<Vec<Line>, String> {
             Some(b) => (true, b.trim()),
             None => (false, t),
         };
-        let inside = if workspace.is_empty() {
-            body
-        } else {
-            body.strip_prefix(workspace)
-                .and_then(|r| r.strip_prefix('/'))
-                .unwrap_or(body)
-        };
-        let rel = normalize_rel(inside)?;
+        let rel = workspace_rel(body, workspace)?;
         let pattern = if rel.is_empty() {
             "**".to_string()
         } else {
@@ -333,6 +352,17 @@ pub fn decide_version(name: &str, latest: Option<u32>, overwrite: bool) -> Resul
     }
 }
 
+/// The version a new upload takes after finding the one it chose already
+/// taken (another upload of the name claimed it a moment earlier): with
+/// `overwrite` the next one, otherwise the conflict.
+pub fn version_after_race(name: &str, taken: u32, overwrite: bool) -> Result<u32, String> {
+    if overwrite {
+        Ok(taken + 1)
+    } else {
+        decide_version(name, Some(taken), false)
+    }
+}
+
 /// An option that is `true` or `false`; absent is `false`.
 pub fn parse_bool(key: &str, v: Option<&str>) -> Result<bool, String> {
     match v.map(str::trim) {
@@ -373,6 +403,23 @@ const DOWNLOAD_KEYS: &[&str] = &["name", "path", "pattern", "merge-multiple"];
 /// would upload the same name). A value that holds an expression is checked
 /// when it is known, at run time.
 pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> Result<(), String> {
+    validate_inner(kind, with, in_matrix, false)
+}
+
+/// [`validate_with`] for a step about to run, its values expanded: the name is
+/// checked whatever it holds, and `path` is left to the code that reads it
+/// against the workspace (an absolute path inside it is what
+/// `${{ github.workspace }}/x` expands to).
+pub fn validate_run(kind: Kind, with: &[(String, String)]) -> Result<(), String> {
+    validate_inner(kind, with, false, true)
+}
+
+fn validate_inner(
+    kind: Kind,
+    with: &[(String, String)],
+    in_matrix: bool,
+    run: bool,
+) -> Result<(), String> {
     let allowed = match kind {
         Kind::Upload => UPLOAD_KEYS,
         Kind::Download => DOWNLOAD_KEYS,
@@ -390,7 +437,9 @@ pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> 
         }
     }
     let name = get(with, "name");
-    if let Some(n) = name.filter(|n| literal(n)) {
+    if run {
+        name.map(runtime_name).transpose()?;
+    } else if let Some(n) = name.filter(|n| literal(n)) {
         validate_name(n)?;
     }
     match kind {
@@ -398,7 +447,7 @@ pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> 
             let Some(path) = get(with, "path") else {
                 return Err("`path` is required".into());
             };
-            if literal(path) {
+            if !run && literal(path) {
                 path_lines(path, "")?;
             }
             missing_policy(get(with, "if-no-files-found"))?;
@@ -406,7 +455,7 @@ pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> 
             parse_bool("include-hidden-files", get(with, "include-hidden-files"))?;
             parse_retention(get(with, "retention-days"))?;
             let shown = name.unwrap_or("artifact");
-            if in_matrix && !(shown.contains("${{") && shown.contains("matrix.")) {
+            if !run && in_matrix && !(shown.contains("${{") && shown.contains("matrix.")) {
                 return Err(format!(
                     "the name `{shown}` is the same in every variant of the matrix; put the variant in it (`name: report-${{{{ matrix.os }}}}`)"
                 ));
@@ -417,7 +466,7 @@ pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> 
                 return Err("`name` and `pattern` cannot both be set".into());
             }
             parse_bool("merge-multiple", get(with, "merge-multiple"))?;
-            if let Some(p) = get(with, "path").filter(|p| literal(p)) {
+            if let Some(p) = get(with, "path").filter(|p| !run && literal(p)) {
                 normalize_rel(p)?;
             }
         }
@@ -498,6 +547,90 @@ pub fn target_rel(dir: &str, file: &str) -> Result<String, String> {
     } else {
         format!("{dir}/{f}")
     })
+}
+
+/// What a receipt says against what the download asked for: `(name, version,
+/// plan digest)` of the directory it was read from and of the current run
+/// against the same three in the receipt.
+pub fn check_receipt(want: (&str, u32, &str), got: (&str, u32, &str)) -> Result<(), String> {
+    if want.0 != got.0 {
+        return Err(format!(
+            "the receipt in the directory of `{}` is of the artifact `{}`",
+            want.0, got.0
+        ));
+    }
+    if want.1 != got.1 {
+        return Err(format!(
+            "the receipt of `{}` is of version {}, not of the version {} it was read from",
+            want.0, got.1, want.1
+        ));
+    }
+    if want.2 != got.2 {
+        return Err(format!(
+            "the receipt of `{}` is of another run (plan {}, this run's is {})",
+            want.0, got.2, want.2
+        ));
+    }
+    Ok(())
+}
+
+/// A stored file against its receipt entry: `(size, sha256)`.
+pub fn check_digest(
+    file: &str,
+    artifact: &str,
+    want: (u64, &str),
+    got: (u64, &str),
+) -> Result<(), String> {
+    if want == got {
+        return Ok(());
+    }
+    Err(format!(
+        "`{file}` of artifact `{artifact}` does not match its receipt (size {} against {}, sha256 {} against {})",
+        got.0, want.0, got.1, want.1
+    ))
+}
+
+/// Whether the paths a download would write can all be written: no path
+/// twice, none that differs from another only in case (the same file on a
+/// case-insensitive file system, the default of macOS), none that is a file
+/// where another is under it as a directory.
+pub fn find_collision(dests: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeMap::new();
+    for d in dests {
+        if let Some(prev) = seen.insert(d.to_lowercase(), d) {
+            return Err(if prev == d {
+                format!("two files would both write `{d}`")
+            } else {
+                format!("`{prev}` and `{d}` differ only in case, which is one file on a case-insensitive file system")
+            });
+        }
+    }
+    for d in dests {
+        let folded = d.to_lowercase();
+        for (i, _) in folded.match_indices('/') {
+            if let Some(file) = seen.get(&folded[..i]) {
+                return Err(format!(
+                    "`{file}` is a file, and `{d}` needs it as a directory"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an upload of `name` takes the place of an artifact that is there
+/// under a name that differs from it only in case.
+pub fn name_collision(existing: &[String], name: &str) -> Result<(), String> {
+    let folded = name.to_lowercase();
+    match existing
+        .iter()
+        .find(|e| e.as_str() != name && e.to_lowercase() == folded)
+    {
+        Some(e) => Err(format!(
+            "an artifact named `{e}` is there, and `{name}` differs from it only in case, which is one name on a case-insensitive file system"
+        )),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -617,8 +750,10 @@ mod tests {
             ]
         );
         // a path inside the workspace is taken relative to it
-        let l = path_lines("/ws/dist\n/ws\n/wsx/y", "/ws").unwrap_err();
+        let l = path_lines("/ws/dist\n/wsx/y", "/ws").unwrap_err();
         assert!(l.contains("absolute"));
+        // the workspace itself, with no slash, is the root
+        assert_eq!(path_lines("/ws", "/ws").unwrap()[0].pattern, "**");
         let l = path_lines("/ws/dist\n/ws/\n", "/ws").unwrap();
         assert_eq!(l[0].pattern, "dist");
         assert_eq!(l[1].pattern, "**");
@@ -1006,5 +1141,130 @@ mod tests {
         assert!(target_rel("out", "../y").is_err());
         assert!(target_rel("out", "/y").is_err());
         assert!(target_rel("out", "").is_err());
+    }
+    #[test]
+    fn a_path_is_read_the_same_for_upload_and_download() {
+        assert_eq!(workspace_rel("/ws/x/y", "/ws").unwrap(), "x/y");
+        assert_eq!(workspace_rel("/ws", "/ws").unwrap(), "");
+        assert_eq!(workspace_rel("/ws/", "/ws").unwrap(), "");
+        assert_eq!(workspace_rel("/ws/x", "/ws/").unwrap(), "x");
+        assert_eq!(workspace_rel("x/./y", "/ws").unwrap(), "x/y");
+        assert_eq!(workspace_rel("", "/ws").unwrap(), "");
+        assert_eq!(workspace_rel("a/b", "").unwrap(), "a/b");
+        // still outside after stripping, or only the same prefix
+        assert!(workspace_rel("/ws/../x", "/ws")
+            .unwrap_err()
+            .contains("`..`"));
+        assert!(workspace_rel("/wsx/y", "/ws")
+            .unwrap_err()
+            .contains("absolute"));
+        assert!(workspace_rel("/etc/x", "/ws")
+            .unwrap_err()
+            .contains("absolute"));
+        assert!(workspace_rel("/x", "").unwrap_err().contains("absolute"));
+    }
+
+    #[test]
+    fn a_name_is_checked_after_expansion_even_with_an_expression_left_in() {
+        assert_eq!(runtime_name("report-1").unwrap(), "report-1");
+        for bad in [
+            "",
+            "..",
+            "a/b",
+            "../x",
+            "${{ x }}/../..",
+            "a\\b",
+            "a:b",
+            "x\0y",
+        ] {
+            assert!(runtime_name(bad).is_err(), "{bad:?}");
+        }
+        // the plan skips a name that holds an expression; the run does not
+        assert!(validate_with(
+            Kind::Upload,
+            &w(&[("name", "${{ x }}/y"), ("path", "a")]),
+            false
+        )
+        .is_ok());
+        assert!(runtime_name("${{ x }}/y").is_err());
+        assert_eq!(runtime_name("${{ x }}").unwrap(), "${{ x }}");
+    }
+
+    #[test]
+    fn a_receipt_must_be_of_what_was_asked_for() {
+        let ok = ("n", 2, "sha256:p");
+        assert!(check_receipt(ok, ok).is_ok());
+        let e = check_receipt(ok, ("m", 2, "sha256:p")).unwrap_err();
+        assert!(e.contains("`n`") && e.contains("artifact `m`"), "{e}");
+        let e = check_receipt(ok, ("n", 3, "sha256:p")).unwrap_err();
+        assert!(e.contains("version 3") && e.contains("version 2"), "{e}");
+        let e = check_receipt(ok, ("n", 2, "sha256:q")).unwrap_err();
+        let ok = e.contains("another run") && e.contains("sha256:q") && e.contains("sha256:p");
+        assert!(ok, "{e}");
+    }
+
+    #[test]
+    fn a_stored_file_must_match_its_entry() {
+        assert!(check_digest("f", "n", (3, "aa"), (3, "aa")).is_ok());
+        let e = check_digest("f", "n", (3, "aa"), (4, "aa")).unwrap_err();
+        assert!(e.contains("size 4 against 3"), "{e}");
+        let e = check_digest("f", "n", (3, "aa"), (3, "bb")).unwrap_err();
+        let ok = e.contains("sha256 bb against aa") && e.contains("`f` of artifact `n`");
+        assert!(ok, "{e}");
+    }
+
+    #[test]
+    fn paths_that_would_be_one_file_are_a_collision() {
+        assert!(find_collision(&[]).is_ok());
+        assert!(find_collision(&s(&["a", "b/x", "c/y", "c/d/e", "ab"])).is_ok());
+        let e = find_collision(&s(&["a", "b", "a"])).unwrap_err();
+        assert_eq!(e, "two files would both write `a`");
+        let e = find_collision(&s(&["Out/A.txt", "out/a.txt"])).unwrap_err();
+        let ok = e.contains("`Out/A.txt`") && e.contains("`out/a.txt`") && e.contains("case");
+        assert!(ok, "{e}");
+        // a file where another needs a directory, in either order and in any case
+        for order in [["a", "a/b"], ["a/b", "a"], ["A", "a/b"], ["a/b/c", "A/B"]] {
+            let e = find_collision(&s(&order)).unwrap_err();
+            assert!(e.contains("as a directory"), "{order:?}: {e}");
+        }
+        // a sibling with the same start is not a parent
+        assert!(find_collision(&s(&["ab", "a/b", "a/b2"])).is_ok());
+    }
+
+    #[test]
+    fn an_artifact_name_that_differs_only_in_case_is_a_collision() {
+        let have = s(&["Report", "other"]);
+        assert!(name_collision(&have, "Report").is_ok());
+        assert!(name_collision(&have, "fresh").is_ok());
+        assert!(name_collision(&[], "x").is_ok());
+        let e = name_collision(&have, "report").unwrap_err();
+        let ok = e.contains("`Report`") && e.contains("`report`") && e.contains("case");
+        assert!(ok, "{e}");
+        assert!(name_collision(&have, "OTHER").is_err());
+    }
+
+    #[test]
+    fn a_race_for_a_version_overwrites_onto_the_next_or_conflicts() {
+        assert_eq!(version_after_race("n", 3, true), Ok(4));
+        let e = version_after_race("n", 3, false).unwrap_err();
+        assert!(e.contains("already uploaded") && e.contains("`n`"), "{e}");
+    }
+
+    #[test]
+    fn a_step_about_to_run_is_checked_by_its_values_not_by_the_plan() {
+        let run = |k, p: &[(&str, &str)]| validate_run(k, &w(p));
+        // an absolute path in the workspace is read against it later
+        assert!(run(Kind::Upload, &[("path", "/ws/dist")]).is_ok());
+        assert!(run(Kind::Download, &[("name", "n"), ("path", "/ws/x")]).is_ok());
+        // an upload in a matrix whose name has no variant is the plan's to refuse
+        assert!(validate_with(Kind::Upload, &w(&[("path", "a")]), true).is_err());
+        assert!(run(Kind::Upload, &[("path", "a")]).is_ok());
+        // the name is checked even holding an expression, and options are
+        assert!(run(Kind::Upload, &[("name", "${{ x }}/../y"), ("path", "a")]).is_err());
+        assert!(run(Kind::Download, &[("name", "a/b")]).is_err());
+        assert!(run(Kind::Download, &[("name", "ok")]).is_ok());
+        assert!(run(Kind::Upload, &[("path", "a"), ("run-id", "1")]).is_err());
+        assert!(run(Kind::Upload, &[("path", "a"), ("overwrite", "x")]).is_err());
+        assert!(run(Kind::Download, &[("name", "a"), ("pattern", "b")]).is_err());
     }
 }

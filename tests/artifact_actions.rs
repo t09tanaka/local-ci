@@ -607,3 +607,242 @@ fn a_download_checks_every_file_against_the_receipt_before_placing_any() {
     assert!(e.contains("symlink"), "{e}");
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
 }
+
+// ---- review fixes (safety): file work on a bare workspace, no run needed ----
+
+struct Lab {
+    tmp: common::Tmp,
+    ws: PathBuf,
+    out: PathBuf,
+    area: Area,
+}
+
+fn who() -> Who {
+    Who {
+        job: "w::j".into(),
+        display: "j".into(),
+        task: None,
+    }
+}
+
+fn lab_io() -> Lab {
+    let tmp = common::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let out = tmp.path().join("outside");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let area = Area::of_run(&tmp.path().join("run"), "sha256:plan");
+    Lab { tmp, ws, out, area }
+}
+
+impl Lab {
+    fn up(&self, name: &str, path: &str) -> Result<String, String> {
+        artifact_io::upload(
+            &self.area,
+            &who(),
+            &self.ws,
+            &w(&[("name", name), ("path", path)]),
+        )
+    }
+    fn down(&self, ws: &Path, with: &[(&str, &str)]) -> Result<String, String> {
+        artifact_io::download(&self.area, ws, &w(with))
+    }
+    fn fresh(&self, n: &str) -> PathBuf {
+        let d = self.tmp.path().join(n);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn receipt_path(&self, name: &str) -> PathBuf {
+        self.tmp
+            .path()
+            .join(format!("run/artifacts/{name}/v1/receipt.json"))
+    }
+    fn edit_receipt(&self, name: &str, from: &str, to: &str) {
+        let rp = self.receipt_path(name);
+        let mut perm = std::fs::metadata(&rp).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+        std::fs::set_permissions(&rp, perm).unwrap();
+        let text = std::fs::read_to_string(&rp).unwrap();
+        assert!(text.contains(from), "{text}");
+        std::fs::write(&rp, text.replace(from, to)).unwrap();
+    }
+}
+
+fn is_empty(d: &Path) -> bool {
+    std::fs::read_dir(d).unwrap().next().is_none()
+}
+
+#[test]
+fn an_upload_does_not_take_what_a_symlink_points_at() {
+    let l = lab_io();
+    std::fs::write(l.out.join("secret"), "s3cret").unwrap();
+    std::fs::create_dir_all(l.ws.join("real")).unwrap();
+    std::fs::write(l.ws.join("real/f"), "f").unwrap();
+    // a symlink in the middle of the path
+    std::os::unix::fs::symlink(&l.out, l.ws.join("link")).unwrap();
+    let e = l.up("a", "link/secret").unwrap_err();
+    assert!(e.contains("symlink"), "{e}");
+    // a symlink inside a directory that is uploaded is left out
+    std::fs::create_dir_all(l.ws.join("dir")).unwrap();
+    std::fs::write(l.ws.join("dir/own"), "own").unwrap();
+    std::os::unix::fs::symlink(l.out.join("secret"), l.ws.join("dir/leak")).unwrap();
+    std::os::unix::fs::symlink(&l.out, l.ws.join("dir/leakdir")).unwrap();
+    l.up("b", "dir").unwrap();
+    let d = l.fresh("got");
+    l.down(&d, &[("name", "b")]).unwrap();
+    assert_eq!(std::fs::read_to_string(d.join("own")).unwrap(), "own");
+    assert!(!d.join("leak").exists() && !d.join("leakdir").exists());
+    // a symlink given as the file itself
+    let e = l.up("c", "dir/leak").unwrap_err();
+    assert!(e.contains("symlink") || e.contains("no files"), "{e}");
+}
+
+#[test]
+fn a_name_with_path_characters_is_refused_when_it_is_expanded_too() {
+    let l = lab_io();
+    std::fs::write(l.ws.join("f"), "f").unwrap();
+    for bad in ["../../x", "a/b", "..", "${{ none }}/../../x", "a\\b"] {
+        let e = l.up(bad, "f").unwrap_err();
+        assert!(
+            e.contains("not allowed") || e.contains("usable"),
+            "{bad}: {e}"
+        );
+        let d = l.fresh("d");
+        let e = l.down(&d, &[("name", bad)]).unwrap_err();
+        assert!(
+            e.contains("not allowed") || e.contains("usable"),
+            "{bad}: {e}"
+        );
+    }
+    assert!(!l.tmp.path().join("x").exists());
+    assert!(!l.tmp.path().join("run/artifacts").exists());
+}
+
+#[test]
+fn a_receipt_must_be_of_the_artifact_version_and_run_that_was_asked_for() {
+    let l = lab_io();
+    std::fs::write(l.ws.join("f"), "f").unwrap();
+    l.up("n", "f").unwrap();
+    let d = l.fresh("d");
+    l.down(&d, &[("name", "n")]).unwrap();
+    // another run (a plan digest that is not this one's)
+    let other = Area::of_run(&l.tmp.path().join("run"), "sha256:other");
+    let e = artifact_io::download(&other, &d, &w(&[("name", "n")])).unwrap_err();
+    assert!(e.contains("another run"), "{e}");
+    // a receipt of another name, and of another version
+    l.edit_receipt("n", "\"name\": \"n\"", "\"name\": \"m\"");
+    let e = l.down(&d, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("is of the artifact `m`"), "{e}");
+    l.edit_receipt("n", "\"name\": \"m\"", "\"name\": \"n\"");
+    l.edit_receipt("n", "\"version\": 1", "\"version\": 7");
+    let e = l.down(&d, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("version 7"), "{e}");
+    l.edit_receipt("n", "\"version\": 7", "\"version\": 1");
+    l.edit_receipt("n", "sha256:plan", "sha256:forged");
+    let e = l.down(&d, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("another run"), "{e}");
+}
+
+#[test]
+fn a_rejection_partway_leaves_nothing_placed() {
+    let l = lab_io();
+    std::fs::create_dir_all(l.ws.join("src/sub")).unwrap();
+    std::fs::write(l.ws.join("src/a"), "a").unwrap();
+    std::fs::write(l.ws.join("src/sub/b"), "b").unwrap();
+    l.up("n", "src").unwrap();
+    // `sub` of the destination is a symlink out of the workspace
+    let d = l.fresh("d");
+    std::os::unix::fs::symlink(&l.out, d.join("sub")).unwrap();
+    let e = l.down(&d, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("symlink"), "{e}");
+    assert!(
+        !d.join("a").exists(),
+        "`a` was placed before `sub/b` was refused"
+    );
+    assert!(is_empty(&l.out));
+    // a directory where a file goes
+    let d2 = l.fresh("d2");
+    std::fs::create_dir_all(d2.join("sub/b")).unwrap();
+    let e = l.down(&d2, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("not replaced"), "{e}");
+    assert!(!d2.join("a").exists());
+    // a file that does not match its receipt, after one that does
+    let stored = l.tmp.path().join("run/artifacts/n/v1/files/sub/b");
+    let mut perm = std::fs::metadata(&stored).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+    std::fs::set_permissions(&stored, perm).unwrap();
+    std::fs::write(&stored, "B").unwrap();
+    let d3 = l.fresh("d3");
+    assert!(l.down(&d3, &[("name", "n")]).is_err());
+    assert!(is_empty(&d3));
+}
+
+#[test]
+fn names_and_files_that_differ_only_in_case_are_a_conflict() {
+    let l = lab_io();
+    std::fs::write(l.ws.join("f"), "f").unwrap();
+    l.up("Report", "f").unwrap();
+    let e = l.up("report", "f").unwrap_err();
+    assert!(e.contains("only in case"), "{e}");
+    assert!(
+        !l.tmp.path().join("run/artifacts/report/v1").exists()
+            || std::fs::read_dir(l.tmp.path().join("run/artifacts"))
+                .unwrap()
+                .count()
+                == 1
+    );
+    // two artifacts with files of one name in different case, merged
+    std::fs::create_dir_all(l.ws.join("x")).unwrap();
+    std::fs::create_dir_all(l.ws.join("y")).unwrap();
+    std::fs::write(l.ws.join("x/Out.txt"), "1").unwrap();
+    std::fs::write(l.ws.join("y/out.txt"), "2").unwrap();
+    l.up("r1", "x/Out.txt").unwrap();
+    l.up("r2", "y/out.txt").unwrap();
+    let d = l.fresh("d");
+    let e = l
+        .down(&d, &[("merge-multiple", "true"), ("pattern", "r*")])
+        .unwrap_err();
+    assert!(e.contains("only in case"), "{e}");
+    assert!(is_empty(&d));
+}
+
+#[test]
+fn upload_and_download_read_a_workspace_prefixed_path_alike() {
+    let l = lab_io();
+    let ws = l.ws.to_string_lossy().into_owned();
+    std::fs::create_dir_all(l.ws.join("out")).unwrap();
+    std::fs::write(l.ws.join("out/a"), "a").unwrap();
+    // upload by the absolute path inside the workspace, and by the root itself
+    l.up("n", &format!("{ws}/out")).unwrap();
+    l.up("all", &ws).unwrap();
+    // download to `<workspace>/dest`, to the root, and out of the workspace
+    let d = l.fresh("d");
+    let dws = d.to_string_lossy().into_owned();
+    l.down(&d, &[("name", "n"), ("path", &format!("{dws}/dest"))])
+        .unwrap();
+    assert!(d.join("dest/a").is_file());
+    l.down(&d, &[("name", "n"), ("path", &dws)]).unwrap();
+    assert!(d.join("a").is_file());
+    let e = l
+        .down(&d, &[("name", "n"), ("path", &format!("{dws}/../x"))])
+        .unwrap_err();
+    assert!(e.contains("`..`"), "{e}");
+    let e = l.down(&d, &[("name", "n"), ("path", &ws)]).unwrap_err();
+    assert!(e.contains("absolute"), "{e}");
+}
+
+#[test]
+fn a_temp_file_swapped_for_a_symlink_is_not_written_through() {
+    let l = lab_io();
+    std::fs::write(l.ws.join("f"), "payload").unwrap();
+    l.up("n", "f").unwrap();
+    let d = l.fresh("d");
+    std::fs::write(l.out.join("victim"), "keep").unwrap();
+    std::os::unix::fs::symlink(l.out.join("victim"), d.join("f.lci-tmp")).unwrap();
+    l.down(&d, &[("name", "n")]).unwrap();
+    assert_eq!(std::fs::read_to_string(d.join("f")).unwrap(), "payload");
+    assert_eq!(
+        std::fs::read_to_string(l.out.join("victim")).unwrap(),
+        "keep"
+    );
+}
