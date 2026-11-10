@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-10
+
+Breaking changes for external code (library API; the CLI is unchanged). Each
+is described in full below:
+
+- `source::CaptureOptions` has the new public fields `secret_root` and
+  `secret_bundle`; `source::SourceError` has the new variants
+  `SecretBundlePath` and `SecretTooLarge`. A capture whose secret files are
+  above the new size limits now fails.
+- `exec::Opts` has the new field `executor`.
+- The plan schema version is 6: a plan of version 5 is refused, and every
+  digest changed. `ExecutionTask` and `JobGraph` carry `schema_version`, and
+  `SetupRecipe`, `PreparedReceipt`, `TaskInputs` and `TaskResult` have the
+  new field `schema_version: u32`; `SetupRecipe`, `TaskInputs` and `JobGraph`
+  no longer derive `Default`.
+- `task::TaskResult` has the new field `shard`, `ExecutionTask` has `shard`,
+  and `NotSplit` has more reasons.
+- `Playwright::new` and `Cypress::new` (and `from_command`) take an
+  `Isolation` instead of a `Safety`; `Safety::e2e()` is gone;
+  `shard::Discovered` has the new field `blocked`.
+
 - Secret files of a captured source (`source::CaptureOptions::secret_files`)
   can now come with every kind of capture, not only that of a working tree:
   - `source::capture_directory` keeps the files a `secret_files` declaration
