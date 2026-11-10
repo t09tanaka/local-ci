@@ -300,25 +300,23 @@ fn lcov_records(r: &ShardCoverage<'_>) -> Result<BTreeMap<String, Record>, Cover
             }
             (_, None) => return Err(at(format!("`{tag}` is outside a file"))),
             ("FN", Some((_, rec))) => {
-                let (start, rest) = pair(rest).map_err(&at)?;
+                let (start, rest) = pair(rest).map_err(at)?;
                 // newer lcov: `FN:start,end,name`
                 let name = match rest.split_once(',') {
                     Some((end, name)) if end.trim().parse::<u64>().is_ok() => name,
                     _ => rest,
                 };
-                rec.fns
-                    .insert(name.to_string(), number(start).map_err(&at)?);
+                rec.fns.insert(name.to_string(), number(start).map_err(at)?);
             }
             ("FNDA", Some((_, rec))) => {
-                let (hits, name) = pair(rest).map_err(&at)?;
-                rec.fnda
-                    .insert(name.to_string(), number(hits).map_err(&at)?);
+                let (hits, name) = pair(rest).map_err(at)?;
+                rec.fnda.insert(name.to_string(), number(hits).map_err(at)?);
             }
             ("DA", Some((_, rec))) => {
                 let mut p = rest.split(',');
                 let (line, hits) = (p.next().unwrap_or(""), p.next().unwrap_or(""));
                 rec.da
-                    .insert(number(line).map_err(&at)?, number(hits).map_err(&at)?);
+                    .insert(number(line).map_err(at)?, number(hits).map_err(at)?);
             }
             ("BRDA", Some((_, rec))) => {
                 let p: Vec<&str> = rest.split(',').collect();
@@ -327,11 +325,11 @@ fn lcov_records(r: &ShardCoverage<'_>) -> Result<BTreeMap<String, Record>, Cover
                 };
                 let taken = match *taken {
                     "-" => None,
-                    t => Some(number(t).map_err(&at)?),
+                    t => Some(number(t).map_err(at)?),
                 };
                 rec.br.insert(
                     (
-                        number(line).map_err(&at)?,
+                        number(line).map_err(at)?,
                         block.to_string(),
                         branch.to_string(),
                     ),
