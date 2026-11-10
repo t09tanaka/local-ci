@@ -114,7 +114,7 @@ fn plan_lists_units_and_setup() {
 #[test]
 fn nothing_runs_when_paths_do_not_match() {
     let d = demo("README.md");
-    let o = local_ci(&d, &["run", "--no-status", "--no-canirun"]);
+    let o = local_ci(&d, &["run", "--no-status", "--no-traffic-controller"]);
     let out = stdout(&o);
     assert!(o.status.success(), "{out}");
     assert!(
@@ -139,7 +139,7 @@ fn runs_jobs_with_dynamic_matrix() {
         &[
             "run",
             "--no-status",
-            "--no-canirun",
+            "--no-traffic-controller",
             "-j",
             "test",
             "-j",
@@ -180,7 +180,16 @@ fn reports_the_failing_step_with_its_log() {
     let d = demo("app/lib.sh");
     std::fs::write(d.repo.join("app/lib.sh"), "add() { echo 0; }\n").unwrap();
     git(&d.repo, &["commit", "-qam", "break add"]);
-    let o = local_ci(&d, &["run", "--no-status", "--no-canirun", "-j", "test"]);
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-traffic-controller",
+            "-j",
+            "test",
+        ],
+    );
     let out = stdout(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
@@ -236,7 +245,7 @@ jobs:
         &[
             "run",
             "--no-status",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--parallel",
             "2",
             "-j",
@@ -261,7 +270,14 @@ fn json_result_is_saved() {
     let d = demo("app/lib.sh");
     let o = local_ci(
         &d,
-        &["run", "--no-status", "--no-canirun", "--json", "-j", "lint"],
+        &[
+            "run",
+            "--no-status",
+            "--no-traffic-controller",
+            "--json",
+            "-j",
+            "lint",
+        ],
     );
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["state"], "success");
@@ -307,7 +323,7 @@ fn job_time_counts_the_running_and_no_waits_on_an_idle_machine() {
             "run",
             "--no-status",
             "--no-cache",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--json",
             "-j",
             "lint",
@@ -330,7 +346,7 @@ fn job_time_counts_the_running_and_no_waits_on_an_idle_machine() {
 }
 
 #[test]
-fn canirun_queue_is_counted_apart_from_the_running() {
+fn traffic_controller_queue_is_counted_apart_from_the_running() {
     let d = demo("app/lib.sh");
     add_workflow(
         &d,
@@ -345,10 +361,10 @@ jobs:
       - run: echo two
 "#,
     );
-    // a canirun that lets every command start 2 seconds late
+    // a task-traffic-controller that lets every command start 2 seconds late
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let fake = bin.join("canirun");
+    let fake = bin.join("task-traffic-controller");
     std::fs::write(
         &fake,
         format!(
@@ -376,7 +392,7 @@ jobs:
     let queue = t["wait_queue_secs"].as_f64().unwrap();
     assert!((3.5..15.0).contains(&queue), "two steps, 2s each: {t}");
     assert!(t["work_secs"].as_f64().unwrap() < queue, "{t}");
-    // canirun is given the step's own command, as before: its history shows it
+    // task-traffic-controller is given the step's own command, as before: its history shows it
     let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
     assert!(
         argv.lines()
@@ -408,7 +424,7 @@ fn container_slot_and_repository_lock_waits_are_counted() {
             "run",
             "--no-status",
             "--no-cache",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--json",
             "-w",
             "slow.yml",
@@ -444,7 +460,7 @@ fn container_slot_and_repository_lock_waits_are_counted() {
             "run",
             "--no-status",
             "--no-cache",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--json",
             "--containers",
             "1",
@@ -494,7 +510,7 @@ jobs:
             "run",
             "--no-status",
             "--no-cache",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--json",
             "--parallel",
             "1",
@@ -527,7 +543,13 @@ fn services_get_their_own_port() {
     let d = demo("app/lib.sh");
     let o = local_ci(
         &d,
-        &["run", "--no-status", "--no-canirun", "-j", "integration"],
+        &[
+            "run",
+            "--no-status",
+            "--no-traffic-controller",
+            "-j",
+            "integration",
+        ],
     );
     let out = stdout(&o);
     assert_eq!(o.status.code(), Some(0), "{out}");
@@ -630,7 +652,7 @@ jobs:
         &[
             "run",
             "--no-status",
-            "--no-canirun",
+            "--no-traffic-controller",
             "--workflows-dir",
             "ci/local",
             "-w",
@@ -679,7 +701,16 @@ fn config_replaces_the_workflows_dir() {
     );
     assert!(!out.contains(".ci/workflows"), "{out}");
 
-    let o = local_ci(&d, &["run", "--no-status", "--no-canirun", "-j", "lint"]);
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-traffic-controller",
+            "-j",
+            "lint",
+        ],
+    );
     let out = stdout(&o);
     assert_eq!(o.status.code(), Some(0), "{out}");
     assert!(out.contains("PASS   ci.yml › lint"), "{out}");
@@ -767,4 +798,60 @@ fn bad_config_is_an_error() {
         assert!(err.contains(".local-ci.toml"), "{config}: {err}");
         assert!(err.contains(msg), "{config}: {err}");
     }
+}
+
+/// A stand-in controller named `name` that records its argv in `<home>/<name>.argv`.
+fn fake_controller(d: &Demo, bin: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let fake = bin.join(name);
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}/{name}.argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+            d.home.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn the_controller_is_found_by_its_new_name_only() {
+    for (name, used) in [("task-traffic-controller", true), ("canirun", false)] {
+        let d = demo("app/lib.sh");
+        let bin = d.home.join("bin");
+        fake_controller(&d, &bin, name);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let o = local_ci_path(
+            &d,
+            &path,
+            &["run", "--no-status", "--no-cache", "-j", "lint"],
+        );
+        assert!(o.status.success(), "{name}: {}", stdout(&o));
+        assert_eq!(d.home.join(format!("{name}.argv")).exists(), used, "{name}");
+    }
+}
+
+#[test]
+fn only_the_new_no_controller_flag_exists() {
+    let d = demo("app/lib.sh");
+    let bin = d.home.join("bin");
+    fake_controller(&d, &bin, "task-traffic-controller");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let args = |f| ["run", "--no-status", "--no-cache", f, "-j", "lint"];
+    let o = local_ci_path(&d, &path, &args("--no-traffic-controller"));
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(!d.home.join("task-traffic-controller.argv").exists());
+    let o = local_ci_path(&d, &path, &args("--no-canirun"));
+    assert!(!o.status.success());
+    let help = Command::new(env!("CARGO_BIN_EXE_local-ci"))
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    let help = stdout(&help);
+    assert!(
+        help.contains("--no-traffic-controller") && !help.contains("canirun"),
+        "{help}"
+    );
 }

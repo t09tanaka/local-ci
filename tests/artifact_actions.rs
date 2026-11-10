@@ -123,7 +123,7 @@ fn lab_ws(jobs: &str) -> (common::Tmp, FrozenPlan, Workspace) {
 fn lab_opts(tmp: &common::Tmp, parallel: usize) -> Opts {
     Opts {
         parallel,
-        canirun: None,
+        traffic_controller: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,
@@ -510,7 +510,7 @@ fn cached_opts(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> local_ci::R
     local_ci::RunOptions {
         target: t,
         parallel: Some(2),
-        no_canirun: true,
+        no_traffic_controller: true,
         no_portool: true,
         containers: 1,
         keep: false,

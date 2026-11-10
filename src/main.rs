@@ -74,12 +74,12 @@ impl TargetArgs {
 struct RunArgs {
     #[command(flatten)]
     target: TargetArgs,
-    /// Units to run at once (default: all of them with canirun, else 4)
+    /// Units to run at once (default: all of them with task-traffic-controller, else 4)
     #[arg(long)]
     parallel: Option<usize>,
-    /// Do not wrap steps in `canirun exec`
+    /// Do not wrap steps in `task-traffic-controller exec`
     #[arg(long)]
-    no_canirun: bool,
+    no_traffic_controller: bool,
     /// Do not give jobs that start containers or test servers a port block from portool
     #[arg(long)]
     no_portool: bool,
@@ -156,7 +156,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
     let opts = RunOptions {
         target: a.target.into_target()?,
         parallel: a.parallel,
-        no_canirun: a.no_canirun,
+        no_traffic_controller: a.no_traffic_controller,
         no_portool: a.no_portool,
         containers: a.containers,
         keep: a.keep,

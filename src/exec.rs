@@ -122,7 +122,7 @@ pub struct JobResult {
 /// What a job waited for, and how long it really ran, in seconds.
 ///
 /// `secs` of the job counts from the start of its steps and so holds the wait
-/// for canirun (`wait_queue_secs`); the other waits come before it. The waits
+/// for task-traffic-controller (`wait_queue_secs`); the other waits come before it. The waits
 /// of a whole unit (`wait_lock_secs` for the repository lock, `wait_parallel_secs`
 /// for a `--parallel` place) are charged to its first job, so that the sum over
 /// jobs is not counted twice.
@@ -135,7 +135,7 @@ pub struct JobTime {
     pub wait_lock_secs: f64,
     /// For one of the `--containers` slots, shared by all runs on the machine.
     pub wait_slot_secs: f64,
-    /// For canirun to let a step start, summed over the steps.
+    /// For task-traffic-controller to let a step start, summed over the steps.
     pub wait_queue_secs: f64,
     /// For one of the `--parallel` places of this run.
     pub wait_parallel_secs: f64,
@@ -193,7 +193,7 @@ pub struct UnitResult {
 
 pub struct Opts {
     pub parallel: usize,
-    pub canirun: Option<PathBuf>,
+    pub traffic_controller: Option<PathBuf>,
     /// Gives jobs that bind fixed ports a block of their own (`--no-portool` turns it off).
     pub portool: Option<PathBuf>,
     /// Exclusive jobs that may run at once, across all runs on the machine.
@@ -311,7 +311,7 @@ pub fn tail(path: &Path, n: usize) -> Vec<String> {
     let text = strip_ansi(&String::from_utf8_lossy(&buf));
     let lines: Vec<String> = text
         .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with("canirun: "))
+        .filter(|l| !l.trim().is_empty() && !is_controller_line(l))
         .map(String::from)
         .collect();
     lines[lines.len().saturating_sub(n)..].to_vec()
@@ -370,7 +370,22 @@ pub fn compose_projects(script: &str) -> Vec<String> {
     out
 }
 
-/// The log written since `from` holds only canirun's own lines, ending in its
+/// The prefix task-traffic-controller puts on its own output lines. The one
+/// place that knows it.
+const CONTROLLER_PREFIX: &str = "task-traffic-controller: ";
+
+/// A line of task-traffic-controller's own output, not the command's.
+fn is_controller_line(line: &str) -> bool {
+    line.starts_with(CONTROLLER_PREFIX)
+}
+
+/// Its ledger lock timing out, so the command never ran.
+fn is_ledger_timeout_line(line: &str) -> bool {
+    line.strip_prefix(CONTROLLER_PREFIX)
+        .is_some_and(|r| r.starts_with("ledger: timed out"))
+}
+
+/// The log written since `from` holds only task-traffic-controller's own lines, ending in its
 /// ledger lock timing out: the command itself never ran.
 fn ledger_timed_out(log: &Path, from: u64) -> bool {
     let Ok(mut f) = File::open(log) else {
@@ -382,10 +397,7 @@ fn ledger_timed_out(log: &Path, from: u64) -> bool {
     }
     let text = String::from_utf8_lossy(&b);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines.iter().all(|l| l.starts_with("canirun: "))
-        && lines
-            .iter()
-            .any(|l| l.starts_with("canirun: ledger: timed out"))
+    lines.iter().all(|l| is_controller_line(l)) && lines.iter().any(|l| is_ledger_timeout_line(l))
 }
 
 /// Each `docker compose` command line of a script, cut at the next command.
@@ -930,7 +942,7 @@ impl<'a> Runner<'a> {
     }
 
     /// Run one shell step. Output goes to `log`; returns how it ended and how
-    /// long canirun kept it waiting for its turn. When canirun's ledger lock
+    /// long task-traffic-controller kept it waiting for its turn. When task-traffic-controller's ledger lock
     /// times out the command never started, so it is tried again, a few times.
     /// A `piped` script holds the GitHub token: it is not written to a file but
     /// handed to the shell over a pipe (see `shell_once`).
@@ -956,7 +968,7 @@ impl<'a> Runner<'a> {
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
                 && attempt < 3
-                && self.opts.canirun.is_some()
+                && self.opts.traffic_controller.is_some()
                 && ledger_timed_out(log, from))
             {
                 return Ok((r, queued));
@@ -980,14 +992,14 @@ impl<'a> Runner<'a> {
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let file = self.tools.join(format!("scripts/step-{n}.sh"));
-        // With canirun the script touches this file as its first act, on the
-        // line the script starts on, so canirun still sees the same command and
+        // With task-traffic-controller the script touches this file as its first act, on the
+        // line the script starts on, so task-traffic-controller still sees the same command and
         // the script keeps its line numbers. The file's time tells how long the
         // step waited for its turn, even if it prints nothing. Scripts of other
         // shells are not changed (a Python script may begin with
         // `from __future__`); their wait is read from the log.
         let turn = self.tools.join(format!("scripts/step-{n}.turn"));
-        let queued = self.opts.canirun.is_some() && key.is_some();
+        let queued = self.opts.traffic_controller.is_some() && key.is_some();
         let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
         let sh_family = matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
         // bash and sh read a script that is not a file one byte at a time, so
@@ -1012,7 +1024,7 @@ impl<'a> Runner<'a> {
         };
         // A script that holds the token never reaches a file: the shell reads
         // it from file descriptor 3, the read end of a pipe (so the argument
-        // list shows `/dev/fd/3` and nothing else), and canirun passes the
+        // list shows `/dev/fd/3` and nothing else), and task-traffic-controller passes the
         // descriptor on to its child.
         let f = if piped {
             PIPE_SCRIPT.to_string()
@@ -1042,7 +1054,7 @@ impl<'a> Runner<'a> {
             // keep in step with `plan::shell_supported`
             Some(other) => bail!("unsupported shell `{other}`"),
         };
-        if let (Some(c), Some(k)) = (&self.opts.canirun, key) {
+        if let (Some(c), Some(k)) = (&self.opts.traffic_controller, key) {
             let mut w = vec![
                 c.to_string_lossy().into_owned(),
                 "exec".into(),
@@ -1118,8 +1130,8 @@ impl<'a> Runner<'a> {
         let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
         self.ctx.cancel.track_pgid(pid);
-        // With canirun the clock starts when the command gets its turn, not while it waits.
-        let mut started: Option<Instant> = if self.opts.canirun.is_some() {
+        // With task-traffic-controller the clock starts when the command gets its turn, not while it waits.
+        let mut started: Option<Instant> = if self.opts.traffic_controller.is_some() {
             None
         } else {
             Some(Instant::now())
@@ -1144,7 +1156,7 @@ impl<'a> Runner<'a> {
                         seen = len;
                         if String::from_utf8_lossy(&b)
                             .lines()
-                            .any(|l| !l.starts_with("canirun: "))
+                            .any(|l| !is_controller_line(l))
                         {
                             started = Some(Instant::now());
                         }
@@ -1176,8 +1188,8 @@ impl<'a> Runner<'a> {
             let _ = fs::remove_file(&file);
         }
         // Waiting for its turn: until the script touched `turn`, or the first
-        // line of output that is not canirun's own, or, when neither came
-        // (canirun gave up, the step was stopped, a silent step of another
+        // line of output that is not task-traffic-controller's own, or, when neither came
+        // (task-traffic-controller gave up, the step was stopped, a silent step of another
         // shell), until it was over.
         let waited = if marked {
             let got_turn = fs::metadata(&turn).and_then(|m| m.modified()).ok();
@@ -2247,10 +2259,14 @@ impl<'a> Runner<'a> {
             r
         };
         // Each combination at once, in its own copy of the workspace, as each
-        // gets its own runner on GitHub. Only with canirun, which keeps the CPU
+        // gets its own runner on GitHub. Only with task-traffic-controller, which keeps the CPU
         // in check, and for exclusive jobs only when they cannot collide.
         let at_once = job.max_parallel.unwrap_or(usize::MAX);
-        if todo.len() > 1 && at_once > 1 && self.opts.canirun.is_some() && (!exclusive || !locked) {
+        if todo.len() > 1
+            && at_once > 1
+            && self.opts.traffic_controller.is_some()
+            && (!exclusive || !locked)
+        {
             let done = Mutex::new(Vec::new());
             let sem = Semaphore {
                 free: Mutex::new(at_once),
@@ -2432,7 +2448,7 @@ impl<'a> Runner<'a> {
         let mut errored: Option<String> = None;
         // the first error was the run being cancelled
         let mut cancelled = false;
-        // canirun's queue, summed over the steps
+        // task-traffic-controller's queue, summed over the steps
         let mut queue = Duration::ZERO;
 
         for (n, s) in job.steps.iter().enumerate() {
@@ -3653,22 +3669,35 @@ mod tests {
     }
 
     #[test]
-    fn canirun_ledger_timeouts_are_retried() {
+    fn ledger_timeouts_are_retried() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("step.log");
         fs::write(&log, "earlier output\n").unwrap();
         let from = fs::metadata(&log).unwrap().len();
         let mut f = OpenOptions::new().append(true).open(&log).unwrap();
-        writeln!(f, "canirun: waiting 0:00 (queue)").unwrap();
+        writeln!(f, "task-traffic-controller: waiting 0:00 (queue)").unwrap();
         writeln!(
             f,
-            "canirun: ledger: timed out after 10s waiting for /x/ledger.lock"
+            "task-traffic-controller: ledger: timed out after 10s waiting for /x/ledger.lock"
         )
         .unwrap();
         assert!(ledger_timed_out(&log, from));
         writeln!(f, "npm ERR! something").unwrap();
         assert!(!ledger_timed_out(&log, from));
         assert!(!ledger_timed_out(&log, 0));
+    }
+
+    #[test]
+    fn only_the_controllers_prefix_marks_its_own_lines() {
+        let p = "task-traffic-controller";
+        assert!(is_controller_line(&format!("{p}: waiting 0:00 (queue)")));
+        assert!(is_ledger_timeout_line(&format!(
+            "{p}: ledger: timed out after 10s"
+        )));
+        assert!(!is_ledger_timeout_line(&format!("{p}: waiting")));
+        assert!(!is_controller_line("canirun: waiting"));
+        assert!(!is_ledger_timeout_line("canirun: ledger: timed out"));
+        assert!(!is_ledger_timeout_line("ledger: timed out"));
     }
 
     #[test]
