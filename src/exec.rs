@@ -1584,6 +1584,7 @@ impl<'a> Runner<'a> {
         };
         PreparedSetup {
             receipt: PreparedReceipt {
+                schema_version: crate::wire::wire_version(),
                 template_key: key.into(),
                 source: self.fp.source.execution_commit.clone(),
                 workspace,
@@ -1711,6 +1712,7 @@ impl<'a> Runner<'a> {
         let why = self.refused.get(&wf)?;
         let only = task.variant.as_ref().map(|v| v.index);
         Some(TaskResult {
+            schema_version: crate::wire::wire_version(),
             task: task.id.clone(),
             jobs: task
                 .jobs
@@ -2313,6 +2315,7 @@ impl<'a> Runner<'a> {
             outcomes.push(outcome);
         }
         Ok(TaskResult {
+            schema_version: crate::wire::wire_version(),
             task: task.id.clone(),
             shard,
             jobs,
@@ -3172,11 +3175,11 @@ impl<'a> Runner<'a> {
                 .map(|m| Duration::from_secs_f64(m * 60.0))
                 .map(|t| t.min(remaining))
                 .unwrap_or(remaining);
-            let key = format!(
-                "local-ci {} {} {}",
-                crate::report::short(&self.fp.config.default_workflows_dir, &w.file),
-                job.id,
-                label
+            let key = crate::demand::history_key(
+                &self.fp.config.default_workflows_dir,
+                &w.file,
+                &job.id,
+                &label,
             );
             let pkg = fs::read_to_string(ws.join(&wd).join("package.json")).ok();
             if writes_node_modules(&plan::with_scripts(&script, pkg.as_deref())) {
@@ -4346,6 +4349,7 @@ mod tests {
             wait_parallel_secs: 5.0,
         };
         let r = crate::task::TaskResult {
+            schema_version: crate::wire::wire_version(),
             task: "t1".into(),
             jobs: vec![
                 job("a", Outcome::Pass, false, Some(time.clone())),

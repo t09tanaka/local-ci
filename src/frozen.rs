@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bumped when the shape of a [`FrozenPlan`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// What the plan was made from: a [`crate::source::SourceManifest`] by its
 /// id, the commit the jobs run against, and the ref the changed files were
@@ -312,6 +312,10 @@ impl FrozenPlan {
                 "plan schema version {} is not supported (this is {SCHEMA_VERSION})",
                 self.schema_version
             );
+        }
+        crate::wire::check_version("plan job graph", self.graph.schema_version)?;
+        for t in &self.tasks {
+            crate::wire::check_version(&format!("plan task {}", t.id), t.schema_version)?;
         }
         let want = sha256_of(&canonical_json(&serde_json::to_value(&self.config)?));
         if want != self.config_digest {

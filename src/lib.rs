@@ -11,6 +11,7 @@ pub mod complete;
 pub mod config;
 pub mod context;
 pub mod dag;
+pub mod demand;
 pub mod exec;
 pub mod expr;
 pub mod filter;
@@ -20,6 +21,7 @@ pub mod matrix;
 pub mod plan;
 pub mod portool;
 pub mod report;
+pub mod result_wire;
 mod run;
 mod script;
 pub mod setup;
@@ -34,7 +36,9 @@ pub mod workflow;
 
 pub use complete::{validate_run_result, verify_task_result, Completeness, Verdict};
 pub use context::{CancelHandle, ExecContext};
+pub use demand::{plan_task_demand, TaskDemand};
 pub use frozen::{derive_job_dag, FrozenPlan};
+pub use result_wire::{validate_wire_run_result, WireRunResult, WireTaskResult};
 pub use run::{
     build_frozen_plan, build_frozen_plan_with, claim_run_dir, execute_plan, freeze, post_status,
     publish_target, resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions,

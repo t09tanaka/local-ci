@@ -396,6 +396,53 @@ impl UnitSpec {
     }
 }
 
+/// The version of the types that cross between a coordinator and a worker:
+/// [`crate::setup::SetupRecipe`], [`crate::setup::PreparedReceipt`],
+/// [`crate::task::TaskInputs`], [`crate::task::TaskResult`],
+/// [`crate::dag::ExecutionTask`], [`crate::dag::JobGraph`], and the types of
+/// [`crate::result_wire`] and [`crate::demand`]. Each carries it as
+/// `schema_version`. A document without one was written before it existed and
+/// reads as this version (`#[serde(default = ...)]`); a reader refuses a
+/// version it does not know ([`check_version`]).
+pub const WIRE_SCHEMA_VERSION: u32 = 1;
+
+/// The `schema_version` of a document that has none (see
+/// [`WIRE_SCHEMA_VERSION`]), and of every document this build writes.
+pub fn wire_version() -> u32 {
+    WIRE_SCHEMA_VERSION
+}
+
+/// Fail unless `version` is the one this build reads.
+pub fn check_version(what: &str, version: u32) -> anyhow::Result<()> {
+    if version != WIRE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "{what}: schema version {version} is not supported (this is {WIRE_SCHEMA_VERSION})"
+        );
+    }
+    Ok(())
+}
+
+/// A type that crosses the wire and has a digest: the SHA-256 of its canonical
+/// JSON (keys sorted at every level), `sha256:<hex>`. The digest is not a
+/// field of the type: the sender puts it next to the document, and the reader
+/// checks it with [`Digested::verify_digest`], so the document cannot hold a
+/// digest that is out of date.
+pub trait Digested: Serialize {
+    fn digest(&self) -> anyhow::Result<String> {
+        let v = serde_json::to_value(self)?;
+        Ok(crate::frozen::sha256_of(&crate::frozen::canonical_json(&v)))
+    }
+
+    /// Fail unless the digest of `self` is `expected`.
+    fn verify_digest(&self, expected: &str) -> anyhow::Result<()> {
+        let got = self.digest()?;
+        if got != expected {
+            anyhow::bail!("digest {expected} does not match the content ({got})");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +468,34 @@ mod tests {
         let j = m.to_json();
         assert!(j.as_object().unwrap().contains_key("1.5"));
         assert_eq!(j["include"][0]["n"], serde_json::json!(1000.0));
+    }
+
+    #[derive(Serialize)]
+    struct Doc {
+        b: u32,
+        a: Vec<u32>,
+    }
+    impl Digested for Doc {}
+
+    #[test]
+    fn a_digest_is_of_the_canonical_form_and_checked() {
+        let d = Doc { b: 1, a: vec![2] };
+        let want = crate::frozen::sha256_of("{\"a\":[2],\"b\":1}");
+        assert_eq!(d.digest().unwrap(), want);
+        d.verify_digest(&want).unwrap();
+        let other = Doc { b: 2, a: vec![2] };
+        let e = other.verify_digest(&want).unwrap_err().to_string();
+        assert!(e.contains("does not match the content"), "{e}");
+    }
+
+    #[test]
+    fn only_this_schema_version_is_read() {
+        assert_eq!(wire_version(), WIRE_SCHEMA_VERSION);
+        check_version("x", WIRE_SCHEMA_VERSION).unwrap();
+        for v in [0, WIRE_SCHEMA_VERSION + 1] {
+            let e = check_version("a recipe", v).unwrap_err().to_string();
+            assert!(e.starts_with("a recipe: schema version"), "{e}");
+        }
     }
 
     #[test]

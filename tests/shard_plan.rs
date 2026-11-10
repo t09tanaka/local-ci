@@ -321,10 +321,10 @@ fn what_cannot_be_split_says_why() {
 #[test]
 fn a_plan_of_an_older_schema_is_refused_by_name() {
     let (_t, fp) = plan();
-    assert_eq!(fp.schema_version, 5);
+    assert_eq!(fp.schema_version, 6);
     let text = fp.to_canonical_json().unwrap();
     let old = text
-        .replace("\"schema_version\":5", "\"schema_version\":4")
+        .replace("\"schema_version\":6", "\"schema_version\":4")
         .replace(",\"shard\":null", "");
     assert!(!old.contains("\"shard\""));
     let err = FrozenPlan::from_json(&old).unwrap_err().to_string();

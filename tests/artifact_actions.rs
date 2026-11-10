@@ -1481,6 +1481,7 @@ fn the_cli_and_the_library_agree_on_the_artifacts_a_task_must_publish() {
     let mine = artifact_io::published_by(&r.run_dir, W1, &[format!("{W1}::a")]);
     assert!(mine.is_empty());
     let mut lib = local_ci::task::TaskResult {
+        schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
         task: a.id.clone(),
         jobs: vec![],
         outcomes: r.units.iter().flat_map(|u| u.outcomes.clone()).collect(),

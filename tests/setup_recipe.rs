@@ -876,6 +876,7 @@ fn receipt_for(
     artifact: &str,
 ) -> PreparedReceipt {
     PreparedReceipt {
+        schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
         template_key: key.digest().into(),
         source: "src".into(),
         workspace: "builder".into(),
