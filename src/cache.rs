@@ -9,6 +9,7 @@
 //! not run the unit again. Results are kept for a day: tests that depend on
 //! the date, and checks against advisory databases, change without the code.
 
+use crate::artifact;
 use crate::context::ExecContext;
 use crate::exec::{JobResult, Outcome, StepResult, UnitResult};
 use crate::filter::last_match;
@@ -119,6 +120,14 @@ impl Inputs {
         for id in &u.jobs {
             let j = w.jobs.iter().find(|j| &j.id == id)?;
             for s in &j.steps {
+                // what an artifact step leaves is in the run, not in the
+                // commit: a unit that has one is run again
+                if s.uses
+                    .as_deref()
+                    .is_some_and(|u| artifact::parse_uses(u).is_some())
+                {
+                    return None;
+                }
                 let Some(run) = &s.run else { continue };
                 let dir = crate::plan::step_dir(w, j, s);
                 let pkg = if dir.is_empty() {

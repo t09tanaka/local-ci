@@ -353,14 +353,14 @@ fn skipping_what_cannot_be_reproduced_is_incomplete_not_a_pass() {
     assert_eq!(report::github_state(&r.state), "error");
     assert!(r.description.contains("incomplete:"), "{}", r.description);
 
-    // a skipped artifact step and a step that needs a secret too; a checkout
+    // a skipped action and a step that needs a secret too; a checkout
     // or a cache is not a gap
     let jobs = "  a:\n    runs-on: x\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/cache@v4\n      - run: echo ${{ secrets.TOKEN }}\n";
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
     let r = execute(&tmp, &dir, &plan(&tmp, &dir), "inc2");
     assert_eq!(r.state, "incomplete");
     assert_eq!(r.completeness.incomplete.len(), 1, "{:?}", r.completeness);
-    let jobs = "  a:\n    runs-on: x\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/upload-artifact@v4\n";
+    let jobs = "  a:\n    runs-on: x\n    steps:\n      - uses: actions/checkout@v4\n      - uses: someone/upload-artifact@v4\n";
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
     let r = execute(&tmp, &dir, &plan(&tmp, &dir), "inc3");
     assert_eq!(r.state, "incomplete");

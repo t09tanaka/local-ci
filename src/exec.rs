@@ -1,7 +1,9 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
+use crate::artifact::{self};
+use crate::artifact_io;
 use crate::context::ExecContext;
-use crate::dag::ExecutionTask;
+use crate::dag::{self, ExecutionTask};
 use crate::expr::{self, Ctx, Status};
 use crate::frozen::FrozenPlan;
 use crate::matrix;
@@ -1905,7 +1907,14 @@ impl<'a> Runner<'a> {
             jobs,
             outcomes,
             receipt_ignored,
-            artifacts: vec![],
+            artifacts: artifact_io::published_by(
+                &self.run_dir,
+                &task
+                    .jobs
+                    .iter()
+                    .map(|j| dag::node_id(&task.workflow, j))
+                    .collect::<Vec<_>>(),
+            ),
         })
     }
 
@@ -2389,7 +2398,11 @@ impl<'a> Runner<'a> {
             }
 
             if let Some(uses) = &s.uses {
-                let (outcome, note) = self.check_action(uses, s, &scm);
+                let (outcome, note) = match artifact::parse_uses(uses) {
+                    Some(Ok(kind)) => self.artifact_step(ws, w, job, &display, s, &scm, kind),
+                    Some(Err(e)) => (Outcome::Error(e), None),
+                    None => self.check_action(uses, s, &scm),
+                };
                 // what a `with:` value expanded to comes to result.json
                 let outcome = match outcome {
                     Outcome::Error(e) => Outcome::Error(self.hide_token(e)),
@@ -2850,6 +2863,53 @@ impl<'a> Runner<'a> {
                 (Outcome::Skip("artifact".into()), None)
             }
             _ => (Outcome::Skip(format!("action {uses}")), None),
+        }
+    }
+
+    /// An `actions/upload-artifact@v4` or `actions/download-artifact@v4` step
+    /// of this run (see [`crate::artifact_io`]).
+    #[allow(clippy::too_many_arguments)]
+    fn artifact_step(
+        &self,
+        ws: &Path,
+        w: &Workflow,
+        job: &Job,
+        display: &str,
+        s: &Step,
+        cm: &Map<String, Value>,
+        kind: artifact::Kind,
+    ) -> (Outcome, Option<String>) {
+        let ctx = Ctx::new(cm, Status::Success).with_token(self.ctx);
+        let mut with = Vec::new();
+        for (k, v) in &s.with {
+            match expr::interpolate(v, &ctx) {
+                Ok(x) => with.push((k.clone(), x)),
+                Err(e) => return (Outcome::Error(format!("with.{k}: {e:#}")), None),
+            }
+        }
+        let area = artifact_io::Area::of_run(&self.run_dir, &self.fp.digest);
+        let node = dag::node_id(&w.file, &job.id);
+        let mut holding = self
+            .fp
+            .tasks
+            .iter()
+            .filter(|t| t.workflow == w.file && t.jobs.contains(&job.id));
+        let task = match (holding.next(), holding.next()) {
+            (Some(t), None) => Some(t.id.clone()),
+            _ => None,
+        };
+        let who = artifact_io::Who {
+            job: node,
+            display: display.to_string(),
+            task,
+        };
+        let done = match kind {
+            artifact::Kind::Upload => artifact_io::upload(&area, &who, ws, &with),
+            artifact::Kind::Download => artifact_io::download(&area, ws, &with),
+        };
+        match done {
+            Ok(note) => (Outcome::Pass, Some(note)),
+            Err(e) => (Outcome::Error(e), None),
         }
     }
 

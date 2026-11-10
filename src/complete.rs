@@ -128,6 +128,8 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
             )),
         }
     }
+    // the artifacts the run has a receipt for
+    let published = crate::artifact_io::published_names(&r.run_dir);
     for (ui, spec) in fp.units.iter().enumerate() {
         let file = &fp.workflows[spec.workflow].file;
         let label = unit_label(file, &spec.jobs);
@@ -136,7 +138,7 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
         }
         match got[ui].as_slice() {
             [] => c.missing.push(format!("the result of {label}")),
-            [one] => check_unit(fp, ui, &label, one, &mut c),
+            [one] => check_unit(fp, ui, &label, one, &published, &mut c),
             many => c.duplicate.push(format!("{label}: {} results", many.len())),
         }
     }
@@ -168,7 +170,14 @@ fn expected_entries(fp: &FrozenPlan, wf: usize, job: &str) -> (usize, bool) {
     }
 }
 
-fn check_unit(fp: &FrozenPlan, ui: usize, label: &str, ru: &UnitResult, c: &mut Completeness) {
+fn check_unit(
+    fp: &FrozenPlan,
+    ui: usize,
+    label: &str,
+    ru: &UnitResult,
+    published: &[String],
+    c: &mut Completeness,
+) {
     let spec = &fp.units[ui];
     let cached = ru.cached.is_some();
     if cached {
@@ -234,7 +243,7 @@ fn check_unit(fp: &FrozenPlan, ui: usize, label: &str, ru: &UnitResult, c: &mut 
             .filter(|j| passed.contains(j))
             .collect();
         let every = ok.len() == t.jobs.len();
-        let mut why = check_outputs(t, &ok, &ru.outcomes, &[], every);
+        let mut why = check_outputs(t, &ok, &ru.outcomes, published, every);
         why.retain(|w| !w.is_empty());
         c.invalid
             .extend(why.into_iter().map(|w| format!("{label}: {w}")));

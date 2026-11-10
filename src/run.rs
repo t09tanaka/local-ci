@@ -403,6 +403,7 @@ pub fn build_frozen_plan_with(
 /// Fix an already resolved plan (what [`build_frozen_plan`] does after
 /// [`resolve`]).
 pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
+    crate::artifact_io::validate_plan(&p).map_err(|e| anyhow::anyhow!(e))?;
     FrozenPlan::new(PlanParts {
         repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {

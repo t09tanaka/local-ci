@@ -250,11 +250,44 @@ they end.
   and every place the job uses it is rewritten the same way. `docker compose -p
   <name>` and `COMPOSE_PROJECT_NAME=<name>` get a suffix of the run, so two runs
   never share a project and the clean-up never stops one you started yourself.
-- `uses:` — `actions/checkout`, caches and artifacts are skipped; `setup-node`,
+- `uses:` — `actions/upload-artifact@v4` and `actions/download-artifact@v4`
+  run for real within one run (next section); `actions/checkout` and caches
+  are skipped; `setup-node`,
   `setup-python`, `setup-go`, `setup-java`, `setup-ruby`, `flutter-action`,
   `setup-dart` and `rust-toolchain` check that the tool is installed and warn
   when its version differs. Other actions are skipped and listed under
   `not covered`.
+
+### Artifacts (`upload-artifact@v4`, `download-artifact@v4`)
+
+Within one run, an upload copies its files into the run's own area
+(`<run dir>/artifacts/<name>/v<N>/`), read-only, and writes a receipt (name,
+each file's relative path, size and SHA-256, the plan digest, the attempt and
+the job) before the step completes. A download reads the receipt, checks every
+file against it and only then places the files, so a job that `needs` the
+uploading job gets exactly what was uploaded. A run is not a `success` while an
+artifact its plan requires (a literal name, a step that always runs, and
+`if-no-files-found: error`) has no receipt. Jobs that use these actions are
+never taken from the results cache.
+
+| | Supported | Not supported (an error before the run starts) |
+|---|---|---|
+| Action | `actions/upload-artifact@v4`, `actions/download-artifact@v4` | other major versions, sub-actions such as `upload-artifact/merge` |
+| `name` | upload: a name without `/ \ : " < > \| * ?`, default `artifact`; download: one artifact by name | |
+| `path` (upload) | several lines, `*` `?` `**` globs, `!` exclusions, a directory takes what is under it; stored relative to the common ancestor of the lines; hidden files only with `include-hidden-files: true` | an absolute path, `..`, a backslash |
+| Multiple files | yes (sorted, each with its own size and SHA-256) | symlinks are not followed or uploaded |
+| `if-no-files-found` | `warn` (default: the step passes with a warning), `error` (the step fails), `ignore` | other values |
+| `overwrite` | a second upload of a name is a conflict by default; `overwrite: true` records a new version, and a download takes the newest | |
+| Matrix | the name must contain the variant (`name: report-${{ matrix.os }}`) | a name that is the same in every variant |
+| `path` (download) | a directory under the workspace; the default is the workspace itself | an absolute path, `..`, a path through a symlink |
+| `pattern`, `merge-multiple` | yes: without `merge-multiple` each artifact goes to `<path>/<name>/`; two artifacts writing one file is an error | |
+| `retention-days` | 1 to 90, recorded in the receipt (local runs are kept until pruned) | |
+| Across runs, GitHub's side | | `run-id`, `repository`, `github-token`, `artifact-ids`, `skip-decompress`, `compression-level` and any other option |
+
+A download does not wait for the uploading job to finish: it needs the receipt
+only, so it must run after the job that uploads (`needs:`); a download with no
+receipt is an error that says so. Moving artifacts to and from another host is
+not part of local-ci.
 
 A step whose script holds `github.token` is run with bash, sh or python (the
 default shell is bash); the script is handed over a pipe and never written to a
@@ -348,6 +381,7 @@ commands are in `.github/workflows/ci.yml`):
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
 cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
+cargo schemata --file src/artifact.rs -- --lib artifact::
 ```
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is

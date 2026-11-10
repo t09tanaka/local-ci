@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `actions/upload-artifact@v4` and `actions/download-artifact@v4` run within a
+  run instead of being skipped (`src/artifact.rs`, `src/artifact_io.rs`):
+  `name`, `path` (lines, globs, exclusions), `if-no-files-found`, `overwrite`
+  (a new version), `pattern`, `merge-multiple`. An upload fixes its files
+  read-only in the run directory and writes a receipt (path, size, SHA-256,
+  plan digest, attempt, job) before the step completes; a download needs the
+  receipt only, verifies the hashes and then places the files, refusing
+  absolute paths, `..` and symlinks. Cross-run options (`run-id`,
+  `repository`, `github-token`, ...), another major version and a matrix upload
+  whose name lacks the variant are errors before the run. A task's required
+  artifacts (`verification.artifacts`) and needed ones (`artifacts`) are filled
+  in from the plan, `TaskResult.artifacts` from the receipts, and a run is not
+  a success while a required one has none. Jobs that use them are not reused
+  from the results cache.
 - Library: `source::capture_source` fixes the input of a run (staged and
   unstaged changes, untracked files, deletions, modes, symlinks, submodules,
   LFS payloads) in a private content-addressed store and describes it in a

@@ -147,10 +147,10 @@ fn runs_jobs_with_dynamic_matrix() {
         ],
     );
     let out = stdout(&o);
-    // the report-upload step is an action local-ci cannot reproduce: nothing
-    // failed, but the run is not a pass
-    assert_eq!(o.status.code(), Some(3), "{out}");
-    assert!(out.contains("result: incomplete"), "{out}");
+    // the report-upload step is run for real (one artifact per shard), so
+    // nothing is left out of the run
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("result: success"), "{out}");
     for line in [
         "PASS   ci.yml › lint",
         "PASS   ci.yml › discover",

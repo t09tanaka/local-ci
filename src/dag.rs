@@ -10,6 +10,7 @@
 //!
 //! Nothing here runs anything; see [`crate::execute_task`].
 
+use crate::artifact;
 use crate::expr::NeedsRef;
 use crate::plan::{self, Plan};
 use crate::wire::{JobSpec, MatrixValue, UnitSpec, WorkflowSpec};
@@ -541,7 +542,13 @@ pub(crate) fn derive_tasks(
                 dynamic_matrix: false,
                 depends_on: vec![],
                 needs_outputs: vec![],
-                artifacts: vec![],
+                artifacts: specs_of
+                    .iter()
+                    .flat_map(|j| &j.steps)
+                    .filter_map(|s| artifact::needed_download(s.uses.as_deref()?, &s.with))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
                 workspace: WorkspacePolicy {
                     own_checkout: true,
                     shared_by_jobs: g.len() > 1,
@@ -566,7 +573,20 @@ pub(crate) fn derive_tasks(
                         .iter()
                         .flat_map(|j| j.outputs.iter().map(|(k, _)| format!("{}.{k}", j.id)))
                         .collect(),
-                    artifacts: vec![],
+                    artifacts: specs_of
+                        .iter()
+                        .filter(|j| j.matrix.is_none())
+                        .flat_map(|j| &j.steps)
+                        .filter_map(|s| {
+                            artifact::required_upload(
+                                s.uses.as_deref()?,
+                                &s.with,
+                                s.cond.is_some() || s.continue_on_error,
+                            )
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                 },
                 grouped_reason,
             };

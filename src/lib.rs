@@ -4,6 +4,8 @@
 //! This is not a stable API (0.x): types, functions and modules may change in
 //! any release. The `local-ci` binary is a thin adapter over it.
 
+pub mod artifact;
+pub mod artifact_io;
 pub mod cache;
 pub mod complete;
 pub mod config;
