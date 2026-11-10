@@ -1093,10 +1093,11 @@ mod tests {
         assert!(!m.ok());
         // the trait method merges the same way
         let f = fake(OK);
-        assert_eq!(
-            f.merge(None, &[outcome("s0", true, &[])]),
-            Merged::default()
+        let m = f.merge(
+            Some(&["x".to_string()]),
+            &[outcome("s0", true, &[("x", TestStatus::Failed)])],
         );
+        assert_eq!(m.failed, vec!["x"]);
     }
 
     #[test]
