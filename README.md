@@ -354,6 +354,10 @@ cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
 inside the repository. Tests that need "not a git repository" therefore set
 `GIT_CEILING_DIRECTORIES`.
 
+`cargo schemata --file` exits 0 when the glob matches nothing, so CI first runs
+`scripts/mutation-targets-check.sh <file>...` (built on `--list`) and fails if any target file
+produces no mutants, for example after a rename.
+
 ## License
 
 MIT

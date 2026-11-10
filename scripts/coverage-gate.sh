@@ -6,7 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo llvm-cov --json --output-path target/llvm-cov.json >/dev/null
 python3 - <<'PY'
-import json, sys
+import json, os, sys
+root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
 want = {
     "src/matrix.rs",
@@ -19,7 +20,7 @@ seen = set()
 bad = []
 for f in data["data"][0]["files"]:
     name = f["filename"]
-    rel = name[name.find("src/"):] if "src/" in name else name
+    rel = os.path.relpath(name, root)
     if rel not in want:
         continue
     seen.add(rel)

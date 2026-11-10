@@ -281,8 +281,11 @@ fn the_library_does_not_read_the_process_environment() {
             }
             let text = std::fs::read_to_string(&p).unwrap();
             // cargo-schemata's own harness, added to a copy of the sources,
-            // reads CARGO_SCHEMATA_* variables.
-            for line in text.lines().filter(|l| !l.contains("CARGO_SCHEMATA_")) {
+            // reads CARGO_SCHEMATA_* variables through exactly this call.
+            for line in text
+                .lines()
+                .filter(|l| !l.contains("env::var(\"CARGO_SCHEMATA_"))
+            {
                 for needle in ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("] {
                     assert!(!line.contains(needle), "{} uses {needle}", p.display());
                 }
