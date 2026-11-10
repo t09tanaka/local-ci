@@ -359,6 +359,28 @@ pub fn post_status(
     bail!("gh api failed: {}", err.lines().next().unwrap_or("").trim())
 }
 
+/// A new directory for a run of `sha7` started at `stamp`: `<stamp>-<sha7>`,
+/// or with `-<n>` after it when another run of the same commit started in the
+/// same second and has it. The directory is made here, so two runs never share
+/// one (what a run does to its artifact area would destroy the other's).
+fn claim_run_dir(runs: &std::path::Path, stamp: u64, sha7: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(runs)?;
+    for n in 0u32.. {
+        let name = if n == 0 {
+            format!("{stamp}-{sha7}")
+        } else {
+            format!("{stamp}-{sha7}-{n}")
+        };
+        let dir = runs.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("a counter that does not end")
+}
+
 fn prune_runs(dir: &std::path::Path, keep: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -559,7 +581,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     // digest of the plan that is left to run, which depends on which of them
     // are reused, so a result whose artifacts do not restore (a file that does
     // not match its receipt) is given up, and the rest settled again.
-    let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));
+    let run_dir = claim_run_dir(&runs, stamp, &sha[..7])?;
     let mut hits: Vec<Option<cache::Hit>> = std::mem::take(&mut full_plan.units)
         .iter()
         .zip(&fingerprints)
@@ -580,11 +602,12 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             .map(|(u, _)| u.clone())
             .collect();
         let fp = full.with_plan(p)?;
+        // what an earlier pass restored is not this pass's: a result given up
+        // takes with it the artifacts of the units that were settled on it
+        let _ = std::fs::remove_dir_all(run_dir.join("artifacts"));
         if !taken.iter().any(|t| *t) {
             break (fp, taken);
         }
-        let _ = std::fs::remove_dir_all(run_dir.join("artifacts"));
-        std::fs::create_dir_all(&run_dir)?;
         let mut failed = false;
         for (i, t) in taken.iter().enumerate() {
             let (Some(h), Some(f)) = (hits[i].as_ref(), fingerprints[i].as_deref()) else {
@@ -817,4 +840,27 @@ pub fn status(
         report::github_state(&saved.state).to_string(),
         want[..7].to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_runs_of_one_commit_in_one_second_get_directories_of_their_own() {
+        let t = tempfile::tempdir().unwrap();
+        let runs = t.path().join("runs");
+        let a = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let b = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let c = claim_run_dir(&runs, 100, "abcdef0").unwrap();
+        let d = claim_run_dir(&runs, 101, "abcdef0").unwrap();
+        assert_eq!(a, runs.join("100-abcdef0"));
+        assert_eq!(b, runs.join("100-abcdef0-1"));
+        assert_eq!(c, runs.join("100-abcdef0-2"));
+        assert_eq!(d, runs.join("101-abcdef0"));
+        // they come in the order they were made
+        let mut sorted = vec![c.clone(), b.clone(), a.clone()];
+        sorted.sort();
+        assert_eq!(sorted, [a, b, c]);
+    }
 }

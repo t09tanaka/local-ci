@@ -1497,6 +1497,42 @@ impl<'a> Runner<'a> {
         r.into_iter().map(|(_, u)| u).collect()
     }
 
+    /// The entries of a job that is not run, each an error that says why: one
+    /// per matrix variant (`only`: that variant alone) when the matrix is
+    /// written out, so the result has what the plan expects of the job.
+    fn refused_entries(
+        &self,
+        wf: usize,
+        id: &str,
+        why: &str,
+        only: Option<usize>,
+    ) -> Vec<JobResult> {
+        let w = &self.plan.selected[wf].wf;
+        let base = self.plan.job(wf, id).name.clone().unwrap_or(id.to_string());
+        let displays: Vec<String> = match dag::matrix_plan(self.fp.job(wf, id)) {
+            dag::MatrixPlan::Static(v) => v
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| only.is_none_or(|o| o == *i))
+                .map(|(_, c)| format!("{base} ({})", matrix::describe(c)))
+                .collect(),
+            _ => vec![base],
+        };
+        displays
+            .into_iter()
+            .map(|display| JobResult {
+                workflow: w.file.clone(),
+                job: id.to_string(),
+                display,
+                outcome: Outcome::Error(why.to_string()),
+                secs: 0.0,
+                steps: vec![],
+                cancelled: false,
+                time: None,
+            })
+            .collect()
+    }
+
     /// The result of a unit that is not run: each of its jobs is an error that
     /// says why.
     fn refused_unit(&self, ui: usize, u: &Unit, why: &str) -> UnitResult {
@@ -1507,22 +1543,48 @@ impl<'a> Runner<'a> {
             jobs: u
                 .jobs
                 .iter()
-                .map(|id| JobResult {
-                    workflow: w.file.clone(),
-                    job: id.clone(),
-                    display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
-                    outcome: Outcome::Error(why.to_string()),
-                    secs: 0.0,
-                    steps: vec![],
-                    cancelled: false,
-                    time: None,
-                })
+                .flat_map(|id| self.refused_entries(u.wf, id, why, None))
                 .collect(),
             waited_secs: 0.0,
             copy_secs: None,
             cached: None,
             outcomes: vec![],
         }
+    }
+
+    /// The result of `task` when its workflow has an artifact step that cannot
+    /// be run, `None` when it has none: nothing is started, and each job is an
+    /// error that says why.
+    pub(crate) fn refused_task(&self, task: &ExecutionTask) -> Option<TaskResult> {
+        let wf = self
+            .plan
+            .selected
+            .iter()
+            .position(|s| s.wf.file == task.workflow)?;
+        let why = self.refused.get(&wf)?;
+        let only = task.variant.as_ref().map(|v| v.index);
+        Some(TaskResult {
+            task: task.id.clone(),
+            jobs: task
+                .jobs
+                .iter()
+                .flat_map(|id| self.refused_entries(wf, id, why, only))
+                .collect(),
+            outcomes: task
+                .jobs
+                .iter()
+                .map(|id| JobOutcome {
+                    job: id.clone(),
+                    variant: only,
+                    status: JobStatus::Failure,
+                    outputs: Default::default(),
+                    skipped: Some(why.clone()),
+                    ancestor_failed: false,
+                })
+                .collect(),
+            receipt_ignored: None,
+            artifacts: vec![],
+        })
     }
 
     pub(crate) fn lock(&self) -> Result<File> {

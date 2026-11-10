@@ -11,8 +11,9 @@
   receipt only, verifies the hashes and then places the files, refusing
   absolute paths, `..` and symlinks. Cross-run options (`run-id`,
   `repository`, `github-token`, ...), another major version and a matrix upload
-  whose name does not read every key of the matrix (or `${{ matrix }}`, or
-  `strategy.job-index`) are errors of the jobs of their workflow, reported
+  whose name does not read every key of the matrix (or `strategy.job-index`;
+  keys that `include` only adds to a variant are not asked for) or holds the
+  whole matrix (`${{ matrix }}`, `toJSON(matrix)`) are errors of the jobs of their workflow, reported
   before anything of it runs and only for it: planning and the other
   workflows go on. Jobs a job filter leaves out are not looked at. A
   40-character commit SHA runs as v4, with one warning. `compression-level`
@@ -27,6 +28,9 @@
   `restored_from`; a mismatch is a cache miss), and a unit that downloads is
   reused only against the same upstream artifact digests. `strategy.job-index`
   and `strategy.job-total` are set in a matrix job's expressions.
+  `execute_task` refuses the same workflows (its jobs are errors, nothing is
+  started), a run's directory is never shared by two runs of one commit in the
+  same second, and a failed restore leaves no artifact of a unit that runs again.
 - Library: `source::capture_source` fixes the input of a run (staged and
   unstaged changes, untracked files, deletions, modes, symlinks, submodules,
   LFS payloads) in a private content-addressed store and describes it in a

@@ -452,9 +452,12 @@ pub enum Matrix<'a> {
     Unknown,
 }
 
-/// The keys of a written-out `strategy.matrix`: its axes and every key an
-/// `include` entry adds. `None` for a matrix (or an `include`) that is an
-/// expression.
+/// The keys that tell the variants of a written-out `strategy.matrix` apart:
+/// its axes. `include` entries add no key to ask for: one that adds keys to a
+/// variant that is there (`{os: a, experimental: true}`) does not make
+/// variants differ by them. A matrix of `include` entries alone has no axes,
+/// so the keys on which the entries differ stand in for them. `None` for a
+/// matrix (or an `include`) that is an expression.
 pub fn matrix_axes(m: &serde_json::Value) -> Option<Vec<String>> {
     let obj = m.as_object()?;
     let mut keys: Vec<String> = obj
@@ -463,9 +466,15 @@ pub fn matrix_axes(m: &serde_json::Value) -> Option<Vec<String>> {
         .cloned()
         .collect();
     match obj.get("include") {
-        Some(serde_json::Value::Array(entries)) => {
-            for e in entries.iter().filter_map(|e| e.as_object()) {
-                keys.extend(e.keys().cloned());
+        Some(serde_json::Value::Array(entries)) if keys.is_empty() => {
+            let entries: Vec<_> = entries.iter().filter_map(|e| e.as_object()).collect();
+            let all: std::collections::BTreeSet<&String> =
+                entries.iter().flat_map(|e| e.keys()).collect();
+            for k in all {
+                let first = entries.first().and_then(|e| e.get(k));
+                if entries.iter().any(|e| e.get(k) != first) {
+                    keys.push(k.clone());
+                }
             }
         }
         Some(serde_json::Value::String(_)) => return None,
@@ -511,23 +520,32 @@ fn reads_key(body: &str, key: &str) -> bool {
     body.contains(&format!("matrix['{key}']")) || body.contains(&format!("matrix[\"{key}\"]"))
 }
 
+fn squashed(body: &str) -> String {
+    body.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Whether `name` holds the whole matrix (`${{ matrix }}`, `toJSON(matrix)`):
+/// that expands to JSON, which a name cannot hold, so the upload would always
+/// fail when it runs.
+pub fn names_whole_matrix(name: &str) -> bool {
+    expressions(name).iter().any(|b| {
+        let q = squashed(b);
+        q == "matrix" || q.contains("tojson(matrix)")
+    })
+}
+
 /// Whether an upload's `name` tells the variants of a matrix apart: it reads
-/// every key of the matrix, the whole matrix (`${{ matrix }}`,
-/// `toJSON(matrix)`) or `strategy.job-index`. For a matrix that is an
+/// every key of the matrix or `strategy.job-index`. For a matrix that is an
 /// expression (`axes` is `None`) it must read the matrix in some way.
 pub fn name_separates_variants(name: &str, axes: Option<&[String]>) -> bool {
     let bodies = expressions(name);
-    let whole = |b: &&str| {
-        let squashed: String = b
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        squashed == "matrix"
-            || squashed.contains("tojson(matrix)")
-            || squashed.contains("strategy.job-index")
-    };
-    if bodies.iter().any(whole) {
+    if bodies
+        .iter()
+        .any(|b| squashed(b).contains("strategy.job-index"))
+    {
         return true;
     }
     match axes {
@@ -593,6 +611,11 @@ fn validate_inner(
                 Matrix::Unknown => Some(None),
                 Matrix::None => None,
             };
+            if !run && names_whole_matrix(shown) {
+                return Err(format!(
+                    "the name `{shown}` holds the whole matrix, which is JSON, and a name cannot hold that: the upload would always fail; read the keys (`name: report-${{{{ matrix.os }}}}`) or use `${{{{ strategy.job-index }}}}`"
+                ));
+            }
             if let Some(axes) = axes.filter(|_| !run) {
                 if !name_separates_variants(shown, axes) {
                     return Err(format!(
@@ -789,6 +812,42 @@ pub fn find_collision(dests: &[String]) -> Result<(), String> {
                 return Err(format!(
                     "`{file}` is a file, and `{d}` needs it as a directory"
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What is at one component of a path a download writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    Missing,
+    Dir,
+    File,
+    /// A symlink, a device, a pipe...
+    Other,
+}
+
+/// Whether the file `dest` can be written given what is there: `found` has
+/// one entry per component, from the first, up to the first that is missing
+/// (what is under a missing one is missing too). Each component that exists
+/// must be a directory, and the last a regular file or nothing.
+pub fn check_path_kinds(dest: &str, found: &[Found]) -> Result<(), String> {
+    let comps: Vec<&str> = dest.split('/').collect();
+    for (i, f) in found.iter().enumerate() {
+        match (f, i + 1 == comps.len()) {
+            (Found::Missing, _) => return Ok(()),
+            (Found::Dir, false) | (Found::File, true) => {}
+            (_, false) => {
+                return Err(format!(
+                    "`{}` exists and is not a directory, and `{dest}` needs it as one",
+                    comps[..=i].join("/")
+                ))
+            }
+            (_, true) => {
+                return Err(format!(
+                    "`{dest}` exists and is not a file; it is not replaced"
+                ))
             }
         }
     }
@@ -1252,7 +1311,8 @@ mod tests {
             assert!(e.contains("matrix.node") && e.contains("matrix.os"), "{e}");
             assert!(up("r-${{ matrix.node }}").is_err());
             assert!(up("r-${{ matrix.os }}-${{ matrix.node }}").is_ok());
-            assert!(up("r-${{ matrix }}").is_ok());
+            assert!(up("r-${{ matrix }}").is_err());
+            assert!(up("r-${{ toJSON(matrix) }}").is_err());
             assert!(up("r-${{ strategy.job-index }}").is_ok());
         }
         // no matrix: nothing to tell apart
@@ -1544,17 +1604,37 @@ mod tests {
             matrix_axes(&json!({"os": ["a"], "node": [1], "exclude": [{"os": "a"}]})),
             Some(s(&["node", "os"]))
         );
-        // include adds its keys
+        // include adds none: it adds keys to variants that are there
         assert_eq!(
             matrix_axes(
                 &json!({"os": ["a"], "include": [{"os": "b", "extra": 1}, 3, {"more": 2}]})
             ),
-            Some(s(&["extra", "more", "os"]))
+            Some(s(&["os"]))
         );
         assert_eq!(
-            matrix_axes(&json!({"include": [{"name": "x", "shard": 1}]})),
-            Some(s(&["name", "shard"]))
+            matrix_axes(&json!({"os": ["a", "b"], "include": [{"os": "a", "experimental": true}]})),
+            Some(s(&["os"]))
         );
+        // only include: the keys the entries differ on
+        assert_eq!(
+            matrix_axes(&json!({"include": [{"name": "x", "shard": 1}]})),
+            Some(s(&[]))
+        );
+        assert_eq!(
+            matrix_axes(&json!({"include": [{"os": "a", "n": 1}, {"os": "b", "n": 1}]})),
+            Some(s(&["os"]))
+        );
+        assert_eq!(
+            matrix_axes(
+                &json!({"include": [{"os": "a", "n": 1}, {"os": "a", "n": 2}, {"os": "a"}]})
+            ),
+            Some(s(&["n"]))
+        );
+        assert_eq!(
+            matrix_axes(&json!({"include": [{"os": "a"}, {"n": 1}]})),
+            Some(s(&["n", "os"]))
+        );
+        assert_eq!(matrix_axes(&json!({"include": []})), Some(s(&[])));
         assert_eq!(
             matrix_axes(&json!({"os": ["a"], "include": 7})),
             Some(s(&["os"]))
@@ -1587,16 +1667,16 @@ mod tests {
         assert!(!sep("${{ matrix.os }}-${{ xmatrix.node }}"));
         assert!(sep("${{ matrix.os }}-${{ x.y == 1 && matrix.node }}"));
         assert!(!sep("${{ matrix.os }}-${{ matrix.node"));
-        // the whole matrix, or the index of the variant
+        // the index of the variant
         for n in [
-            "r-${{ matrix }}",
-            "r-${{matrix}}",
-            "r-${{ toJSON(matrix) }}",
-            "r-${{ toJson( matrix ) }}",
             "r-${{ hashFiles('x') }}-${{ strategy.job-index }}",
+            "r-${{ Strategy.Job-Index }}",
         ] {
             assert!(sep(n), "{n}");
         }
+        // the whole matrix tells nothing apart (it is refused on its own)
+        assert!(!sep("r-${{ matrix }}"));
+        assert!(!sep("r-${{ toJSON(matrix) }}"));
         assert!(!sep("r-${{ toJSON(matrix.os) }}"));
         assert!(!sep("r-${{ matrixx }}"));
         // no key: a literal name is fine for nothing to tell apart
@@ -1607,6 +1687,65 @@ mod tests {
         assert!(!name_separates_variants("r-${{ github.run_id }}", None));
         assert!(!name_separates_variants("matrix.os", None));
         assert!(!name_separates_variants("r", None));
+    }
+
+    #[test]
+    fn a_name_that_holds_the_whole_matrix() {
+        for n in [
+            "r-${{ matrix }}",
+            "r-${{matrix}}",
+            "r-${{ toJSON(matrix) }}",
+            "r-${{ toJson( matrix ) }}",
+        ] {
+            assert!(names_whole_matrix(n), "{n}");
+        }
+        for n in [
+            "r",
+            "r-${{ matrix.os }}",
+            "r-${{ toJSON(matrix.os) }}",
+            "r-${{ matrixx }}",
+            "matrix",
+        ] {
+            assert!(!names_whole_matrix(n), "{n}");
+        }
+        let with = |n: &str| {
+            vec![
+                ("name".to_string(), n.to_string()),
+                ("path".to_string(), "p".to_string()),
+            ]
+        };
+        let keys = s(&["os"]);
+        for m in [Matrix::None, Matrix::Axes(&keys), Matrix::Unknown] {
+            let e = validate_with(Kind::Upload, &with("r-${{ matrix }}"), m).unwrap_err();
+            assert!(e.contains("holds the whole matrix"), "{e}");
+        }
+        // at run time the name is expanded, and said by the run
+        assert!(validate_run(Kind::Upload, &with("r-${{ matrix }}")).is_ok());
+    }
+
+    #[test]
+    fn a_path_is_written_only_over_directories_and_a_file() {
+        use Found::*;
+        let ok = |d: &str, f: &[Found]| check_path_kinds(d, f).unwrap();
+        let err = |d: &str, f: &[Found]| check_path_kinds(d, f).unwrap_err();
+        ok("a", &[Missing]);
+        ok("a", &[File]);
+        ok("out/sub/b", &[Dir, Dir, File]);
+        ok("out/sub/b", &[Dir, Missing]);
+        ok("out/sub/b", &[Missing]);
+        ok("out/sub/b", &[Dir, Dir, Missing]);
+        // a regular file partway along
+        let e = err("out/sub/b", &[Dir, File]);
+        assert!(e.contains("`out/sub` exists and is not a directory"), "{e}");
+        let e = err("out/sub/b", &[File]);
+        assert!(e.contains("`out` exists"), "{e}");
+        // a link partway or at the end, a directory at the end
+        assert!(err("out/sub/b", &[Dir, Other]).contains("`out/sub`"));
+        assert!(err("a/b", &[Dir, Dir]).contains("`a/b` exists and is not a file"));
+        assert!(err("a/b", &[Dir, Other]).contains("not replaced"));
+        assert!(err("a", &[Dir]).contains("not replaced"));
+        // nothing is looked at under a missing component
+        ok("a/b/c", &[Dir, Missing, File]);
     }
 
     #[test]

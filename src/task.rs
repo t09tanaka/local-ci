@@ -289,6 +289,11 @@ pub fn execute_task(
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
     let keep = opts.keep;
     let runner = Runner::new(ctx, fp, ws, opts);
+    // as in a run: an artifact step local-ci cannot run fails the task's jobs
+    // before anything is started
+    if let Some(r) = runner.refused_task(task) {
+        return Ok(r);
+    }
     let result = (|| {
         runner.prepare_tools()?;
         let lock = if runner.task_locked(task) {

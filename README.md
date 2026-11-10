@@ -295,7 +295,7 @@ name that is an expression, is never taken from the cache.
 | Multiple files | yes (sorted, each with its own size and SHA-256) | symlinks are not followed or uploaded |
 | `if-no-files-found` | `warn` (default: the step passes with a warning), `error` (the step fails), `ignore` | other values |
 | `overwrite` | a second upload of a name is a conflict by default; `overwrite: true` records a new version, and a download takes the newest | |
-| Matrix | the name must read every key of the matrix (`name: report-${{ matrix.os }}-${{ matrix.node }}`; keys that `include` adds count), or the whole matrix (`${{ matrix }}`, `toJSON(matrix)`), or `${{ strategy.job-index }}`; with or without `overwrite` | a name that leaves a key out, so two variants would upload one name |
+| Matrix | the name must read every key of the matrix (`name: report-${{ matrix.os }}-${{ matrix.node }}`; keys that `include` only adds to a variant are not asked for) or `${{ strategy.job-index }}`; with or without `overwrite` | a name that leaves a key out, so two variants would upload one name; one that holds the whole matrix (`${{ matrix }}`, `toJSON(matrix)`), which is JSON and always fails |
 | `path` (download) | a directory under the workspace; the default is the workspace itself | an absolute path, `..`, a path through a symlink |
 | `pattern`, `merge-multiple` | yes: without `merge-multiple` each artifact goes to `<path>/<name>/`; two artifacts writing one file is an error | |
 | `retention-days` | 1 to 90, recorded in the receipt (local runs are kept until pruned) | |

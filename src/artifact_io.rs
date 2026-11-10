@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The run's artifact area and what a receipt records about the run.
 pub struct Area {
@@ -159,6 +160,27 @@ fn no_symlink_in(root: &Path, rel: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What is at each component of `rel` under `ws`, from the first, up to the
+/// first one that is missing.
+fn found_along(ws: &Path, rel: &str) -> Vec<artifact::Found> {
+    let mut at = ws.to_path_buf();
+    let mut out = Vec::new();
+    for c in rel.split('/').filter(|c| !c.is_empty()) {
+        at.push(c);
+        let f = match fs::symlink_metadata(&at) {
+            Err(_) => artifact::Found::Missing,
+            Ok(m) if m.is_dir() => artifact::Found::Dir,
+            Ok(m) if m.is_file() => artifact::Found::File,
+            Ok(_) => artifact::Found::Other,
+        };
+        out.push(f);
+        if f == artifact::Found::Missing {
+            break;
+        }
+    }
+    out
 }
 
 /// Every file under `ws/rel`, as paths relative to `ws`. Symlinks are not
@@ -543,24 +565,31 @@ fn read_nofollow(root: &File, rel: &str) -> Result<(Vec<u8>, u32)> {
     Ok((bytes, meta.permissions().mode()))
 }
 
-/// Write `bytes` as `name` of `dir`: into a temp file made new (`O_EXCL`,
-/// `O_NOFOLLOW`: never through a link someone left there), then renamed over
+/// Write `bytes` as `name` of `dir`: into a temp file made new, under a name
+/// that is this placement's (`O_EXCL`, `O_NOFOLLOW`: never through a link
+/// someone left there, and what is there is never removed), then renamed over
 /// the name. A name that is a directory or a symlink is not replaced.
 fn write_at(dir: &File, name: &str, bytes: &[u8], mode: u32, shown: &str) -> Result<()> {
     if matches!(type_at(dir, name), Some(libc::S_IFLNK | libc::S_IFDIR)) {
         bail!("`{shown}` exists and is not a file; it is not replaced");
     }
-    let tmp = format!("{name}.lci-tmp");
+    // a name of its own for this placement: nothing that is there is touched
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
-    let mut f = match open_at(dir, &tmp, flags, 0o600) {
-        Ok(f) => f,
-        // a leftover of an earlier run (or a link put there): the name itself
-        // is removed, never what it points at, and the file made again new
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            unlink_at(dir, &tmp)?;
-            open_at(dir, &tmp, flags, 0o600).with_context(|| format!("create `{tmp}`"))?
+    let (tmp, mut f) = {
+        let mut tries = 0;
+        loop {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let tmp = format!(
+                "{name}.lci-tmp-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            match open_at(dir, &tmp, flags, 0o600) {
+                Ok(f) => break (tmp, f),
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) && tries < 16 => tries += 1,
+                Err(e) => return Err(anyhow!(e).context(format!("create `{tmp}`"))),
+            }
         }
-        Err(e) => return Err(anyhow!(e).context(format!("create `{tmp}`"))),
     };
     let done = (|| -> Result<()> {
         f.write_all(bytes)?;
@@ -803,11 +832,7 @@ fn download_inner(area: &Area, ws: &Path, with: &[(String, String)]) -> Result<S
     for i in &items {
         load(i)?;
         no_symlink_in(ws, &i.dest)?;
-        if let Ok(m) = fs::symlink_metadata(ws.join(&i.dest)) {
-            if m.file_type().is_symlink() || m.is_dir() {
-                bail!("`{}` exists and is not a file; it is not replaced", i.dest);
-            }
-        }
+        artifact::check_path_kinds(&i.dest, &found_along(ws, &i.dest)).map_err(|e| anyhow!(e))?;
     }
     // placing: each file is read once more, checked against the receipt
     // again, and that same buffer is what is written
@@ -875,21 +900,28 @@ mod tests {
         fs::create_dir_all(&ws).unwrap();
         fs::create_dir_all(&out).unwrap();
         fs::write(out.join("victim"), "keep").unwrap();
-        // the temp name is a symlink to a file outside: it is removed, not written through
+        // what sits under the old temp name is not ours: left as it is, not written through
         symlink(out.join("victim"), ws.join("f.lci-tmp")).unwrap();
         let r = root(&ws);
         place_nofollow(&r, "f", b"new", 0o644).unwrap();
         assert_eq!(fs::read(ws.join("f")).unwrap(), b"new");
         assert_eq!(fs::read(out.join("victim")).unwrap(), b"keep");
-        assert!(!ws.join("f.lci-tmp").exists());
-        // a dangling link as the temp name is the same
-        symlink(out.join("not-yet"), ws.join("g.lci-tmp")).unwrap();
-        place_nofollow(&r, "g", b"x", 0o644).unwrap();
-        assert!(!out.join("not-yet").exists());
-        // a temp name that cannot be removed (a directory) is an error, and nothing is made
+        assert!(ws.join("f.lci-tmp").symlink_metadata().is_ok());
+        fs::write(ws.join("g.lci-tmp"), "someone's").unwrap();
         fs::create_dir(ws.join("h.lci-tmp")).unwrap();
-        assert!(place_nofollow(&r, "h", b"x", 0o644).is_err());
-        assert!(!ws.join("h").exists());
+        place_nofollow(&r, "g", b"x", 0o644).unwrap();
+        place_nofollow(&r, "h", b"x", 0o644).unwrap();
+        assert_eq!(fs::read(ws.join("g.lci-tmp")).unwrap(), b"someone's");
+        assert!(ws.join("h.lci-tmp").is_dir());
+        // every placement has a temp name of its own, and none stays
+        for _ in 0..3 {
+            place_nofollow(&r, "g", b"y", 0o644).unwrap();
+        }
+        let names: Vec<String> = fs::read_dir(&ws)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 6, "{names:?}");
         // the name itself being a symlink or a directory is not replaced
         symlink(out.join("victim"), ws.join("l")).unwrap();
         let e = place_nofollow(&r, "l", b"x", 0o644)

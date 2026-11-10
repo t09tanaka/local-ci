@@ -494,8 +494,7 @@ fn cached_opts(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> local_ci::R
 }
 
 fn run_cached(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> RunResult {
-    // a run directory is named by the second it starts in
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // two runs in one second have run directories of their own
     local_ci::run(
         &ctx(tmp.path()),
         cached_opts(tmp, dir, workflows),
@@ -688,11 +687,6 @@ fn a_matrix_upload_name_must_tell_every_variant_apart() {
         ("r-${{ matrix.node }}", ""),
         ("r", ""),
         ("r-${{ matrix.os }}\n          overwrite: true", ""),
-        // a key `include` adds counts too
-        (
-            "r-${{ matrix.os }}-${{ matrix.node }}",
-            "        include:\n          - os: a\n            extra: z\n",
-        ),
     ] {
         let (_t, _f, r) = run(&job(name, extra));
         assert_eq!(r.state, "error", "{name}");
@@ -704,23 +698,35 @@ fn a_matrix_upload_name_must_tell_every_variant_apart() {
         why(&r, "m")
     };
     assert!(e.contains("matrix.node") && e.contains("m`"), "{e}");
-    // every key or the index of the variant
-    for name in [
-        "r-${{ matrix.os }}-${{ matrix.node }}",
-        "r-${{ strategy.job-index }}",
+    // every key or the index of the variant; a key `include` only adds to a
+    // variant is not one to ask for
+    for (name, extra) in [
+        ("r-${{ matrix.os }}-${{ matrix.node }}", ""),
+        ("r-${{ strategy.job-index }}", ""),
+        (
+            "r-${{ matrix.os }}-${{ matrix.node }}",
+            "        include:\n          - os: a\n            node: 1\n            extra: z\n",
+        ),
     ] {
-        let (_t, _f, r) = run(&job(name, ""));
+        let (_t, _f, r) = run(&job(name, extra));
         assert_eq!(r.state, "success", "{name}: {r:?}");
     }
-    // the whole matrix passes the check before the run (what it expands to is
-    // JSON, which a name cannot hold, as on GitHub: that is the run's to say)
+    // the whole matrix is JSON, which a name cannot hold: refused before the run
     for name in ["r-${{ matrix }}", "r-${{ toJSON(matrix) }}"] {
         let (_t, _f, r) = run(&job(name, ""));
-        assert!(
-            !why(&r, "m").contains("does not tell the variants"),
-            "{name}"
-        );
+        assert_eq!(r.state, "error", "{name}");
+        assert!(why(&r, "m").contains("holds the whole matrix"), "{name}");
     }
+}
+
+#[test]
+fn an_include_key_that_only_adds_to_a_variant_is_not_asked_of_the_name() {
+    let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        include:\n          - os: a\n            experimental: true\n    steps:\n      - run: mkdir -p out && echo hi > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: x-${{ matrix.os }}\n          path: out\n";
+    let (_t, _f, r) = run(jobs);
+    assert_eq!(r.state, "success", "{r:?}");
+    let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n        include:\n          - os: a\n            experimental: true\n    steps:\n      - run: mkdir -p out && echo hi > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: x-${{ matrix.os }}\n          path: out\n";
+    let (_t, _f, r) = run(jobs);
+    assert_eq!(r.state, "success", "{r:?}");
 }
 
 fn kept_files(cache: &Path) -> Vec<PathBuf> {
@@ -1224,4 +1230,167 @@ fn a_temp_file_swapped_for_a_symlink_is_not_written_through() {
         std::fs::read_to_string(l.out.join("victim")).unwrap(),
         "keep"
     );
+}
+
+const TWO_PACKAGE: &str = "name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  package:\n    runs-on: x\n    steps:\n      - run: sleep 2\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: mkdir -p dist && cp got/a.txt dist/d.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: dist\n          path: dist\n";
+
+#[test]
+fn a_restore_that_fails_leaves_no_artifact_of_the_units_that_run_again() {
+    for overwrite in [false, true] {
+        let (tmp, dir) = lab(BUILD_ONLY);
+        let two = if overwrite {
+            format!("{TWO_PACKAGE}          overwrite: true\n")
+        } else {
+            TWO_PACKAGE.to_string()
+        };
+        std::fs::write(dir.join(".github/workflows/two.yml"), two).unwrap();
+        git(&dir, &["add", ".github/workflows/two.yml"]);
+        git(&dir, &["commit", "-qm", "two"]);
+        // the uploader first; `package` waits a little, so that when both run
+        // together `bundle` is there when it downloads
+        let first = run_cached(&tmp, &dir, &["one.yml"]);
+        assert_eq!(first.state, "success", "{overwrite}: {first:?}");
+        let second = run_cached(&tmp, &dir, &[]);
+        assert_eq!(second.state, "success", "{overwrite}: {second:?}");
+        let third = run_cached(&tmp, &dir, &[]);
+        assert!(is_cached(&third, "build") && is_cached(&third, "package"));
+        // the artifact `package` takes is not what its receipt says
+        let kept = kept_files(&tmp.path().join("cache3"));
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        std::fs::set_permissions(
+            &kept[0],
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::write(&kept[0], "tampered").unwrap();
+        // both run again, and `dist` of the restored result is not left over
+        let fourth = run_cached(&tmp, &dir, &[]);
+        assert_eq!(fourth.state, "success", "{overwrite}: {fourth:?}");
+        assert!(!is_cached(&fourth, "build") && !is_cached(&fourth, "package"));
+        assert!(!why_all(&fourth).contains("already uploaded"));
+        assert!(fourth.run_dir.join("artifacts/dist/v1").exists());
+        assert!(
+            !fourth.run_dir.join("artifacts/dist/v2").exists(),
+            "{overwrite}: a stale v1 of `dist` was left in the run's area"
+        );
+        assert_eq!(receipt(&fourth, "dist", 1).restored_from, None);
+        let fifth = run_cached(&tmp, &dir, &[]);
+        assert!(is_cached(&fifth, "build") && is_cached(&fifth, "package"));
+    }
+}
+
+fn why_all(r: &RunResult) -> String {
+    r.units
+        .iter()
+        .flat_map(|u| &u.jobs)
+        .map(|j| format!("{:?}", j.outcome))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn a_regular_file_partway_along_the_download_path_places_nothing() {
+    let l = lab_io();
+    std::fs::create_dir_all(l.ws.join("src/sub")).unwrap();
+    std::fs::write(l.ws.join("src/a"), "a").unwrap();
+    std::fs::write(l.ws.join("src/sub/b"), "b").unwrap();
+    l.up("n", "src").unwrap();
+    let d = l.fresh("d");
+    std::fs::write(d.join("sub"), "a file").unwrap();
+    let e = l.down(&d, &[("name", "n")]).unwrap_err();
+    assert!(e.contains("not a directory"), "{e}");
+    assert!(
+        !d.join("a").exists(),
+        "`a` was placed before `sub/b` failed"
+    );
+    assert_eq!(std::fs::read_to_string(d.join("sub")).unwrap(), "a file");
+}
+
+#[test]
+fn a_matrix_job_that_uploads_is_reused_with_its_artifacts() {
+    let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: mkdir -p out && printf one > out/a.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: bundle-${{ matrix.os }}\n          path: out\n";
+    let (tmp, dir) = lab(jobs);
+    let first = run_cached(&tmp, &dir, &[]);
+    assert_eq!(first.state, "success", "{first:?}");
+    let second = run_cached(&tmp, &dir, &[]);
+    assert!(is_cached(&second, "m"), "{second:?}");
+    // both variants' uploads are in this run's area again
+    assert_eq!(
+        artifact_io::published_names(&second.run_dir),
+        ["bundle-a", "bundle-b"]
+    );
+    // a matrix entry names the job by its id
+    assert!(first.units[0].jobs.iter().all(|j| j.job == "m"));
+}
+
+#[test]
+fn a_task_run_through_the_library_is_refused_like_a_run() {
+    // an upload of a matrix whose name does not tell the variants apart
+    let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: mkdir -p out && echo hi > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: report\n          path: out\n          overwrite: true\n";
+    let (tmp, dir) = lab(jobs);
+    let fp = plan(&tmp, &dir).unwrap();
+    let cache = tmp.path().join("lab");
+    std::fs::create_dir_all(cache.join("locks")).unwrap();
+    let wt = cache.join("wt/w");
+    local_ci::git::add_worktree(&ctx(tmp.path()), &dir, &wt, &fp.source.execution_commit).unwrap();
+    let ws = Workspace {
+        root: wt.clone(),
+        repo_root: dir.clone(),
+        run_dir: cache.join("runs/r1"),
+        tools: cache.join("wt/w.tools"),
+        lock_file: cache.join("locks/lab.lock"),
+    };
+    std::fs::create_dir_all(&ws.run_dir).unwrap();
+    assert!(!fp.tasks.is_empty());
+    for task in &fp.tasks {
+        let opts = Opts {
+            parallel: 1,
+            canirun: None,
+            portool: None,
+            containers: 1,
+            job_timeout_min: 5.0,
+            keep: true,
+            trash: cache.join("trash"),
+        };
+        let r = local_ci::execute_task(
+            &ctx(tmp.path()),
+            &fp,
+            &task.id,
+            &local_ci::TaskInputs::default(),
+            None,
+            &ws,
+            opts,
+        )
+        .unwrap();
+        assert!(!r.jobs.is_empty());
+        for j in &r.jobs {
+            let Outcome::Error(e) = &j.outcome else {
+                panic!("{:?}", j.outcome)
+            };
+            assert!(e.contains("does not tell the variants"), "{e}");
+            assert_eq!(j.job, "m");
+        }
+        assert!(r
+            .outcomes
+            .iter()
+            .all(|o| o.status == local_ci::JobStatus::Failure));
+        // nothing was started: no output of the step
+        assert!(!wt.join("out").exists());
+    }
+}
+
+#[test]
+fn a_refused_matrix_job_has_an_error_for_each_variant_in_a_complete_check() {
+    let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: echo hi\n      - uses: actions/upload-artifact@v4\n        with:\n          name: report\n          path: x\n";
+    let (_t, fp, r) = run(jobs);
+    assert_eq!(r.state, "error");
+    let c = validate_run_result(&fp, &r);
+    // an error the plan accounts for, not a job missing entries
+    assert!(c.missing.is_empty(), "{c:?}");
+    assert_eq!(c.verdict, Verdict::Complete, "{c:?}");
+    let entries: Vec<_> = r.units[0].jobs.iter().collect();
+    assert_eq!(entries.len(), 2);
+    assert!(entries
+        .iter()
+        .all(|j| matches!(j.outcome, Outcome::Error(_))));
 }
