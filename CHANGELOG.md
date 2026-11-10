@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+- Secret files of a captured source (`source::CaptureOptions::secret_files`)
+  can now come with every kind of capture, not only that of a working tree:
+  - `source::capture_directory` keeps the files a `secret_files` declaration
+    matches out of the object store and the manifest's entries and writes
+    them to the secret bundle, as `capture_source` does. Before, the
+    declarations were ignored there and such a file became plain content.
+    The checks are the same (`SecretKeyTooShort`, `RequiredSecretMissing`, a
+    warning for an optional declaration that matches nothing). `exclude` is
+    applied first: what it leaves out is not looked into.
+  - `CaptureOptions::secret_root: Option<PathBuf>` takes the secret files
+    from another working tree than the one that is captured: the tree a
+    commit was checked out from, when the capture runs in a clean checkout of
+    that commit. The files are chosen there (untracked files of that tree,
+    ignored or not, that a declaration matches), read there and checked again
+    after the read, so a file that changes meanwhile is retried and then
+    `SOURCE_BUSY`. A file of that tree which the captured index tracks is
+    commit content and is left out with the usual warning. Files of the
+    checkout itself that a declaration matches are still kept out of the
+    source, and are not the secret. `capture_directory` refuses the option.
+  - `CaptureOptions::secret_bundle: Option<PathBuf>` writes the secret bundle
+    to a path of the caller's (one per run) instead of
+    `<store>/secrets/<source_id>.json`. The file is created at 0600 and never
+    replaces anything: a path that exists (a dangling symlink included) or
+    whose directory does not exist is the new
+    `SourceError::SecretBundlePath { path, why }`, said before anything is
+    read and checked again at the write. When the capture fails after the
+    file was written, it is removed. `SecretBundle::save_new` is that write.
+    With the option unset nothing changes.
+  - A secret file is now read only when every directory above it, below the
+    root, is a real directory (`SourceError::UnsafePath` otherwise), and
+    through a descriptor that does not follow a symlink; a symlink, a FIFO or
+    a device at the path was an error before and still is.
+  This is a breaking change for external code: `CaptureOptions` has two new
+  public fields, so a struct literal without `..CaptureOptions::default()`
+  adds `secret_root: None, secret_bundle: None`, and an exhaustive `match` on
+  `SourceError` adds the `SecretBundlePath` arm.
 - `exec::Opts` has a new field `executor: Option<Arc<dyn StepExecutor>>`
   (`src/step_executor.rs`). When set, every step is handed to it as a
   `StepRequest` (key, argv, cwd, env, log, timeout, script pipe, cancel

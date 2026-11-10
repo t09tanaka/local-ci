@@ -195,9 +195,12 @@ struct Meta {
     untracked: Vec<RelPath>,
     /// Ignored files taken along by `include`.
     included: Vec<RelPath>,
-    /// Files that match `secret_files`.
+    /// Files that match `secret_files` (declaration index, path).
     secret: Vec<(usize, RelPath)>,
     stats: BTreeMap<RelPath, Option<Stat>>,
+    /// The stats of `secret`, apart from `stats`: with a `secret_root` they
+    /// are files of another directory.
+    secret_stats: BTreeMap<RelPath, Option<Stat>>,
 }
 
 struct Selection {
@@ -220,11 +223,19 @@ impl Meta {
         if self.index_hash != later.index_hash || self.tracked != later.tracked {
             return "the index changed".into();
         }
-        if self.untracked != later.untracked || self.included != later.included {
+        if self.untracked != later.untracked
+            || self.included != later.included
+            || self.secret != later.secret
+        {
             return "files were added, removed or renamed".into();
         }
         for (p, s) in &self.stats {
             if later.stats.get(p) != Some(s) {
+                return format!("{} changed", p.display());
+            }
+        }
+        for (p, s) in &self.secret_stats {
+            if later.secret_stats.get(p) != Some(s) {
                 return format!("{} changed", p.display());
             }
         }
@@ -346,6 +357,7 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
     let mut secret = vec![];
     let mut secret_paths = BTreeSet::new();
     let mut tracked_secrets = vec![];
+    let secret_root = o.secret_root.as_deref().unwrap_or(root);
     if !o.secrets.is_empty() {
         for p in tracked
             .iter()
@@ -357,16 +369,31 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
                 tracked_secrets.push((i, p.clone()));
             }
         }
-        for p in untracked.iter().chain(ignored.iter()) {
-            for (i, g) in o.secrets.iter().enumerate() {
-                if g.matches(p) {
-                    secret.push((i, p.clone()));
-                    secret_paths.insert(p.clone());
-                    break;
-                }
+        // a file here that a declaration matches never becomes content of
+        // the source, wherever the secret files are taken from
+        let own = pick_secrets(o, untracked.iter().chain(ignored.iter()));
+        secret_paths = own.iter().map(|s| s.1.clone()).collect();
+        secret = match &o.secret_root {
+            None => own,
+            Some(from) => {
+                let listed = secret_candidates(ctx, from)?;
+                let mut picked = pick_secrets(o, listed.iter());
+                // what the captured index tracks is commit content, as above
+                picked.retain(|s| {
+                    let is_tracked = tracked_set.contains(&s.1);
+                    if is_tracked && !tracked_secrets.contains(s) {
+                        tracked_secrets.push(s.clone());
+                    }
+                    !is_tracked
+                });
+                picked
             }
-        }
+        };
     }
+    let secret_stats: BTreeMap<RelPath, Option<Stat>> = secret
+        .iter()
+        .map(|s| (s.1.clone(), lstat(secret_root, &s.1)))
+        .collect();
 
     let keep = |p: &RelPath| !o.exclude.matches(p) && !secret_paths.contains(p);
     let tracked: Vec<(u32, String, RelPath)> = tracked.into_iter().filter(|t| keep(&t.2)).collect();
@@ -383,7 +410,6 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
         .map(|t| &t.2)
         .chain(untracked.iter())
         .chain(included.iter())
-        .chain(secret.iter().map(|s| &s.1))
     {
         stats.insert(p.clone(), lstat(root, p));
     }
@@ -398,10 +424,50 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
             included,
             secret,
             stats,
+            secret_stats,
         },
         index_bytes,
         tracked_secrets,
     })
+}
+
+/// The files among `candidates` that a `secret_files` declaration matches,
+/// each with the index of the first declaration that does.
+fn pick_secrets<'a>(
+    o: &Opts,
+    candidates: impl Iterator<Item = &'a RelPath>,
+) -> Vec<(usize, RelPath)> {
+    candidates
+        .filter_map(|p| {
+            o.secrets
+                .iter()
+                .position(|g| g.matches(p))
+                .map(|i| (i, p.clone()))
+        })
+        .collect()
+}
+
+/// Every file of the working tree `root` that Git does not track, ignored
+/// or not: what a secret file can be. (A repository of its own below it is
+/// listed as a directory and is not looked into.)
+fn secret_candidates(ctx: &ExecContext, root: &Path) -> Result<Vec<RelPath>> {
+    Ok(split_z(&og(ctx, root, &["ls-files", "-z", "-o"])?)
+        .into_iter()
+        .filter(|rec| !rec.ends_with(b"/"))
+        .map(|rec| RelPath(rec.to_vec()))
+        .collect())
+}
+
+/// The top of the working tree `dir` is in, for
+/// [`CaptureOptions::secret_root`].
+fn secret_toplevel(ctx: &ExecContext, dir: &Path) -> Result<PathBuf> {
+    let top = og_str(ctx, dir, &["rev-parse", "--show-toplevel"]).with_context(|| {
+        format!(
+            "secret_root {} is not inside a git working tree",
+            dir.display()
+        )
+    })?;
+    Ok(std::fs::canonicalize(top)?)
 }
 
 /// A FIFO, socket or device in the working directory that is not in an
@@ -496,13 +562,20 @@ fn select_directory(dir: &Path, o: &Opts, warnings: &mut Vec<String>) -> Result<
     }
     let mut files = vec![];
     walk(dir, &RelPath(vec![]), o, &mut files, warnings)?;
-    let mut stats = BTreeMap::new();
-    for p in &files {
-        stats.insert(p.clone(), lstat(dir, p));
-    }
+    // the secret files are kept apart, as in a worktree
+    let secret = pick_secrets(o, files.iter());
+    let secret_paths: BTreeSet<&RelPath> = secret.iter().map(|s| &s.1).collect();
+    files.retain(|p| !secret_paths.contains(p));
+    let stats = files.iter().map(|p| (p.clone(), lstat(dir, p))).collect();
+    let secret_stats = secret
+        .iter()
+        .map(|s| (s.1.clone(), lstat(dir, &s.1)))
+        .collect();
     Ok(Meta {
         untracked: files,
+        secret,
         stats,
+        secret_stats,
         ..Meta::default()
     })
 }
@@ -511,6 +584,9 @@ struct Opts {
     exclude: Globs,
     include: Globs,
     secrets: Vec<Globs>,
+    /// The top of the working tree the secret files are taken from, when it
+    /// is not the directory that is captured.
+    secret_root: Option<PathBuf>,
 }
 
 // ---- reading --------------------------------------------------------------
@@ -592,8 +668,25 @@ fn ingest(
     }))
 }
 
+/// One secret file of `root`: `None` when it is gone. Only a regular file
+/// that is really below `root` is read: a symlink (the file itself or a
+/// directory above it), a FIFO or a device is an error, never skipped and
+/// never followed.
 fn read_secret(root: &Path, p: &RelPath, st: &Option<Stat>) -> Result<Option<(u32, Vec<u8>)>> {
     let Some(st) = st else { return Ok(None) };
+    super::store::check_safe(p)?;
+    for a in p.ancestors() {
+        let real_dir = std::fs::symlink_metadata(root.join(a.to_path()))
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !real_dir {
+            return Err(SourceError::UnsafePath {
+                path: p.display(),
+                why: format!("{} is not a directory (a symlink or a file)", a.display()),
+            }
+            .into());
+        }
+    }
     let full = root.join(p.to_path());
     let meta = std::fs::symlink_metadata(&full)?;
     if !meta.file_type().is_file() {
@@ -606,7 +699,16 @@ fn read_secret(root: &Path, p: &RelPath, st: &Option<Stat>) -> Result<Option<(u3
     if Stat::of(&meta) != *st {
         return Err(unstable(format!("{} changed", p.display())));
     }
-    let bytes = std::fs::read(&full)?;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&full)?;
+    let opened = f.metadata()?;
+    if opened.ino() != st.ino || opened.dev() != st.dev {
+        return Err(unstable(format!("{} was replaced", p.display())));
+    }
+    let mut bytes = vec![];
+    std::io::Read::read_to_end(&mut f, &mut bytes)?;
     let after = std::fs::symlink_metadata(&full)?;
     if Stat::of(&after) != *st || bytes.len() as u64 != st.size {
         return Err(unstable(format!("{} changed while read", p.display())));
@@ -1495,7 +1597,26 @@ fn build_opts(o: &CaptureOptions) -> Result<Opts> {
             .iter()
             .map(|s| Globs::new(std::slice::from_ref(&s.glob)))
             .collect::<Result<_>>()?,
+        secret_root: None,
     })
+}
+
+/// What has to hold before a capture with `secret_files` starts.
+fn check_secret_opts(opts: &CaptureOptions) -> Result<()> {
+    if opts.secret_files.is_empty() {
+        return Ok(());
+    }
+    if opts.secret_key.len() < MIN_SECRET_KEY {
+        return Err(SourceError::SecretKeyTooShort {
+            len: opts.secret_key.len(),
+        }
+        .into());
+    }
+    if let Some(path) = &opts.secret_bundle {
+        // said before anything is read; the write itself checks again
+        secret::check_new_path(path)?;
+    }
+    Ok(())
 }
 
 fn store_of(ctx: &ExecContext, o: &CaptureOptions) -> Result<ObjectStore> {
@@ -1514,6 +1635,7 @@ struct Read {
 fn read_all(
     store: &ObjectStore,
     root: &Path,
+    secret_root: &Path,
     meta: &Meta,
     gitlink_paths: &BTreeSet<&RelPath>,
 ) -> Result<Read> {
@@ -1533,7 +1655,7 @@ fn read_all(
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut secrets = vec![];
     for (i, p) in &meta.secret {
-        if let Some((mode, bytes)) = read_secret(root, p, &meta.stats[p])? {
+        if let Some((mode, bytes)) = read_secret(secret_root, p, &meta.secret_stats[p])? {
             secrets.push((*i, p.clone(), mode, bytes));
         }
     }
@@ -1547,12 +1669,7 @@ pub fn capture_source(
     repo_dir: &Path,
     opts: &CaptureOptions,
 ) -> Result<SourceSnapshot> {
-    if !opts.secret_files.is_empty() && opts.secret_key.len() < MIN_SECRET_KEY {
-        return Err(SourceError::SecretKeyTooShort {
-            len: opts.secret_key.len(),
-        }
-        .into());
-    }
+    check_secret_opts(opts)?;
     capture_worktree(ctx, repo_dir, opts, &store_of(ctx, opts)?).map(|(snap, _)| snap)
 }
 
@@ -1571,7 +1688,10 @@ fn capture_worktree(
     let root = std::fs::canonicalize(top)?;
     let cwd = std::fs::canonicalize(repo_dir)?;
     let cwd_relative = RelPath::new(cwd.strip_prefix(&root).unwrap_or(Path::new("")));
-    let o = build_opts(opts)?;
+    let mut o = build_opts(opts)?;
+    if let (Some(dir), false) = (&opts.secret_root, o.secrets.is_empty()) {
+        o.secret_root = Some(secret_toplevel(ctx, dir)?);
+    }
     check_supported(ctx, &root)?;
     let repo_id = repository_id(ctx, &root)?;
     let git_dir = private_repo(ctx, store, &root, &repo_id)?;
@@ -1661,7 +1781,8 @@ fn one_pass(
             ));
         }
     }
-    let mut read = read_all(store, root, &sel.meta, &gitlink_paths)?;
+    let secret_root = o.secret_root.as_deref().unwrap_or(root);
+    let mut read = read_all(store, root, secret_root, &sel.meta, &gitlink_paths)?;
     let lfs = resolve_lfs(ctx, store, root, &mut read.entries)?;
     opts.call(Stage::AfterRead(attempt))?;
     let again = select_worktree(ctx, root, o)?;
@@ -1671,6 +1792,11 @@ fn one_pass(
     // the stats of what was read are the stats now
     for p in sel.meta.stats.keys() {
         if lstat(root, p) != sel.meta.stats[p] {
+            return Err(unstable(format!("{} changed", p.display())));
+        }
+    }
+    for (p, st) in &sel.meta.secret_stats {
+        if lstat(secret_root, p) != *st {
             return Err(unstable(format!("{} changed", p.display())));
         }
     }
@@ -1743,35 +1869,8 @@ fn finish(
             .filter(|s| !s.is_empty())
     });
 
-    let mut secret_files = vec![];
-    let mut bundle_files = vec![];
-    for (i, path, mode, bytes) in &p.read.secrets {
-        let _ = i;
-        secret_files.push(SecretEntry {
-            path: path.clone(),
-            hmac: secret::secret_digest(&opts.secret_key, path, bytes),
-        });
-        bundle_files.push((path.clone(), *mode, bytes.clone()));
-    }
-    for (_, path) in &p.sel.tracked_secrets {
-        warnings.push(format!(
-            "{} is tracked, so it is commit content and not a secret file",
-            path.display()
-        ));
-    }
-    for (i, spec) in opts.secret_files.iter().enumerate() {
-        if p.read.secrets.iter().all(|s| s.0 != i) && p.sel.tracked_secrets.iter().all(|s| s.0 != i)
-        {
-            if spec.required {
-                return Err(SourceError::RequiredSecretMissing {
-                    glob: spec.glob.clone(),
-                }
-                .into());
-            }
-            warnings.push(format!("secret_files {:?} matches no file", spec.glob));
-        }
-    }
-    secret_files.sort_by(|a, b| a.path.cmp(&b.path));
+    let (secret_files, bundle_files) =
+        secret_entries(opts, p.read.secrets, &p.sel.tracked_secrets, &mut warnings)?;
 
     let entries = p.read.entries;
     let mut submodules: Vec<SubmoduleRef> = p.submodules.into_iter().map(|s| s.0).collect();
@@ -1830,20 +1929,91 @@ fn finish(
             None,
         )?;
     }
-    let secrets = if bundle_files.is_empty() {
-        None
-    } else {
-        let path = store.secrets_path(&m.source_id);
-        SecretBundle::new(bundle_files).save(&path)?;
-        Some(path)
-    };
-    opts.call(Stage::BeforePublish)?;
-    store.publish_manifest(&m)?;
+    let secrets = publish(store, opts, &m, bundle_files)?;
     Ok(SourceSnapshot {
         manifest: m,
         secrets,
         warnings,
     })
+}
+
+type BundleFile = (RelPath, u32, Vec<u8>);
+
+/// The manifest entries and the bundle content of the secret files that were
+/// read. A declaration that matched nothing fails the capture when it is
+/// `required` and is a warning otherwise.
+fn secret_entries(
+    opts: &CaptureOptions,
+    read: Vec<(usize, RelPath, u32, Vec<u8>)>,
+    tracked: &[(usize, RelPath)],
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<SecretEntry>, Vec<BundleFile>)> {
+    for (_, path) in tracked {
+        warnings.push(format!(
+            "{} is tracked, so it is commit content and not a secret file",
+            path.display()
+        ));
+    }
+    for (i, spec) in opts.secret_files.iter().enumerate() {
+        if read.iter().all(|s| s.0 != i) && tracked.iter().all(|s| s.0 != i) {
+            if spec.required {
+                return Err(SourceError::RequiredSecretMissing {
+                    glob: spec.glob.clone(),
+                }
+                .into());
+            }
+            warnings.push(format!("secret_files {:?} matches no file", spec.glob));
+        }
+    }
+    let mut secret_files = vec![];
+    let mut bundle_files = vec![];
+    for (_, path, mode, bytes) in read {
+        secret_files.push(SecretEntry {
+            hmac: secret::secret_digest(&opts.secret_key, &path, &bytes),
+            path: path.clone(),
+        });
+        bundle_files.push((path, mode, bytes));
+    }
+    secret_files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((secret_files, bundle_files))
+}
+
+/// The last step of a capture: the secret bundle, then the manifest. A
+/// bundle at a path the caller chose is taken away again when the manifest
+/// is not published after all, so nothing of a capture that failed stays
+/// there (and the same path can be used for the next try).
+fn publish(
+    store: &ObjectStore,
+    opts: &CaptureOptions,
+    m: &SourceManifest,
+    bundle_files: Vec<BundleFile>,
+) -> Result<Option<PathBuf>> {
+    let secrets = if bundle_files.is_empty() {
+        None
+    } else {
+        let bundle = SecretBundle::new(bundle_files);
+        Some(match &opts.secret_bundle {
+            Some(path) => {
+                bundle.save_new(path)?;
+                path.clone()
+            }
+            None => {
+                let path = store.secrets_path(&m.source_id);
+                bundle.save(&path)?;
+                path
+            }
+        })
+    };
+    let published = opts
+        .call(Stage::BeforePublish)
+        .and_then(|()| store.publish_manifest(m));
+    if let Err(e) = published {
+        if let (Some(written), true) = (&secrets, opts.secret_bundle.is_some()) {
+            let _ = std::fs::remove_file(written);
+        }
+        return Err(e);
+    }
+    Ok(secrets)
 }
 
 /// Capture a directory that is not a repository: the same manifest, without
@@ -1853,6 +2023,10 @@ pub fn capture_directory(
     dir: &Path,
     opts: &CaptureOptions,
 ) -> Result<SourceSnapshot> {
+    check_secret_opts(opts)?;
+    if opts.secret_root.is_some() && !opts.secret_files.is_empty() {
+        bail!("secret_root is for the capture of a repository; a directory capture takes its secret files from the directory itself");
+    }
     let store = store_of(ctx, opts)?;
     let root = std::fs::canonicalize(dir)?;
     let o = build_opts(opts)?;
@@ -1862,7 +2036,7 @@ pub fn capture_directory(
     for attempt in 1..=attempts {
         let attempt_res = (|| -> Result<(Meta, Read, Vec<LfsRef>)> {
             let meta = select_directory(&root, &o, &mut warnings)?;
-            let read = read_all(&store, &root, &meta, &BTreeSet::new())?;
+            let read = read_all(&store, &root, &root, &meta, &BTreeSet::new())?;
             opts.call(Stage::AfterRead(attempt))?;
             let mut again_warnings = vec![];
             let again = select_directory(&root, &o, &mut again_warnings)?;
@@ -1874,6 +2048,8 @@ pub fn capture_directory(
         match attempt_res {
             Ok((_meta, read, lfs)) => {
                 let entries = read.entries;
+                let (secret_files, bundle_files) =
+                    secret_entries(opts, read.secrets, &[], &mut warnings)?;
                 let m = seal_manifest(SourceManifest {
                     schema_version: SCHEMA_VERSION,
                     source_id: String::new(),
@@ -1896,15 +2072,14 @@ pub fn capture_directory(
                     submodules: vec![],
                     lfs,
                     canonical: CanonicalConfig::default(),
-                    secret_files: vec![],
+                    secret_files,
                 });
-                opts.call(Stage::BeforePublish)?;
-                store.publish_manifest(&m)?;
+                let secrets = publish(&store, opts, &m, bundle_files)?;
                 warnings.sort();
                 warnings.dedup();
                 return Ok(SourceSnapshot {
                     manifest: m,
-                    secrets: None,
+                    secrets,
                     warnings,
                 });
             }
@@ -1915,4 +2090,102 @@ pub fn capture_directory(
         }
     }
     Err(SourceError::Busy { attempts, last }.into())
+}
+
+#[cfg(test)]
+mod read_secret_tests {
+    use super::*;
+
+    fn err_of(root: &Path, p: &str) -> SourceError {
+        let p = RelPath::new(p);
+        // the stat as a selection that followed the path would have taken it
+        let st = std::fs::metadata(root.join(p.to_path()))
+            .ok()
+            .map(|m| Stat::of(&m));
+        let e = read_secret(root, &p, &st).unwrap_err();
+        e.downcast_ref::<SourceError>()
+            .unwrap_or_else(|| panic!("{e:#}"))
+            .clone()
+    }
+
+    #[test]
+    fn a_regular_file_below_the_root_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("conf/deep")).unwrap();
+        std::fs::write(root.join("conf/deep/a.key"), "k1\n").unwrap();
+        let p = RelPath::new("conf/deep/a.key");
+        let got = read_secret(root, &p, &lstat(root, &p)).unwrap();
+        assert_eq!(got, Some((0o600, b"k1\n".to_vec())));
+        // gone when it was listed: nothing, and `required` decides
+        assert_eq!(
+            read_secret(root, &RelPath::new("conf/none"), &None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_directory_above_the_file_that_is_a_symlink_is_not_gone_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(outside.join("a.key"), "out\n").unwrap();
+        std::fs::write(outside.join("deep/b.key"), "out\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("conf")).unwrap();
+        std::os::unix::fs::symlink(outside.join("deep"), root.join("real/deep")).unwrap();
+        assert_eq!(
+            err_of(&root, "conf/a.key"),
+            SourceError::UnsafePath {
+                path: "conf/a.key".into(),
+                why: "conf is not a directory (a symlink or a file)".into()
+            }
+        );
+        // not only the first component
+        assert_eq!(
+            err_of(&root, "real/deep/b.key"),
+            SourceError::UnsafePath {
+                path: "real/deep/b.key".into(),
+                why: "real/deep is not a directory (a symlink or a file)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_root_or_is_not_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(tmp.path().join("up.key"), "out\n").unwrap();
+        std::os::unix::fs::symlink("../up.key", root.join("l.key")).unwrap();
+        assert!(matches!(
+            err_of(&root, "../up.key"),
+            SourceError::UnsafePath { .. }
+        ));
+        assert_eq!(
+            err_of(&root, "l.key"),
+            SourceError::UnsupportedFileType {
+                path: "l.key".into(),
+                kind: "non-regular secret file".into()
+            }
+        );
+        assert!(matches!(
+            err_of(&root, "d"),
+            SourceError::UnsupportedFileType { .. }
+        ));
+    }
+
+    #[test]
+    fn a_file_that_is_not_the_one_that_was_listed_is_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.key"), "one\n").unwrap();
+        let p = RelPath::new("a.key");
+        let st = lstat(root, &p);
+        std::fs::write(root.join("b.key"), "two\n").unwrap();
+        std::fs::rename(root.join("b.key"), root.join("a.key")).unwrap();
+        let e = read_secret(root, &p, &st).unwrap_err();
+        assert!(e.downcast_ref::<Unstable>().is_some(), "{e:#}");
+    }
 }

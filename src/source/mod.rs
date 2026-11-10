@@ -186,7 +186,9 @@ pub struct SourceManifest {
 #[derive(Debug, Clone)]
 pub struct SourceSnapshot {
     pub manifest: SourceManifest,
-    /// The secret files, kept apart from the store (0600), when there are any.
+    /// The secret files, kept apart from the objects (0600), when there are
+    /// any: `<store>/secrets/<source_id>.json`, or
+    /// [`CaptureOptions::secret_bundle`] when that is set.
     pub secrets: Option<PathBuf>,
     /// Things worth saying that did not stop the capture.
     pub warnings: Vec<String>,
@@ -228,6 +230,23 @@ pub struct CaptureOptions {
     pub secret_files: Vec<SecretSpec>,
     /// The key of the `secret_files` HMACs.
     pub secret_key: Vec<u8>,
+    /// Where the secret files are looked for, when that is not the directory
+    /// that is captured: the working tree a commit was checked out from (the
+    /// capture itself then runs in a clean checkout, which has none of them).
+    /// Any directory inside that working tree; the globs are relative to its
+    /// top. The files are chosen, read and checked there exactly as a
+    /// worktree capture does in its own directory. A file of this tree that
+    /// the captured index tracks is commit content and is not taken. Only
+    /// for [`capture_source`]; [`capture_directory`] refuses it.
+    pub secret_root: Option<PathBuf>,
+    /// Write the secret bundle here instead of `<store>/secrets/<source_id>.json`
+    /// (a path of the run, so that two captures of the same source do not
+    /// share a file). The file is created, never replaced: a path that exists
+    /// and a parent directory that does not are both
+    /// [`SourceError::SecretBundlePath`]. When the capture fails after the
+    /// file was written, it is removed again. Nothing is written when no
+    /// secret file was found.
+    pub secret_bundle: Option<PathBuf>,
     pub max_attempts: u32,
     pub hook: Option<Hook>,
 }
@@ -241,6 +260,8 @@ impl Default for CaptureOptions {
             exclude: vec![],
             secret_files: vec![],
             secret_key: vec![],
+            secret_root: None,
+            secret_bundle: None,
             max_attempts: MAX_ATTEMPTS,
             hook: None,
         }
@@ -287,6 +308,10 @@ pub enum SourceError {
     Corrupt { what: String },
     /// `secret_files` is declared with a key that is empty or too short.
     SecretKeyTooShort { len: usize },
+    /// The secret bundle cannot be written where
+    /// [`CaptureOptions::secret_bundle`] says: the file is already there, or
+    /// its directory is not.
+    SecretBundlePath { path: String, why: String },
     /// A shallow clone: its history is not all there to copy.
     ShallowClone,
     /// A repository that does not use SHA-1 object names.
@@ -334,6 +359,9 @@ impl fmt::Display for SourceError {
                 write!(f, "{path}: unmerged; resolve the merge before capturing")
             }
             SourceError::Corrupt { what } => write!(f, "source store: {what}"),
+            SourceError::SecretBundlePath { path, why } => {
+                write!(f, "cannot write the secret bundle to {path}: {why}")
+            }
             SourceError::SecretKeyTooShort { len } => write!(
                 f,
                 "secret_files needs a secret key of at least {MIN_SECRET_KEY} bytes (got {len})"

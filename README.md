@@ -412,6 +412,42 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
   repositories that use SHA-256 object names. Both are refused with an
   explicit error.
 
+`source::capture_directory` does the same for a directory that is not a
+repository.
+
+### Secret files
+
+`CaptureOptions::secret_files` (the `[source] secret_files` globs of
+`.local-ci.toml`) names files a run needs that must not travel with the
+source, a test `.env` for instance. They never enter the object store, the
+manifest's entries or an exported bundle of objects: the manifest records
+their paths and an HMAC of each under `secret_key` (16 bytes or more), and
+their content goes to a secret bundle of its own (mode 0600), whose path
+`SourceSnapshot::secrets` returns. `materialize_secrets` places them in a
+workspace after checking each against its HMAC.
+
+- In a repository, a secret file is an untracked file a declaration matches,
+  ignored or not. A tracked file is commit content and stays that (with a
+  warning). In a directory capture, any file a declaration matches is a
+  secret file; `exclude` is applied first.
+- Only a regular file inside the root is read. A symlink (the file, or a
+  directory above it), a FIFO or a device at a secret path stops the capture
+  with an error; it is neither followed nor skipped. A `required` declaration
+  that matches nothing stops it too (`SourceError::RequiredSecretMissing`); an
+  optional one is a warning.
+- `secret_root`: take the secret files from another working tree than the one
+  that is captured. This is for the capture of a commit, which runs in a clean
+  checkout that has none of them: point it at the tree the commit came from.
+  The files are chosen, read and re-checked there by the same rules, and a
+  file there that the captured commit tracks is left out as commit content.
+  Only for `capture_source`.
+- `secret_bundle`: write the bundle to this path instead of
+  `<store>/secrets/<source_id>.json`, which two captures of the same source
+  share. The file is created, never replaced, and its directory is not made:
+  either case is `SourceError::SecretBundlePath`, and a capture that fails
+  after writing it removes it. Nothing is written when no secret file was
+  found.
+
 ## Files
 
 The cache directory is `~/Library/Caches/local-ci` on macOS and
