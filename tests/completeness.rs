@@ -109,7 +109,7 @@ fn plan(tmp: &common::Tmp, dir: &Path) -> FrozenPlan {
 fn opts(cache: &Path) -> Opts {
     Opts {
         parallel: 2,
-        canirun: None,
+        traffic_controller: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,
@@ -279,7 +279,7 @@ fn run_opts(dir: &Path, cache: &Path) -> RunOptions {
     RunOptions {
         target: target(dir),
         parallel: Some(2),
-        no_canirun: true,
+        no_traffic_controller: true,
         no_portool: true,
         containers: 1,
         keep: false,
@@ -1036,23 +1036,24 @@ fn the_argument_list_does_not_show_the_token() {
 }
 
 #[test]
-fn the_pipe_reaches_a_step_that_canirun_starts() {
-    let Some(canirun) = ["/usr/local/bin", "/opt/homebrew/bin"]
+fn the_pipe_reaches_a_step_that_the_traffic_controller_starts() {
+    let name = "task-traffic-controller";
+    let Some(controller) = ["/usr/local/bin", "/opt/homebrew/bin"]
         .iter()
-        .map(|d| Path::new(d).join("canirun"))
-        .chain(std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo/bin/canirun")))
+        .map(|d| Path::new(d).join(name))
+        .chain(std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo/bin").join(name)))
         .find(|p| p.is_file())
     else {
-        eprintln!("canirun is not installed: not checked");
+        eprintln!("task-traffic-controller is not installed: not checked");
         return;
     };
-    let script = "test \"$0\" = /dev/fd/3\necho \"via canirun ${{ github.token }}\"";
+    let script = "test \"$0\" = /dev/fd/3\necho \"via controller ${{ github.token }}\"";
     let (tmp, dir) = lab(&[(W1, wf("x/**", &one_step_job(script)))]);
     let c = ctx_with_gh(tmp.path(), Some(TOKEN));
     let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
-    let ws = workspace(&tmp, &dir, &fp, "canirun");
+    let ws = workspace(&tmp, &dir, &fp, "controller");
     let mut o = opts(&tmp.path().join("lab"));
-    o.canirun = Some(canirun);
+    o.traffic_controller = Some(controller);
     let r = local_ci::execute_plan(&c, &fp, &ws, o).unwrap();
     assert_eq!(
         r.state, "success",
@@ -1060,8 +1061,8 @@ fn the_pipe_reaches_a_step_that_canirun_starts() {
         r.description, r.units[0].jobs[0].steps
     );
     let log = std::fs::read_to_string(r.units[0].jobs[0].steps[0].log.as_ref().unwrap()).unwrap();
-    assert!(log.contains("via canirun ***"), "{log}");
-    assert_no_token_in(&tmp, "canirun");
+    assert!(log.contains("via controller ***"), "{log}");
+    assert_no_token_in(&tmp, "controller");
 }
 
 #[test]

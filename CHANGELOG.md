@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The tool that queues heavy steps, canirun, is now task-traffic-controller.
+  local-ci uses `task-traffic-controller` from PATH and falls back to
+  `canirun` while that is the only one installed, and reads the output prefix
+  of either name (including the ledger lock timeout retry). `--no-canirun` is
+  now `--no-traffic-controller`; the old flag still works but is hidden from
+  `--help`. The `canirun` field of `exec::Opts` is `traffic_controller`.
+
 ## 0.8.0 - 2026-11-10
 
 - CLI behaviour change: a run that has skipped work now ends `incomplete`,

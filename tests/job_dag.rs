@@ -362,7 +362,7 @@ impl Lab {
         std::fs::create_dir_all(&ws.run_dir).unwrap();
         let opts = local_ci::exec::Opts {
             parallel: 1,
-            canirun: None,
+            traffic_controller: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,
@@ -979,7 +979,7 @@ impl Lab {
         std::fs::create_dir_all(cache.join("locks")).unwrap();
         let opts = local_ci::exec::Opts {
             parallel: 2,
-            canirun: None,
+            traffic_controller: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,

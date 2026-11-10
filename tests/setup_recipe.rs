@@ -151,7 +151,7 @@ impl<'a> Place<'a> {
     fn opts(&self) -> Opts {
         Opts {
             parallel: 1,
-            canirun: None,
+            traffic_controller: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,
@@ -975,7 +975,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     std::fs::create_dir_all(&ws.run_dir).unwrap();
     let opts = Opts {
         parallel: 1,
-        canirun: None,
+        traffic_controller: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,

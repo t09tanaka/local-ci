@@ -73,7 +73,7 @@ Common options (`plan` and `run`):
 | `-j, --job <id>` | Only these jobs, plus the jobs they `need`. |
 | `-C <dir>` | Repository directory. |
 
-`run` also takes `--parallel <n>`, `--containers <n>`, `--no-canirun`, `--no-portool`, `--no-status`, `--keep`
+`run` also takes `--parallel <n>`, `--containers <n>`, `--no-traffic-controller`, `--no-portool`, `--no-status`, `--keep`
 (keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
 
 ## `.local-ci.toml`
@@ -185,7 +185,7 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    formatter, mutation testing) is not seen by the jobs beside it. The copy is
    a copy-on-write clone (`clonefile(2)` on APFS, `cp --reflink=auto` elsewhere).
    With `link-node-modules = true` in `.local-ci.toml`, each `node_modules`
-   holds links to the packages in setup's instead (see below). With canirun,
+   holds links to the packages in setup's instead (see below). With task-traffic-controller,
    the entries of a matrix run at once too (up to `strategy.max-parallel`),
    each in its own copy. Jobs that start services or containers, run
    Playwright or Cypress, or look like integration / e2e tests, are
@@ -208,12 +208,12 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    The job's `time` in `result.json` and in `--json` has the same split, in
    seconds: `work_secs` (the job running: its services' start and its steps), `wait_lock_secs` (the
    per-repository lock), `wait_slot_secs` (one of the `--containers` slots),
-   `wait_queue_secs` (canirun letting a step start, summed over the steps) and
+   `wait_queue_secs` (task-traffic-controller letting a step start, summed over the steps) and
    `wait_parallel_secs` (one of the `--parallel` places). The job's `secs`
    still counts from its first step and so includes `wait_queue_secs`; the
    other waits come before it. The waits of a unit before its jobs start go to
    its first job. Jobs that did not run, and reused results, have no `time`. Steps of a shell
-other than bash or sh that print nothing count as waiting for canirun until
+other than bash or sh that print nothing count as waiting for task-traffic-controller until
 they end.
 5. **Commit status.** The state is posted as the `local-ci` commit status with
    `gh` when the commit is on GitHub. Before you push it is not; run
@@ -327,9 +327,10 @@ into a prefix of the run, so neither changes your machine.
 
 ## Working with other tools
 
-- **[canirun](https://github.com/t09tanaka/canirun)**: when it is installed,
-  every `run:` step, setup included, is wrapped in `canirun exec`, so heavy steps
+- **[task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller)**: when it is installed,
+  every `run:` step, setup included, is wrapped in `task-traffic-controller exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
+  The old name `canirun` is still found when the new one is not installed, for now.
 - **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
   `.portool.toml`, each exclusive job without `services:` asks portool for a
   port block of its own

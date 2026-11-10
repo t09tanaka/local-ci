@@ -52,7 +52,7 @@ pub struct Target {
 pub struct RunOptions {
     pub target: Target,
     pub parallel: Option<usize>,
-    pub no_canirun: bool,
+    pub no_traffic_controller: bool,
     pub no_portool: bool,
     pub containers: usize,
     pub keep: bool,
@@ -694,19 +694,19 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         }
         obs.executing();
         exec::remove_orphan_containers(ctx);
-        let canirun = if a.no_canirun {
+        let traffic_controller = if a.no_traffic_controller {
             None
         } else {
-            ctx.find_tool("canirun")
+            ctx.find_traffic_controller()
         };
-        let parallel = a.parallel.unwrap_or(if canirun.is_some() {
+        let parallel = a.parallel.unwrap_or(if traffic_controller.is_some() {
             fp.units.len().clamp(1, 16)
         } else {
             4
         });
         let opts = exec::Opts {
             parallel,
-            canirun,
+            traffic_controller,
             portool: if a.no_portool {
                 None
             } else {

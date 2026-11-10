@@ -181,7 +181,7 @@ fn run_options(dir: &Path, cache: &Path) -> RunOptions {
     RunOptions {
         target: target(dir, "main"),
         parallel: Some(2),
-        no_canirun: true,
+        no_traffic_controller: true,
         no_portool: true,
         containers: 1,
         keep: false,
@@ -216,7 +216,7 @@ fn executing_a_built_plan_gives_what_run_gives() {
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let opts = local_ci::exec::Opts {
         parallel: 2,
-        canirun: None,
+        traffic_controller: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,
