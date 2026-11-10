@@ -14,6 +14,18 @@
   This is a breaking change for external code: because the field is public,
   every struct literal of `exec::Opts` outside this crate must add
   `executor: None` to keep compiling.
+- New `shard` module: a `RunnerAdapter` contract (`discover`, `partition`,
+  `invoke`, `collect`, `merge`) and `partition_tests`, which divides a job's
+  tests among shards (longest first, evened out by estimated load, with a
+  stable name-hash fallback when there is no history), checks that every test
+  is in exactly one shard, and says why a job cannot be split. Adapters for
+  `cargo test`, Vitest and Jest.
+- `FrozenPlan::with_shards` / `new_with_shards` turn a job into one task per
+  shard on request; nothing is split by default. A split job's `ShardGroup`
+  carries the runner, the listed tests and `fail_fast`, and
+  `complete::aggregate_shard_group` puts the shard results together by job,
+  shard and test. `NotSplit` has more reasons, and `ExecutionTask` a `shard`.
+- The plan schema version is 5; a plan of version 4 is refused by name.
 
 ## [0.9.0] - 2026-11-10
 

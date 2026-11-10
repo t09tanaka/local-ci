@@ -382,12 +382,13 @@ most), and the locks.
 ## Development
 
 ```sh
+(cd examples/sharding/node && npm ci)   # the shard adapter tests run real Vitest and Jest
 cargo test
 ./scripts/coverage-gate.sh   # 100% line coverage on the pure modules
 ```
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
-`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`) are gated on 100% line coverage over the whole test suite.
+`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`) are gated on 100% line coverage over the whole test suite.
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 
@@ -402,8 +403,9 @@ commands are in `.github/workflows/ci.yml`):
 
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
-cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan
 cargo schemata --file src/artifact.rs -- --lib artifact
+cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
 ```
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is

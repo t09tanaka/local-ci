@@ -13,10 +13,11 @@
 //! run: a unit whose result came from the cache (`UnitResult::cached`) counts
 //! as the unit's result.
 
-use crate::dag::{self, ExecutionTask, MatrixPlan};
+use crate::dag::{self, ExecutionTask, MatrixPlan, ShardGroup};
 use crate::exec::{JobResult, Outcome, UnitResult};
 use crate::frozen::FrozenPlan;
 use crate::report::RunResult;
+use crate::shard::{merge_outcomes, Merged, ShardOutcome};
 use crate::task::{JobOutcome, JobStatus, TaskResult};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -230,11 +231,11 @@ fn check_unit(
     if cached {
         return;
     }
-    for t in fp
-        .tasks
-        .iter()
-        .filter(|t| t.unit == ui && t.variant.as_ref().is_none_or(|v| v.index == 0))
-    {
+    for t in fp.tasks.iter().filter(|t| {
+        t.unit == ui
+            && t.variant.as_ref().is_none_or(|v| v.index == 0)
+            && t.shard.as_ref().is_none_or(|s| s.index == 0)
+    }) {
         let ok: Vec<&str> = t
             .jobs
             .iter()
@@ -379,4 +380,101 @@ pub fn verify_task_result(task: &ExecutionTask, r: &TaskResult) -> Vec<String> {
     let every = r.outcomes.iter().all(|o| o.status == JobStatus::Success);
     out.extend(check_outputs(task, &jobs, &r.outcomes, &r.artifacts, every));
     out
+}
+
+/// The shards of one split job, taken together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShardAggregate {
+    /// The shard group.
+    pub group: String,
+    /// The tests of all shards, once each.
+    pub merged: Merged,
+    /// Shards (task ids) with no result.
+    pub missing: Vec<String>,
+    /// Shards with more than one result.
+    pub duplicate: Vec<String>,
+    /// Results of shards the group does not have, or of another job.
+    pub unexpected: Vec<String>,
+    /// With `fail-fast`, a shard failed: the shards still without a result are
+    /// to be cancelled (the parent issues the requests and keeps what the
+    /// shards had so far).
+    pub cancel: Vec<String>,
+}
+
+impl ShardAggregate {
+    /// Every shard reported once, every listed test is accounted for and none
+    /// failed. Only then may the outputs of the job be published.
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty()
+            && self.duplicate.is_empty()
+            && self.unexpected.is_empty()
+            && self.merged.ok()
+    }
+
+    /// The problems as short sentences.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        out.extend(self.missing.iter().map(|s| format!("missing: shard {s}")));
+        out.extend(
+            self.duplicate
+                .iter()
+                .map(|s| format!("duplicate: shard {s}")),
+        );
+        out.extend(self.unexpected.iter().map(|s| format!("unexpected: {s}")));
+        out.extend(self.merged.problems.iter().map(|p| format!("invalid: {p}")));
+        out.extend(self.merged.failed.iter().map(|t| format!("failed: {t}")));
+        out
+    }
+}
+
+/// Put the results of the shards of `group` together by `job_id`, `shard_id`
+/// and test identity: every shard once, every listed test once, the failed and
+/// skipped tests. The group is complete only when all of its shards reported.
+pub fn aggregate_shard_group(group: &ShardGroup, results: &[ShardOutcome]) -> ShardAggregate {
+    let job = group.source_jobs.join("+");
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unexpected = Vec::new();
+    for r in results {
+        if r.job_id != job {
+            unexpected.push(format!(
+                "a result of job `{}` for the group of `{job}`",
+                r.job_id
+            ));
+        } else if !group.shards.contains(&r.shard_id) {
+            unexpected.push(format!("a result of shard {}", r.shard_id));
+        } else {
+            *seen.entry(&r.shard_id).or_default() += 1;
+        }
+    }
+    let missing: Vec<String> = group
+        .shards
+        .iter()
+        .filter(|s| !seen.contains_key(s.as_str()))
+        .cloned()
+        .collect();
+    let duplicate = seen
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(s, _)| s.to_string())
+        .collect();
+    let manifest = (!group.manifest.is_empty()).then_some(group.manifest.as_slice());
+    let merged = merge_outcomes(manifest, results);
+    let failed = results.iter().any(|r| {
+        !r.exit_ok
+            || r.tests
+                .iter()
+                .any(|t| t.status == crate::shard::TestStatus::Failed)
+    });
+    ShardAggregate {
+        group: group.id.clone(),
+        cancel: if group.fail_fast && failed {
+            missing.clone()
+        } else {
+            vec![]
+        },
+        merged,
+        missing,
+        duplicate,
+        unexpected,
+    }
 }

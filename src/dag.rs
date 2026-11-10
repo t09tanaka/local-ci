@@ -361,6 +361,7 @@ pub struct ExecutionTask {
     pub verification: OutputVerification,
     pub grouped_reason: Option<GroupedReason>,
     /// The part of a split job this task runs.
+    #[serde(default)]
     pub shard: Option<TaskShard>,
 }
 
@@ -444,11 +445,14 @@ pub struct ShardGroup {
     /// How shard results are merged (none when not split).
     pub aggregation: Option<OutputAggregation>,
     /// The runner of a split job.
+    #[serde(default)]
     pub runner: Option<RunnerInfo>,
     /// The tests the shards hold together, once each (empty when the runner's
     /// own shard feature divides them).
+    #[serde(default)]
     pub manifest: Vec<String>,
     /// A failed shard cancels the others.
+    #[serde(default)]
     pub fail_fast: bool,
 }
 
