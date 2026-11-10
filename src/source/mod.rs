@@ -237,7 +237,8 @@ pub struct CaptureOptions {
     /// top. The files are chosen, read and checked there exactly as a
     /// worktree capture does in its own directory. A file of this tree that
     /// the captured index tracks is commit content and is not taken. Only
-    /// for [`capture_source`]; [`capture_directory`] refuses it.
+    /// for [`capture_source`]; [`capture_directory`] refuses it when there
+    /// are `secret_files`. Without `secret_files` it has no effect.
     pub secret_root: Option<PathBuf>,
     /// Write the secret bundle here instead of `<store>/secrets/<source_id>.json`
     /// (a path of the run, so that two captures of the same source do not

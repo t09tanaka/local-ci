@@ -3178,20 +3178,49 @@ fn a_symlink_or_a_special_file_in_the_secret_root_is_never_read() {
     std::fs::remove_file(f.dir.join("conf")).unwrap();
 
     // a FIFO is not a file either (and is not opened: that would block)
+    // required or not, and also in a directory Git ignores
+    for (at, glob, required) in [
+        (".env", ".env", true),
+        (".env", ".env", false),
+        ("out/deep/pipe.key", "out/**/*.key", false),
+    ] {
+        let fifo = f.dir.join(at);
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        o.secret_files = vec![spec(glob, required)];
+        let err = capture_source(&c, &clone, &o).unwrap_err();
+        assert_eq!(
+            source_error(&err),
+            &SourceError::UnsupportedFileType {
+                path: at.into(),
+                kind: "FIFO".into()
+            }
+        );
+        // the same when the tree is captured itself
+        let mut own = o.clone();
+        own.secret_root = None;
+        let err = capture_source(&c, &f.dir, &own).unwrap_err();
+        assert!(matches!(
+            source_error(&err),
+            SourceError::UnsupportedFileType { path, .. } if path == at
+        ));
+        std::fs::remove_file(&fifo).unwrap();
+    }
+    // one that no declaration matches is not in the way
     assert!(Command::new("mkfifo")
-        .arg(f.dir.join(".env"))
+        .arg(f.dir.join("out/other"))
         .status()
         .unwrap()
         .success());
-    o.secret_files = vec![spec(".env", true)];
-    let err = capture_source(&c, &clone, &o).unwrap_err();
-    assert!(
-        matches!(
-            source_error(&err),
-            SourceError::RequiredSecretMissing { .. } | SourceError::UnsupportedFileType { .. }
-        ),
-        "{err:#}"
-    );
+    o.secret_files = vec![spec(".env", false)];
+    capture_source(&c, &clone, &o).unwrap();
+    std::fs::remove_file(f.dir.join("out/other")).unwrap();
+    let _ = std::fs::remove_dir_all(store.join("manifests"));
+    std::fs::create_dir_all(store.join("manifests")).unwrap();
 
     assert!(published(&store).is_empty());
     assert!(names_in(&store.join("secrets")).is_empty());

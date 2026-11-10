@@ -33,7 +33,9 @@
   - A secret file is now read only when every directory above it, below the
     root, is a real directory (`SourceError::UnsafePath` otherwise), and
     through a descriptor that does not follow a symlink; a symlink, a FIFO or
-    a device at the path was an error before and still is.
+    a device at the path was an error before and still is, now also for a
+    FIFO, socket or device inside an ignored directory, which used to pass
+    for a file that is not there.
   This is a breaking change for external code: `CaptureOptions` has two new
   public fields, so a struct literal without `..CaptureOptions::default()`
   adds `secret_root: None, secret_bundle: None`, and an exhaustive `match` on

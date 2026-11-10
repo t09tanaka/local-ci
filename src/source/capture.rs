@@ -369,6 +369,9 @@ fn select_worktree(ctx: &ExecContext, root: &Path, o: &Opts) -> Result<Selection
                 tracked_secrets.push((i, p.clone()));
             }
         }
+        // git lists no FIFO, socket or device, so one at a secret path
+        // would pass for a file that is not there
+        special_secrets(secret_root, &RelPath(vec![]), o)?;
         // a file here that a declaration matches never becomes content of
         // the source, wherever the secret files are taken from
         let own = pick_secrets(o, untracked.iter().chain(ignored.iter()));
@@ -445,6 +448,47 @@ fn pick_secrets<'a>(
                 .map(|i| (i, p.clone()))
         })
         .collect()
+}
+
+/// A FIFO, socket or device below `root` that a `secret_files` declaration
+/// matches, in an ignored directory or not: an error, since it can be
+/// neither read as a secret file nor passed over as if nothing were there.
+/// (A repository of its own below `root` is not looked into, as in
+/// [`secret_candidates`].)
+fn special_secrets(root: &Path, rel: &RelPath, o: &Opts) -> Result<()> {
+    let here = root.join(rel.to_path());
+    let Ok(dir) = std::fs::read_dir(&here) else {
+        return Ok(()); // gone or unreadable; git has said what it lists
+    };
+    for ent in dir {
+        let ent = ent?;
+        let name = ent.file_name();
+        if name.as_bytes() == b".git" {
+            continue;
+        }
+        let mut b = rel.0.clone();
+        if !b.is_empty() {
+            b.push(b'/');
+        }
+        b.extend_from_slice(name.as_bytes());
+        let p = RelPath(b);
+        let Ok(m) = std::fs::symlink_metadata(root.join(p.to_path())) else {
+            continue; // gone; the second look notices
+        };
+        let t = m.file_type();
+        if t.is_dir() {
+            if !root.join(p.to_path()).join(".git").exists() {
+                special_secrets(root, &p, o)?;
+            }
+        } else if !t.is_file() && !t.is_symlink() && o.secrets.iter().any(|g| g.matches(&p)) {
+            return Err(SourceError::UnsupportedFileType {
+                path: p.display(),
+                kind: kind_of(&m).into(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Every file of the working tree `root` that Git does not track, ignored
