@@ -149,6 +149,7 @@ fn request(job: &str, a: &dyn RunnerAdapter, tests: &[&str], dir: &str) -> Shard
     let d = Discovered {
         tests: tests.iter().map(|s| s.to_string()).collect(),
         complete: true,
+        blocked: vec![],
     };
     let plan = partition_tests(a, &d, &History::default(), 2, &PartitionOpts::default());
     ShardRequest {

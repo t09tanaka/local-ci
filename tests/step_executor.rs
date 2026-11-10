@@ -285,6 +285,7 @@ fn the_demand_of_a_shard_step_is_the_shell_the_executor_starts() {
     let d = Discovered {
         tests: ["a", "b", "c", "d"].map(String::from).to_vec(),
         complete: true,
+        blocked: vec![],
     };
     let plan = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
     l.fp =
