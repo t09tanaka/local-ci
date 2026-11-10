@@ -3,6 +3,7 @@
 
 #![allow(clippy::disallowed_methods)] // the tests build their own commands
 
+mod common;
 use local_ci::{ExecContext, FrozenPlan, Observer, Quiet, RunOptions, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,8 +29,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A repository with one workflow whose job runs `script`, changed on a branch.
-fn repo(script: &str) -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn repo(script: &str) -> (common::Tmp, PathBuf) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -279,9 +280,39 @@ fn the_library_does_not_read_the_process_environment() {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            for needle in ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("] {
-                assert!(!text.contains(needle), "{} uses {needle}", p.display());
+            // cargo-schemata's own harness, added to a copy of the sources,
+            // reads CARGO_SCHEMATA_* variables.
+            for line in text.lines().filter(|l| !l.contains("CARGO_SCHEMATA_")) {
+                for needle in ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("] {
+                    assert!(!line.contains(needle), "{} uses {needle}", p.display());
+                }
             }
         }
     }
+}
+
+#[test]
+fn a_plan_whose_config_or_graph_was_changed_does_not_verify() {
+    let (tmp, dir) = repo("echo hi");
+    let fp = plan_of(&dir, "main", tmp.path());
+    fp.verify().unwrap();
+
+    let mut config = fp.clone();
+    config.config_digest = "sha256:0".into();
+    let err = config.verify().unwrap_err().to_string();
+    assert!(err.contains("config digest"), "{err}");
+
+    let mut graph = fp.clone();
+    graph.graph.nodes.pop();
+    let err = graph.verify().unwrap_err().to_string();
+    assert!(err.contains("job graph"), "{err}");
+
+    let mut digest = fp.clone();
+    digest.digest = "sha256:0".into();
+    assert!(digest.verify().is_err());
+
+    let mut old = fp;
+    old.schema_version += 1;
+    let err = old.verify().unwrap_err().to_string();
+    assert!(err.contains("schema version"), "{err}");
 }

@@ -3,6 +3,7 @@
 
 #![allow(clippy::disallowed_methods)] // the tests build their own commands
 
+mod common;
 use local_ci::dag::{GroupedReason, NodeKind};
 use local_ci::exec::Outcome;
 use local_ci::frozen::{DisabledSource, DisabledWorkflow};
@@ -33,8 +34,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A repository whose one workflow is `jobs` (YAML under `jobs:`), changed on a branch.
-fn repo(jobs: &str) -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn repo(jobs: &str) -> (common::Tmp, PathBuf) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -53,7 +54,7 @@ fn repo(jobs: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Like [`repo`], with the workflows `files` (name, full YAML) in place of one.
-fn repo_of(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+fn repo_of(files: &[(&str, &str)]) -> (common::Tmp, PathBuf) {
     let (tmp, dir) = repo("  x:\n    runs-on: x\n    steps:\n      - run: echo x\n");
     std::fs::remove_file(dir.join(F)).unwrap();
     for (name, text) in files {
@@ -94,7 +95,7 @@ fn target(dir: &Path) -> Target {
     }
 }
 
-fn plan_of(jobs: &str) -> (tempfile::TempDir, PathBuf, FrozenPlan) {
+fn plan_of(jobs: &str) -> (common::Tmp, PathBuf, FrozenPlan) {
     let (tmp, dir) = repo(jobs);
     let fp = local_ci::build_frozen_plan(&ctx(tmp.path()), &target(&dir), &mut Quiet).unwrap();
     (tmp, dir, fp)
@@ -309,7 +310,7 @@ fn the_plan_survives_its_wire_form_and_a_round_trip_through_the_engine() {
 const WORKFLOW: &str = "  prep:\n    runs-on: x\n    outputs:\n      v: ${{ steps.s.outputs.v }}\n    steps:\n      - id: s\n        run: echo \"v=hello\" >> \"$GITHUB_OUTPUT\"\n  use:\n    needs: prep\n    runs-on: x\n    steps:\n      - run: test \"${{ needs.prep.outputs.v }}\" = hello\n  broken:\n    runs-on: x\n    steps:\n      - run: exit 3\n  after_broken:\n    needs: broken\n    runs-on: x\n    steps:\n      - run: echo not reached\n  cleanup:\n    needs: broken\n    if: always()\n    runs-on: x\n    steps:\n      - run: echo cleanup\n  only_on_failure:\n    needs: broken\n    if: failure()\n    runs-on: x\n    steps:\n      - run: echo saw failure\n  only_on_success:\n    needs: prep\n    if: always() && needs.prep.result == 'skipped'\n    runs-on: x\n    steps:\n      - run: echo never\n  m:\n    runs-on: x\n    strategy:\n      matrix:\n        n: [1, 2, 3]\n    outputs:\n      o: ${{ steps.s.outputs.o }}\n    steps:\n      - id: s\n        run: echo \"o=${{ matrix.n }}\" >> \"$GITHUB_OUTPUT\"\n  gather:\n    needs: m\n    runs-on: x\n    steps:\n      - run: test \"${{ needs.m.outputs.o }}\" = 3\n";
 
 struct Lab {
-    tmp: tempfile::TempDir,
+    tmp: common::Tmp,
     dir: PathBuf,
     fp: FrozenPlan,
     cache: PathBuf,
@@ -322,7 +323,7 @@ impl Lab {
         Self::from_plan(tmp, dir, fp)
     }
 
-    fn from_plan(tmp: tempfile::TempDir, dir: PathBuf, fp: FrozenPlan) -> Self {
+    fn from_plan(tmp: common::Tmp, dir: PathBuf, fp: FrozenPlan) -> Self {
         let cache = tmp.path().join("lab");
         std::fs::create_dir_all(cache.join("locks")).unwrap();
         Lab {
@@ -625,7 +626,7 @@ fn cancelled_failure_and_the_result_of_a_needed_job_are_read_from_the_inputs() {
 
 #[test]
 fn a_job_cancelled_while_it_runs_is_cancelled_for_the_jobs_after_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let mark = tmp.path().join("started");
     let mut lab = Lab::new(&format!(
         "  slow:\n    runs-on: x\n    steps:\n      - run: touch '{}' && sleep 60\n  on_failure:\n    needs: slow\n    if: failure()\n    runs-on: x\n    steps:\n      - run: echo f\n  on_cancelled:\n    needs: slow\n    if: cancelled()\n    runs-on: x\n    steps:\n      - run: echo c\n",
@@ -1192,4 +1193,31 @@ fn cancelled_is_the_run_being_cancelled_and_failure_is_not_cancelled() {
     b.ancestor_failed = true;
     let through = TaskInputs::new([&b], [&b], false);
     assert_eq!(run(&mut lab, &through, "on_failure"), came(Success, None));
+}
+
+#[test]
+fn a_matrix_that_cannot_be_expanded_now_is_decided_when_it_runs() {
+    let job = |matrix: &str| {
+        format!(
+            "  m:\n    runs-on: x\n    strategy:\n      matrix: {matrix}\n    steps:\n      - run: echo hi\n"
+        )
+    };
+    // the whole matrix is an expression: decided when it runs
+    let (_t, _d, fp) = plan_of(&job("${{ fromJSON(vars.m) }}"));
+    assert!(matches!(
+        fp.graph.node(&id("m")).unwrap().kind,
+        NodeKind::DynamicMatrix { .. }
+    ));
+    // a key with no values cannot be expanded now either
+    let (_t, _d, fp) = plan_of(&job("{n: []}"));
+    assert!(matches!(
+        fp.graph.node(&id("m")).unwrap().kind,
+        NodeKind::DynamicMatrix { .. }
+    ));
+    // every variant excluded cannot be expanded either
+    let (_t, _d, fp) = plan_of(&job("{n: [1], exclude: [{n: 1}]}"));
+    assert!(matches!(
+        fp.graph.node(&id("m")).unwrap().kind,
+        NodeKind::DynamicMatrix { .. }
+    ));
 }

@@ -2,6 +2,7 @@
 
 #![allow(clippy::disallowed_methods)] // the tests build the binary's environment
 
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -38,14 +39,14 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 struct Demo {
-    _tmp: tempfile::TempDir,
+    _tmp: common::Tmp,
     repo: PathBuf,
     home: PathBuf,
 }
 
 /// The demo on `main`, plus a `feature` branch that changes `app/`.
 fn demo(change: &str) -> Demo {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let repo = tmp.path().join("demo");
     copy_dir(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/demo"),

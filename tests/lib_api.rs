@@ -2,6 +2,7 @@
 
 #![allow(clippy::disallowed_methods)] // the tests build their own commands
 
+mod common;
 use local_ci::{ExecContext, Quiet, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,8 +27,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A repository with one workflow, changed on a `feature` branch.
-fn repo() -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn repo() -> (common::Tmp, PathBuf) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("r");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -91,8 +92,21 @@ fn resolve_keeps_only_the_named_jobs() {
 
 #[test]
 fn resolve_fails_outside_a_repository() {
-    let tmp = tempfile::tempdir().unwrap();
-    assert!(local_ci::resolve(&ctx(), &target(tmp.path()), &mut Quiet).is_err());
+    let tmp = common::tempdir().unwrap();
+    // the temporary directory may itself sit inside a repository (a mutation
+    // run points TMPDIR into the target directory): stop git from looking up
+    let ceiling = tmp.path().parent().unwrap().to_string_lossy().to_string();
+    let ctx = ExecContext::new(
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/nonexistent"),
+            ("GIT_CEILING_DIRECTORIES", ceiling.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    assert!(local_ci::resolve(&ctx, &target(tmp.path()), &mut Quiet).is_err());
 }
 
 #[test]

@@ -3,6 +3,7 @@
 
 #![allow(clippy::disallowed_methods)] // the tests build their own commands
 
+mod common;
 use local_ci::source::{
     capture_directory, capture_source, export_objects, import_objects, materialize_secrets,
     materialize_source, publishable, seal_manifest, secret_digest, CaptureOptions, ObjectStore,
@@ -61,7 +62,7 @@ fn ctx(home: &Path) -> ExecContext {
 }
 
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    _tmp: common::Tmp,
     home: PathBuf,
     dir: PathBuf,
 }
@@ -74,7 +75,7 @@ impl Fixture {
 
 /// A repository with a bit of everything committed.
 fn fixture() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let home = tmp.path().join("home");
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(&dir).unwrap();
@@ -533,7 +534,7 @@ fn a_manifest_that_was_edited_is_not_believed() {
 
 #[test]
 fn a14_unpushed_commits_and_the_snapshot_reach_a_clone_that_never_saw_them() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let home = tmp.path().join("home");
     let origin = tmp.path().join("origin.git");
     let work = tmp.path().join("work");
@@ -1018,7 +1019,7 @@ fn filters_run_once_by_git_and_never_again_on_captured_content() {
 
 #[test]
 fn a_directory_outside_git_is_captured_in_the_same_form() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let home = tmp.path().join("home");
     let d = tmp.path().join("plain");
     std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -1183,7 +1184,7 @@ fn private_repo_of(f_home: &Path) -> PathBuf {
 const APPEND_SMUDGE: (&str, &str) = ("sed '/^#smudged$/d'", "cat; echo '#smudged'");
 
 struct World {
-    _tmp: tempfile::TempDir,
+    _tmp: common::Tmp,
     home: PathBuf,
     work: PathBuf,
     worker: PathBuf,
@@ -1194,7 +1195,7 @@ struct World {
 /// filter that appends a line every time it smudges, a workflow that copies
 /// files out, and a clone (the worker) that has `main` only.
 fn world() -> World {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
     let worker = tmp.path().join("worker");
@@ -1752,14 +1753,14 @@ fn a_change_inside_a_submodule_while_the_superproject_is_read_is_noticed() {
 /// A repository (`work`, set up by the caller and committed) and a clone of
 /// it (`worker`) that has none of its configuration, attributes or filters.
 struct Pair {
-    _tmp: tempfile::TempDir,
+    _tmp: common::Tmp,
     home: PathBuf,
     work: PathBuf,
     worker: PathBuf,
 }
 
 fn pair(setup: impl FnOnce(&Path)) -> Pair {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -2048,7 +2049,7 @@ fn a_shallow_clone_is_refused_before_anything_is_written() {
 
 #[test]
 fn a_sha256_repository_is_refused_with_an_explicit_error() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(&dir).unwrap();
     let init = Command::new("git")
@@ -2475,8 +2476,28 @@ fn a_directory_that_is_not_a_repository_is_an_error_not_a_worker() {
     let m = captured(&p);
     let plain = p.home.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    let (r, wt) = add_in(&p, &m, &plain, "wt");
-    let e = r.unwrap_err();
+    // the home may itself sit inside a repository (a mutation run points
+    // TMPDIR into the target directory): stop git from looking up from it
+    let c = ExecContext::new(
+        [
+            ("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"),
+            ("HOME", p.home.to_str().unwrap()),
+            ("LOCAL_CI_HOME", p.home.to_str().unwrap()),
+            ("GIT_CEILING_DIRECTORIES", p.home.to_str().unwrap()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    let wt = p.home.join("wt");
+    let e = local_ci::source::add_worktree(
+        &c,
+        &ObjectStore::open(p.home.join("sources")).unwrap(),
+        &plain,
+        &wt,
+        &m,
+    )
+    .unwrap_err();
     assert!(
         matches!(
             e.downcast_ref::<SourceError>(),

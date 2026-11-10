@@ -3,6 +3,7 @@
 
 #![allow(clippy::disallowed_methods)] // the test builds the binary's environment
 
+mod common;
 use local_ci::exec::{Opts, Outcome, Workspace};
 use local_ci::setup::{
     derive_setup_recipe, ArtifactDigest, Freshness, PreparedHow, PreparedReceipt, PreparedStep,
@@ -72,13 +73,13 @@ fn id(job: &str) -> String {
 const INSTALL: &str = "echo installed > installed.marker\n";
 
 /// A repository whose one workflow is `jobs`, with the install scripts.
-fn lab(jobs: &str) -> (tempfile::TempDir, PathBuf, FrozenPlan) {
+fn lab(jobs: &str) -> (common::Tmp, PathBuf, FrozenPlan) {
     lab_files(&[(F, format!("name: ci\non: pull_request\njobs:\n{jobs}"))])
 }
 
 /// A repository with these workflow files (path, text), and the install scripts.
-fn lab_files(files: &[(&str, String)]) -> (tempfile::TempDir, PathBuf, FrozenPlan) {
-    let tmp = tempfile::tempdir().unwrap();
+fn lab_files(files: &[(&str, String)]) -> (common::Tmp, PathBuf, FrozenPlan) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     for (path, text) in files {
@@ -116,7 +117,7 @@ struct Place<'a> {
 }
 
 impl<'a> Place<'a> {
-    fn new(tmp: &'a tempfile::TempDir, dir: &'a Path, fp: &'a FrozenPlan) -> Self {
+    fn new(tmp: &'a common::Tmp, dir: &'a Path, fp: &'a FrozenPlan) -> Self {
         let cache = tmp.path().join("lab");
         std::fs::create_dir_all(cache.join("locks")).unwrap();
         Place {
@@ -591,7 +592,7 @@ fn a16_the_same_script_with_another_env_or_shell_is_another_key() {
 /// Run the whole plan in a workspace of its own with an `npm` that records the
 /// `NODE_ENV` it was run with in `dep.marker` of the directory it ran in.
 fn run_with_fake_npm(
-    tmp: &tempfile::TempDir,
+    tmp: &common::Tmp,
     dir: &Path,
     fp: &FrozenPlan,
     parallel: usize,
@@ -897,7 +898,7 @@ fn receipt_for(
 
 #[test]
 fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     let c1 = ctx(tmp.path());
     let c2 = c1.fresh_attempt();
     let store = TemplateStore::new(tmp.path().join("templates"));
@@ -1041,7 +1042,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
 
 #[test]
 fn library_commands_use_the_context_env_and_not_the_processs() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir().unwrap();
     // the test process finds git and cp; a context with an empty PATH does not
     let bare = ctx_with(tmp.path(), "/nonexistent");
     assert!(local_ci::git::git(&bare, tmp.path(), &["--version"]).is_err());

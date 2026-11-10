@@ -5,6 +5,7 @@
 
 #![allow(clippy::disallowed_methods)] // the test builds the binary's environment
 
+mod common;
 use local_ci::complete::{validate_run_result, verify_task_result, Verdict};
 use local_ci::exec::{Opts, Outcome, Workspace};
 use local_ci::report::{self, RunResult};
@@ -69,8 +70,8 @@ const PLAIN: &str = "  a:\n    runs-on: x\n    steps:\n      - run: echo a\n    
 
 /// A repository with these files; `main` has the first version, `feature` one
 /// change under `x/` and `y/`.
-fn lab(files: &[(&str, String)]) -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn lab(files: &[(&str, String)]) -> (common::Tmp, PathBuf) {
+    let tmp = common::tempdir().unwrap();
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     for d in ["x", "y"] {
@@ -101,7 +102,7 @@ fn two_workflows() -> Vec<(&'static str, String)> {
     vec![(W1, wf("x/**", PLAIN)), (W2, wf("y/**", PLAIN))]
 }
 
-fn plan(tmp: &tempfile::TempDir, dir: &Path) -> FrozenPlan {
+fn plan(tmp: &common::Tmp, dir: &Path) -> FrozenPlan {
     local_ci::build_frozen_plan(&ctx(tmp.path()), &target(dir), &mut Quiet).unwrap()
 }
 
@@ -117,7 +118,7 @@ fn opts(cache: &Path) -> Opts {
     }
 }
 
-fn workspace(tmp: &tempfile::TempDir, dir: &Path, fp: &FrozenPlan, name: &str) -> Workspace {
+fn workspace(tmp: &common::Tmp, dir: &Path, fp: &FrozenPlan, name: &str) -> Workspace {
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt").join(name);
@@ -133,7 +134,7 @@ fn workspace(tmp: &tempfile::TempDir, dir: &Path, fp: &FrozenPlan, name: &str) -
     ws
 }
 
-fn execute(tmp: &tempfile::TempDir, dir: &Path, fp: &FrozenPlan, name: &str) -> RunResult {
+fn execute(tmp: &common::Tmp, dir: &Path, fp: &FrozenPlan, name: &str) -> RunResult {
     let ws = workspace(tmp, dir, fp, name);
     local_ci::execute_plan(&ctx(tmp.path()), fp, &ws, opts(&tmp.path().join("lab"))).unwrap()
 }
@@ -470,7 +471,7 @@ fn a_task_result_is_checked_against_what_the_plan_requires_of_it() {
 const NODE_JOB: &str = "  a:\n    runs-on: x\n    steps:\n      - run: sh node.sh\n      - run: test -f node_modules/p/a.js\n  b:\n    runs-on: x\n    steps:\n      - run: sh node.sh\n      - run: test -f node_modules/p/a.js && echo b\n";
 
 fn setup_in(
-    tmp: &tempfile::TempDir,
+    tmp: &common::Tmp,
     dir: &Path,
     fp: &FrozenPlan,
     name: &str,
@@ -491,7 +492,7 @@ fn setup_in(
 }
 
 fn task_with(
-    tmp: &tempfile::TempDir,
+    tmp: &common::Tmp,
     fp: &FrozenPlan,
     ws: &Workspace,
     receipt: &local_ci::setup::PreparedReceipt,
@@ -836,7 +837,7 @@ const TOKEN: &str = "ghs_faketoken123";
 /// fake `gh` and the workflow files, which name the expression or the value
 /// themselves. The checkout under test (`lab/wt/<name>`) is searched: what a
 /// step wrote there is the run's.
-fn run_files(tmp: &tempfile::TempDir, worktree: &str) -> Vec<std::path::PathBuf> {
+fn run_files(tmp: &common::Tmp, worktree: &str) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     tree_files(tmp.path(), &mut files);
     let _ = worktree;
@@ -851,7 +852,7 @@ fn run_files(tmp: &tempfile::TempDir, worktree: &str) -> Vec<std::path::PathBuf>
         .collect()
 }
 
-fn assert_no_token_in(tmp: &tempfile::TempDir, worktree: &str) -> usize {
+fn assert_no_token_in(tmp: &common::Tmp, worktree: &str) -> usize {
     let files = run_files(tmp, worktree);
     for f in &files {
         let b = std::fs::read(f).unwrap();
@@ -952,7 +953,7 @@ fn through_the_shell_and_the_reference(script: &str, name: &str) -> (String, Str
         .collect();
     assert_no_token_in(&tmp, name);
 
-    let plain = tempfile::tempdir().unwrap();
+    let plain = common::tempdir().unwrap();
     let file = plain.path().join("reference.sh");
     std::fs::write(&file, script.replace("${{ github.token }}", TOKEN)).unwrap();
     let out = Command::new("bash")
@@ -1170,7 +1171,7 @@ fn the_token_is_not_kept_in_the_outputs_of_a_task() {
 
 /// Run `jobs` (the body of a `jobs:` section) with the fake token on this
 /// machine; the result and the name the run's files are under.
-fn run_jobs(jobs: &str, name: &str) -> (tempfile::TempDir, RunResult) {
+fn run_jobs(jobs: &str, name: &str) -> (common::Tmp, RunResult) {
     let (tmp, dir) = lab(&[(W1, wf("x/**", jobs))]);
     let c = ctx_with_gh(tmp.path(), Some(TOKEN));
     let fp = local_ci::build_frozen_plan(&c, &target(&dir), &mut Quiet).unwrap();
