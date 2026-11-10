@@ -9,12 +9,14 @@ use local_ci::complete::{Completeness, Verdict};
 use local_ci::dag::{ExecutionTask, JobGraph};
 use local_ci::exec::{JobResult, Outcome, StepResult, UnitResult};
 use local_ci::report::{RunResult, Skipped};
-use local_ci::result_wire::{MAX_LOG_PATH, MAX_WIRE_BYTES};
+use local_ci::result_wire::{
+    MAX_LOG_PATH, MAX_WIRE_BYTES, MAX_WIRE_ITEMS, MAX_WIRE_NOTE, MAX_WIRE_STRING,
+};
 use local_ci::setup::{PreparedReceipt, SetupRecipe};
 use local_ci::wire::{Digested, WIRE_SCHEMA_VERSION};
 use local_ci::{
     validate_run_result, validate_wire_run_result, ExecContext, FrozenPlan, Quiet, Target,
-    TaskInputs, WireRunResult,
+    TaskInputs, TaskResult, WireRunResult, WireTaskResult,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -130,6 +132,14 @@ fn a_document_without_a_version_reads_as_the_first_and_this_build_writes_it() {
     let g: JobGraph = serde_json::from_value(read(serde_json::to_value(&graph).unwrap())).unwrap();
     assert_eq!(g, graph);
     assert_eq!(g.schema_version, WIRE_SCHEMA_VERSION);
+    let e = WireRunResult::from_json_checked(&" ".repeat(MAX_WIRE_BYTES), "sha256:00").unwrap_err();
+    assert!(!e.to_string().contains("at most"), "{e}");
+    // every document says the version it holds
+    assert_eq!(Digested::schema_version(&graph), WIRE_SCHEMA_VERSION);
+    assert_eq!(Digested::schema_version(&task), WIRE_SCHEMA_VERSION);
+    assert_eq!(Digested::schema_version(&recipe), WIRE_SCHEMA_VERSION);
+    assert_eq!(Digested::schema_version(&receipt), WIRE_SCHEMA_VERSION);
+    assert_eq!(Digested::schema_version(&inputs), WIRE_SCHEMA_VERSION);
     assert_eq!(JobGraph::default().schema_version, WIRE_SCHEMA_VERSION);
 }
 
@@ -369,4 +379,377 @@ fn a_wire_result_is_checked_against_the_plan_like_a_local_one() {
     let mut v = wire;
     v.schema_version = 2;
     assert!(validate_wire_run_result(&fp, v, &dir).is_err());
+}
+
+fn task_result(dir: &str) -> TaskResult {
+    TaskResult {
+        schema_version: WIRE_SCHEMA_VERSION,
+        task: "t1".into(),
+        jobs: vec![run_result(dir).units[0].jobs[0].clone()],
+        outcomes: vec![],
+        receipt_ignored: None,
+        artifacts: vec!["coverage".into()],
+        shard: None,
+    }
+}
+
+const CLI_JSON_PRETTY: &str = r#"{
+  "version": "0.0.0",
+  "sha": "abc",
+  "base": "main",
+  "changed_files": 1,
+  "mode": "changes",
+  "state": "success",
+  "description": "success: pass 1 / fail 0 / error 0 / skip 0",
+  "secs": 2.0,
+  "run_dir": "/runs/r1",
+  "setup": [
+    {
+      "label": "setup",
+      "result": "pass",
+      "exit": 0,
+      "secs": 1.5,
+      "log": "/runs/r1/setup/01-s.log"
+    }
+  ],
+  "units": [
+    {
+      "unit": 0,
+      "workflow": ".github/workflows/ci.yml",
+      "jobs": [
+        {
+          "workflow": ".github/workflows/ci.yml",
+          "job": "a",
+          "display": "a",
+          "result": "pass",
+          "secs": 1.5,
+          "steps": [
+            {
+              "label": "echo a",
+              "result": "pass",
+              "exit": 0,
+              "secs": 1.5,
+              "log": "/runs/r1/ci-a/01-echo-a.log"
+            },
+            {
+              "label": "reused",
+              "result": "pass",
+              "exit": 0,
+              "secs": 1.5
+            }
+          ]
+        }
+      ],
+      "waited_secs": 0.0
+    }
+  ],
+  "skipped_workflows": [
+    {
+      "workflow": "x.yml",
+      "reason": "r"
+    }
+  ],
+  "not_covered": [],
+  "warnings": [],
+  "completeness": {
+    "verdict": "complete",
+    "expected_units": 1,
+    "expected_jobs": 1,
+    "from_cache": 0,
+    "missing": [],
+    "duplicate": [],
+    "unexpected": [],
+    "invalid": [],
+    "incomplete": []
+  }
+}"#;
+// The pretty JSON `local-ci run` saves as `result.json` and `local-ci status`
+// reads back, and the line `local-ci status` prints, are what they were.
+#[test]
+fn the_file_status_reads_and_the_line_it_prints_are_what_they_were() {
+    let r = run_result("/runs/r1");
+    let tmp = common::tempdir().unwrap();
+    let path = tmp.path().join("result.json");
+    local_ci::exec::write_json(&path, &r).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text, CLI_JSON_PRETTY);
+    let saved: local_ci::report::Saved = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (
+            saved.sha.as_str(),
+            saved.state.as_str(),
+            saved.description.as_str()
+        ),
+        (
+            "abc",
+            "success",
+            "success: pass 1 / fail 0 / error 0 / skip 0"
+        )
+    );
+    // `status: local-ci={state} posted to {short}`
+    for (state, github) in [
+        ("success", "success"),
+        ("no_work", "success"),
+        ("failure", "failure"),
+        ("error", "error"),
+        ("incomplete", "error"),
+    ] {
+        assert_eq!(local_ci::report::github_state(state), github, "{state}");
+    }
+}
+
+// What a task result is as JSON: `schema_version` first, nothing else new.
+const TASK_JSON: &str = r#"{"schema_version":1,"task":"t1","jobs":[{"workflow":".github/workflows/ci.yml","job":"a","display":"a","result":"pass","secs":1.5,"steps":[{"label":"echo a","result":"pass","exit":0,"secs":1.5,"log":"/runs/r1/ci-a/01-echo-a.log"},{"label":"reused","result":"pass","exit":0,"secs":1.5}]}],"outcomes":[],"receipt_ignored":null,"artifacts":["coverage"],"shard":null}"#;
+
+#[test]
+fn the_json_of_a_task_result_is_pinned() {
+    let r = task_result("/runs/r1");
+    assert_eq!(serde_json::to_string(&r).unwrap(), TASK_JSON);
+    let back: TaskResult = serde_json::from_str(TASK_JSON).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), TASK_JSON);
+    // written before the version existed, it reads as the first
+    let mut v: Value = serde_json::from_str(TASK_JSON).unwrap();
+    v.as_object_mut().unwrap().remove("schema_version");
+    let old: TaskResult = serde_json::from_value(v).unwrap();
+    assert_eq!(old.schema_version, WIRE_SCHEMA_VERSION);
+}
+
+fn wire_task(dir: &str) -> WireTaskResult {
+    WireTaskResult::from_task_result(&task_result(dir), Path::new(dir)).unwrap()
+}
+
+#[test]
+fn the_limits_are_what_they_are_documented_to_be_and_a_limit_is_allowed() {
+    assert_eq!(MAX_WIRE_ITEMS, 100_000);
+    assert_eq!(MAX_WIRE_STRING, 4096);
+    assert_eq!(MAX_WIRE_NOTE, 64 * 1024);
+    assert_eq!(MAX_LOG_PATH, 1024);
+    assert_eq!(MAX_WIRE_BYTES, 64 * 1024 * 1024);
+    // a log path of exactly the longest length is a path
+    let mut w = WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap();
+    w.setup[0].log = Some("a".repeat(MAX_LOG_PATH));
+    w.into_run_result("/m".into()).unwrap();
+    // text of exactly the longest length is read (here it does not parse)
+    let e = WireRunResult::from_json(&" ".repeat(MAX_WIRE_BYTES)).unwrap_err();
+    assert!(!e.to_string().contains("at most"), "{e}");
+    // every document says the version it holds
+    let mut r = WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap();
+    r.schema_version = 7;
+    assert_eq!(Digested::schema_version(&r), 7);
+    let mut t = wire_task("/runs/r1");
+    t.schema_version = 7;
+    assert_eq!(Digested::schema_version(&t), 7);
+}
+
+#[test]
+fn a_result_without_a_schema_version_is_not_read() {
+    let run =
+        serde_json::to_value(WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap())
+            .unwrap();
+    let task = serde_json::to_value(wire_task("/runs/r1")).unwrap();
+    assert!(run.get("schema_version").is_some());
+    for (v, what) in [(run, "run"), (task, "task")] {
+        let mut v = v;
+        v.as_object_mut().unwrap().remove("schema_version");
+        let text = v.to_string();
+        let e = if what == "run" {
+            WireRunResult::from_json(&text).unwrap_err()
+        } else {
+            WireTaskResult::from_json(&text).unwrap_err()
+        };
+        assert!(format!("{e:#}").contains("schema_version"), "{what}: {e:#}");
+    }
+}
+
+#[test]
+fn a_task_result_from_another_host_cannot_name_files_outside_its_directory() {
+    let ok = wire_task("/runs/r1");
+    ok.clone().into_task_result(Path::new("/mine/t1")).unwrap();
+    let log_of = |w: &mut WireTaskResult, p: &str| {
+        w.jobs[0].steps[0].log = Some(p.into());
+    };
+    for bad in [
+        "/etc/passwd",
+        "../x.log",
+        "a/../../x.log",
+        "a\\b.log",
+        "a\nb.log",
+        "a\u{1b}[31m.log",
+        "a\u{7f}.log",
+        "a\u{85}.log",
+        "",
+    ] {
+        let mut w = ok.clone();
+        log_of(&mut w, bad);
+        let e = w
+            .into_task_result(Path::new("/mine/t1"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("log path"), "{bad:?}: {e}");
+    }
+    for bad in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a\0b",
+        "a\nb",
+        &"x".repeat(201),
+    ] {
+        let mut w = ok.clone();
+        w.artifacts = vec![bad.into()];
+        let e = w
+            .into_task_result(Path::new("/mine/t1"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("an artifact:"), "{bad:?}: {e}");
+    }
+    let mut w = ok.clone();
+    w.artifacts = vec!["x".repeat(200), "a..b".into(), "cov erage".into()];
+    w.into_task_result(Path::new("/mine/t1")).unwrap();
+}
+
+#[test]
+fn what_a_result_may_hold_is_bounded() {
+    let base = WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap();
+    let here = || "/mine/r9".into();
+    // too many steps, over the whole result
+    let mut w = base.clone();
+    let s = w.setup[0].clone();
+    w.setup = vec![s; MAX_WIRE_ITEMS + 1];
+    let e = w.into_run_result(here()).unwrap_err().to_string();
+    assert!(e.contains("units, jobs and steps"), "{e}");
+    let mut w = base.clone();
+    let s = w.setup[0].clone();
+    w.setup = vec![s; MAX_WIRE_ITEMS - 3];
+    let e = w.into_run_result(here());
+    assert!(e.is_err(), "the units and jobs count too");
+    let mut w = base.clone();
+    let s = w.setup[0].clone();
+    w.setup = vec![s; MAX_WIRE_ITEMS - 4];
+    w.into_run_result(here()).unwrap();
+    // strings
+    let long = "x".repeat(MAX_WIRE_STRING + 1);
+    for edit in [
+        (|w: &mut WireRunResult, l: &str| w.setup[0].label = l.into())
+            as fn(&mut WireRunResult, &str),
+        |w, l| w.units[0].workflow = l.into(),
+        |w, l| w.units[0].jobs[0].workflow = l.into(),
+        |w, l| w.units[0].jobs[0].job = l.into(),
+        |w, l| w.units[0].jobs[0].display = l.into(),
+        |w, l| w.units[0].jobs[0].steps[0].label = l.into(),
+    ] {
+        let mut w = base.clone();
+        edit(&mut w, &long);
+        let e = w.into_run_result(here()).unwrap_err().to_string();
+        assert!(e.contains("at most"), "{e}");
+        let mut w = base.clone();
+        edit(&mut w, &"x".repeat(MAX_WIRE_STRING));
+        w.into_run_result(here()).unwrap();
+    }
+    // a note may be longer than a name
+    let mut w = base.clone();
+    w.setup[0].note = Some("n".repeat(MAX_WIRE_NOTE));
+    w.clone().into_run_result(here()).unwrap();
+    w.setup[0].note = Some("n".repeat(MAX_WIRE_NOTE + 1));
+    assert!(w.into_run_result(here()).is_err());
+    // a task result: counts and strings
+    let t = wire_task("/runs/r1");
+    let mut w = t.clone();
+    w.task = long.clone();
+    assert!(w.into_task_result(Path::new("/m")).is_err());
+    let mut w = t.clone();
+    let j = w.jobs[0].clone();
+    w.jobs = vec![j; 3];
+    w.jobs[0].steps = vec![w.jobs[0].steps[0].clone(); MAX_WIRE_ITEMS];
+    let e = w.into_task_result(Path::new("/m")).unwrap_err().to_string();
+    assert!(e.contains("steps"), "{e}");
+    let mut w = t.clone();
+    w.artifacts = vec!["a".into(); MAX_WIRE_ITEMS + 1];
+    let e = w.into_task_result(Path::new("/m")).unwrap_err().to_string();
+    assert!(e.contains("artifacts"), "{e}");
+    let mut w = t.clone();
+    w.outcomes = vec![
+        local_ci::task::JobOutcome {
+            job: "a".into(),
+            variant: None,
+            status: local_ci::task::JobStatus::Success,
+            outputs: Default::default(),
+            skipped: None,
+            ancestor_failed: false,
+        };
+        MAX_WIRE_ITEMS + 1
+    ];
+    let e = w.into_task_result(Path::new("/m")).unwrap_err().to_string();
+    assert!(e.contains("outcomes"), "{e}");
+    let mut w = t;
+    let j = w.jobs[0].clone();
+    w.jobs = vec![j; MAX_WIRE_ITEMS + 1];
+    let e = w.into_task_result(Path::new("/m")).unwrap_err().to_string();
+    assert!(e.contains("jobs"), "{e}");
+}
+
+#[test]
+fn a_document_is_read_with_its_digest_and_its_version_checked() {
+    let w = WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap();
+    let text = serde_json::to_string(&w).unwrap();
+    let d = w.digest().unwrap();
+    let back = WireRunResult::from_json_checked(&text, &d).unwrap();
+    assert_eq!(back.digest().unwrap(), d);
+    // another digest, another version, not JSON, too long
+    let e = WireRunResult::from_json_checked(&text, "sha256:00").unwrap_err();
+    assert!(e.to_string().contains("does not match"), "{e}");
+    let mut other = w.clone();
+    other.schema_version = 7;
+    let e = WireRunResult::from_json_checked(
+        &serde_json::to_string(&other).unwrap(),
+        &other.digest().unwrap(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("schema version 7"), "{e}");
+    let e = WireRunResult::from_json_checked("{", &d).unwrap_err();
+    assert!(format!("{e:#}").contains("cannot read"), "{e:#}");
+    let e = WireRunResult::from_json_checked(&" ".repeat(MAX_WIRE_BYTES + 1), &d).unwrap_err();
+    assert!(e.to_string().contains("at most"), "{e}");
+    // the other types that cross have it too
+    let t = TaskInputs::default();
+    let text = serde_json::to_string(&t).unwrap();
+    assert_eq!(
+        TaskInputs::from_json_checked(&text, &t.digest().unwrap()).unwrap(),
+        t
+    );
+    let k = wire_task("/runs/r1");
+    let text = serde_json::to_string(&k).unwrap();
+    WireTaskResult::from_json_checked(&text, &k.digest().unwrap()).unwrap();
+}
+
+// serde refuses an unknown key except in the types that hold a flattened
+// field, which read it away (see the module docs of `result_wire`).
+#[test]
+fn an_unknown_key_is_refused_except_where_serde_cannot() {
+    let w = WireRunResult::from_run_result(&run_result("/runs/r1")).unwrap();
+    let t = wire_task("/runs/r1");
+    for (mut v, at) in [
+        (serde_json::to_value(&w).unwrap(), ""),
+        (serde_json::to_value(&w).unwrap(), "/units/0"),
+        (serde_json::to_value(&t).unwrap(), ""),
+    ] {
+        v.pointer_mut(at).unwrap()["new_field"] = json!(1);
+        let text = v.to_string();
+        let e = if v.get("units").is_some() {
+            WireRunResult::from_json(&text).map(|_| ())
+        } else {
+            WireTaskResult::from_json(&text).map(|_| ())
+        };
+        assert!(
+            format!("{:#}", e.unwrap_err()).contains("new_field"),
+            "{at}"
+        );
+    }
+    let mut v = serde_json::to_value(&w).unwrap();
+    v["setup"][0]["new_field"] = json!(1);
+    v["units"][0]["jobs"][0]["new_field"] = json!(1);
+    let read = WireRunResult::from_json(&v.to_string()).unwrap();
+    assert_eq!(read.digest().unwrap(), w.digest().unwrap());
 }

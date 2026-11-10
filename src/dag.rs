@@ -93,8 +93,16 @@ pub struct JobGraph {
     pub nodes: Vec<JobNode>,
 }
 
-impl crate::wire::Digested for JobGraph {}
-impl crate::wire::Digested for ExecutionTask {}
+impl crate::wire::Digested for JobGraph {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for ExecutionTask {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 impl Default for JobGraph {
     fn default() -> Self {

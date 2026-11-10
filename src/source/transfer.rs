@@ -13,17 +13,22 @@ fn is_hex40(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
+fn check_source_id(id: &str) -> Result<()> {
+    let ok = id.len() == 36
+        && id.starts_with("src-")
+        && id[4..]
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+    if !ok {
+        bail!("not a source id: {id:?}");
+    }
+    Ok(())
+}
+
 /// The ids in `m` that end up on a Git command line or in a ref name: a
 /// manifest from elsewhere is not trusted to hold nothing but ids.
 fn check_ids(m: &SourceManifest) -> Result<()> {
-    let id_ok = m.source_id.len() == 36
-        && m.source_id.starts_with("src-")
-        && m.source_id[4..]
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
-    if !id_ok {
-        bail!("not a source id: {:?}", m.source_id);
-    }
+    check_source_id(&m.source_id)?;
     for sha in m.execution_commit.iter().chain(m.merge_base.iter()) {
         if !is_hex40(sha) {
             bail!("not a commit id: {sha:?}");
@@ -49,6 +54,26 @@ fn snapshot_ref(source_id: &str) -> String {
     format!("refs/local-ci/snapshots/{source_id}")
 }
 
+/// Point `r` at `c` unless it does already. Two exports of one source may run
+/// at once: the value is the same (the commit is fixed by the tree), so only
+/// the write is contended, and a write that lost the ref's lock is tried once
+/// more.
+fn set_ref_once(ctx: &ExecContext, dir: &Path, r: &str, c: &str) -> Result<()> {
+    let current = |ctx: &ExecContext| {
+        pg(ctx, dir, &["rev-parse", "--verify", "-q", r], &[], None)
+            .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+            .unwrap_or_default()
+    };
+    if current(ctx) == c {
+        return Ok(());
+    }
+    match pg(ctx, dir, &["update-ref", r, c], &[], None) {
+        Ok(_) => Ok(()),
+        Err(_) if current(ctx) == c => Ok(()),
+        Err(_) => pg(ctx, dir, &["update-ref", r, c], &[], None).map(|_| ()),
+    }
+}
+
 /// The private repository that holds the snapshot ref of `m`.
 fn holder(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -> Result<PathBuf> {
     let r = snapshot_ref(&m.source_id);
@@ -59,6 +84,40 @@ fn holder(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -> Result<
         }
     }
     bail!("the Git objects of {} are not in this store", m.source_id)
+}
+
+/// The source ids of the dirty submodules in `subs`, those below them
+/// included as far as the manifests this host has tell. An id that is not a
+/// source id is refused: it ends up in a ref name.
+fn dirty_submodule_ids(subs: &[SubmoduleRef], store: Option<&ObjectStore>) -> Result<Vec<String>> {
+    let mut out = vec![];
+    for s in subs.iter().filter(|s| s.dirty) {
+        let Some(id) = &s.source_id else { continue };
+        check_source_id(id)?;
+        out.push(id.clone());
+        if let Some(n) = store.map(|st| st.load_manifest(id)).transpose()?.flatten() {
+            out.extend(dirty_submodule_ids(&n.submodules, store)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Forget what [`import_objects`] put in `clone_dir` for the source
+/// `source_id`: its snapshot ref and its index ref (the objects go with the
+/// clone's next `git gc`). A ref that is not there is not an error. The
+/// caller decides when: nothing here knows whether another task of the same
+/// source still runs, so the worker that owns the clone calls it from its own
+/// garbage collection.
+pub fn remove_imported_refs(ctx: &ExecContext, clone_dir: &Path, source_id: &str) -> Result<()> {
+    check_source_id(source_id)?;
+    let pre = ["-C".into(), clone_dir.into()];
+    for r in [snapshot_ref(source_id), index_ref(source_id)] {
+        let here = git_run(ctx, &pre, &["rev-parse", "--verify", "-q", &r], &[], None).is_ok();
+        if here {
+            git_run(ctx, &pre, &["update-ref", "-d", &r], &[], None)?;
+        }
+    }
+    Ok(())
 }
 
 /// The manifests of the submodules below `m` whose commit is a snapshot of
@@ -115,7 +174,7 @@ pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -
         .with_context(|| format!("the index tree of {} is not in this store", m.source_id))?;
         let c = super::capture::index_commit(ctx, &dir, tree)?;
         let r = index_ref(&m.source_id);
-        pg(ctx, &dir, &["update-ref", &r, &c], &[], None)?;
+        set_ref_once(ctx, &dir, &r, &c)?;
         refs.push(r);
     }
     for sub in dirty_submodules(store, m)? {
@@ -189,16 +248,28 @@ pub fn import_objects(
         None,
     )
     .context("the bundle does not fit this clone (its base is missing)")?;
-    // the snapshot of `m`, and those of its dirty submodules
-    let refspecs = [
-        "+refs/local-ci/snapshots/*:refs/local-ci/snapshots/*",
-        "+refs/local-ci/index/*:refs/local-ci/index/*",
-    ];
-    let mut fetch = vec!["fetch", "-q", "--no-tags", "--no-write-fetch-head"];
+    // the snapshot of `m`, those of its dirty submodules, and the index
+    // commit: named one by one, so a bundle cannot put another ref in the
+    // clone
+    let store = default_store(ctx).ok();
+    let mut refspecs: Vec<String> = vec![];
+    let mut ids = vec![m.source_id.clone()];
+    ids.extend(dirty_submodule_ids(&m.submodules, store.as_ref())?);
+    for id in &ids {
+        let r = snapshot_ref(id);
+        refspecs.push(format!("+{r}:{r}"));
+    }
+    if m.index_tree.is_some() {
+        let r = index_ref(&m.source_id);
+        refspecs.push(format!("+{r}:{r}"));
+    }
     let bundle_path = bundle.to_string_lossy();
+    let mut fetch = vec!["fetch", "-q", "--no-tags", "--no-write-fetch-head"];
     fetch.push(&bundle_path);
-    fetch.extend(refspecs);
-    git_run(ctx, &pre, &fetch, &[], None)?;
+    fetch.extend(refspecs.iter().map(String::as_str));
+    git_run(ctx, &pre, &fetch, &[], None).context(
+        "the bundle lacks a ref of this source (a bundle made without the index tree has no index ref)",
+    )?;
     let got = String::from_utf8_lossy(&git_run(
         ctx,
         &pre,
@@ -249,11 +320,24 @@ pub fn import_objects(
             }
             .into());
         }
+        // a commit around the tree and nothing more: no history rides along
+        let n = git_run(
+            ctx,
+            &pre,
+            &["rev-list", "--count", &index_ref(&m.source_id)],
+            &[],
+            None,
+        )?;
+        if String::from_utf8_lossy(&n).trim() != "1" {
+            return Err(SourceError::Corrupt {
+                what: format!("the index commit of {} has a history", m.source_id),
+            }
+            .into());
+        }
     }
     // a dirty submodule's commit is what the gitlink names: it has come along,
     // and so have the dirty ones below it (known from their manifests, when
     // this host has them)
-    let store = default_store(ctx).ok();
     check_gitlinks(ctx, &pre, commit, &m.submodules, store.as_ref())?;
     Ok(got)
 }

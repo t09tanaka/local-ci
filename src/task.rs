@@ -96,8 +96,16 @@ pub struct TaskInputs {
     pub run_cancelled: bool,
 }
 
-impl crate::wire::Digested for TaskInputs {}
-impl crate::wire::Digested for TaskResult {}
+impl crate::wire::Digested for TaskInputs {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for TaskResult {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 impl Default for TaskInputs {
     fn default() -> Self {

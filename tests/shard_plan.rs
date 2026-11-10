@@ -552,3 +552,37 @@ fn a_native_split_that_knows_its_tests_checks_them() {
         assert_eq!(aggregate_shard_group(&g, &more).ok(), extra_ok);
     }
 }
+
+#[test]
+fn a_plan_whose_shard_runs_outside_the_workspace_or_elsewhere_than_its_step_is_refused() {
+    let (_t, fp) = plan();
+    let sp = fp.with_shards(&[split_request("test", 2)]).unwrap();
+    sp.verify().unwrap();
+    // a job that runs below the root is checked against its own step
+    let mut wd = split_request("wd", 2);
+    wd.dir = "web".into();
+    fp.with_shards(&[wd]).unwrap().verify().unwrap();
+    let i = sp.tasks.iter().position(|t| t.shard.is_some()).unwrap();
+    for (dir, want) in [
+        ("/etc", "not a directory below the workspace"),
+        ("../x", "not a directory below the workspace"),
+        ("a/../../x", "not a directory below the workspace"),
+        ("a\\b", "not a directory below the workspace"),
+        ("web", "not where its step runs"),
+    ] {
+        let mut bad = sp.clone();
+        bad.tasks[i].shard.as_mut().unwrap().dir = dir.into();
+        let e = bad.verify().unwrap_err().to_string();
+        assert!(e.contains(want), "{dir}: {e}");
+        assert!(e.contains(&sp.tasks[i].id), "{dir}: {e}");
+    }
+    // the step is found by workflow, job and index: one that is not there is
+    // not this check's to report
+    let mut bad = sp.clone();
+    bad.tasks[i].shard.as_mut().unwrap().step = 99;
+    assert!(!bad
+        .verify()
+        .unwrap_err()
+        .to_string()
+        .contains("where its step runs"));
+}

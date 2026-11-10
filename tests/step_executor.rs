@@ -272,6 +272,71 @@ fn a_step_reaches_the_executor_with_what_it_needs_and_nothing_is_started_here() 
     assert!(l.dir.exists());
 }
 
+const SHARDED: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  t:\n    runs-on: x\n    defaults:\n      run:\n        shell: sh\n    steps:\n      - run: cargo test\n";
+
+/// The step that runs the tests of a shard is listed as its shell on the
+/// script, as every step is, and that is what the executor is asked to start.
+#[test]
+fn the_demand_of_a_shard_step_is_the_shell_the_executor_starts() {
+    use local_ci::shard::adapters::{CargoTest, Safety};
+    use local_ci::shard::{partition_tests, Discovered, History, PartitionOpts};
+    let mut l = lab_for(SHARDED);
+    let a = CargoTest::from_command("1", "cargo test", Safety::default()).unwrap();
+    let d = Discovered {
+        tests: ["a", "b", "c", "d"].map(String::from).to_vec(),
+        complete: true,
+    };
+    let plan = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
+    l.fp =
+        l.fp.with_shards(&[local_ci::dag::ShardRequest {
+            workflow: W1.into(),
+            job: "t".into(),
+            plan,
+            step: 0,
+            dir: String::new(),
+            discovered: d,
+            fail_fast: true,
+        }])
+        .unwrap();
+    let id =
+        l.fp.tasks
+            .iter()
+            .find(|t| t.shard.is_some())
+            .unwrap()
+            .id
+            .clone();
+    let demand = local_ci::plan_task_demand(&l.fp, &id).unwrap();
+    assert_eq!(demand.nodes.len(), 1);
+    assert_eq!(demand.nodes[0].argv, ["sh", "-e", local_ci::demand::SCRIPT]);
+    let rec = Recorder::new(Exit::Code(0), None);
+    let opts = Opts {
+        parallel: 1,
+        traffic_controller: None,
+        executor: Some(rec.clone()),
+        portool: None,
+        containers: 1,
+        job_timeout_min: 5.0,
+        keep: true,
+        trash: l.tmp.path().join("lab/trash"),
+    };
+    local_ci::execute_task(
+        &l.ctx,
+        &l.fp,
+        &id,
+        &TaskInputs::default(),
+        None,
+        &l.ws,
+        opts,
+    )
+    .unwrap();
+    let seen = rec.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (script, shell) = seen[0].argv.split_last().unwrap();
+    assert!(script.ends_with(".sh"), "{script}");
+    assert_eq!(shell, &demand.nodes[0].argv[..2]);
+    assert_eq!(l.ws.root.join(&demand.nodes[0].cwd), seen[0].cwd);
+}
+
 #[test]
 fn the_demand_of_a_task_is_what_its_steps_ask_the_executor() {
     let l = lab_for(TWO_STEPS);

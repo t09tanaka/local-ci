@@ -4,7 +4,7 @@
 
 mod common;
 use local_ci::dag::ShardRequest;
-use local_ci::demand::{DemandNode, SCRIPT, WORKSPACE};
+use local_ci::demand::{DemandNode, SCRIPT};
 use local_ci::shard::adapters::{CargoTest, Safety, Vitest};
 use local_ci::shard::{partition_tests, Discovered, History, PartitionOpts, RunnerAdapter};
 use local_ci::wire::Digested;
@@ -228,27 +228,29 @@ fn what_is_settled_only_when_the_task_runs_is_marked() {
 }
 
 #[test]
-fn a_shard_task_lists_the_command_its_adapter_builds() {
+fn a_shard_task_lists_its_step_as_the_shell_on_a_script() {
     let (_t, fp) = plan();
     let a = CargoTest::from_command("1", "cargo test", Safety::default()).unwrap();
     let r = request("test", &a, &["a", "b", "c", "d"], "");
     let sp = fp.with_shards(&[r]).unwrap();
     let shards: Vec<_> = sp.tasks.iter().filter(|t| t.shard.is_some()).collect();
     assert_eq!(shards.len(), 2);
+    // the form of an ordinary step of the same shell
+    let plain = nodes(&sp, "chain")[0].argv.clone();
+    assert_eq!(plain.last().unwrap(), SCRIPT);
     for t in &shards {
         let d = plan_task_demand(&sp, &t.id).unwrap();
         let ts = t.shard.as_ref().unwrap();
+        let mut seven = d.clone();
+        seven.schema_version = 7;
+        assert_eq!(Digested::schema_version(&seven), 7);
         assert_eq!(d.nodes.len(), 1);
         let n = &d.nodes[0];
-        assert_eq!(&n.argv[..2], ["cargo", "test"]);
-        for name in &ts.tests {
-            assert!(n.argv.contains(name), "{:?} lacks {name}", n.argv);
-        }
+        assert_eq!(n.argv, plain);
         assert_eq!(n.weight.tests, Some(ts.tests.len()));
-        assert!(!n.argv.iter().any(|w| w == SCRIPT));
     }
-    // the shard's step runs where its tests were listed, with the files named
-    // from the workspace
+    // a working directory below the workspace is the step's, and what the
+    // command is built from is not in the listing
     let v = Vitest::from_command("2", "/p", "npx vitest run", Safety::default()).unwrap();
     let r = ShardRequest {
         dir: "web".into(),
@@ -258,15 +260,57 @@ fn a_shard_task_lists_the_command_its_adapter_builds() {
     let t = sp.tasks.iter().find(|t| t.shard.is_some()).unwrap();
     let n = &plan_task_demand(&sp, &t.id).unwrap().nodes[0];
     assert_eq!(n.cwd, "web");
-    assert_eq!(&n.argv[..2], ["npx", "vitest"]);
-    assert!(
-        n.argv
-            .iter()
-            .any(|w| w.starts_with(&format!("{WORKSPACE}/web/"))),
-        "{:?}",
-        n.argv
-    );
-    assert!(n.argv.iter().all(|w| !w.contains("/p/")), "{:?}", n.argv);
+    assert_eq!(n.argv, plain);
+}
+
+#[test]
+fn a_working_directory_that_leaves_the_workspace_is_not_listed() {
+    let (_t, fp) = plan();
+    let e = |fp: &FrozenPlan, id: &str| plan_task_demand(fp, id).unwrap_err().to_string();
+    for dir in ["/etc", "../x", "a/../../x", "a/../b/..", "C:/x"] {
+        let mut bad = fp.clone();
+        bad.workflows[0]
+            .jobs
+            .iter_mut()
+            .find(|j| j.id == "chain")
+            .unwrap()
+            .working_directory = Some(dir.into());
+        let m = e(&bad, &id_of("chain"));
+        assert!(
+            m.contains("not a directory below the workspace"),
+            "{dir}: {m}"
+        );
+    }
+    // `./a//b` is read as `a/b`
+    let mut ok = fp.clone();
+    ok.workflows[0]
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == "chain")
+        .unwrap()
+        .working_directory = Some("./a//b".into());
+    assert_eq!(nodes(&ok, "chain")[0].cwd, "a/b");
+
+    // a shard task: its directory is the step's and below the workspace
+    let a = CargoTest::from_command("1", "cargo test", Safety::default()).unwrap();
+    let sp = fp
+        .with_shards(&[request("test", &a, &["a", "b", "c", "d"], "")])
+        .unwrap();
+    let i = sp.tasks.iter().position(|t| t.shard.is_some()).unwrap();
+    let id = sp.tasks[i].id.clone();
+    for dir in ["/etc", "../x", "a\\b"] {
+        let mut bad = sp.clone();
+        bad.tasks[i].shard.as_mut().unwrap().dir = dir.into();
+        let m = e(&bad, &id);
+        assert!(
+            m.contains("not a directory below the workspace"),
+            "{dir}: {m}"
+        );
+    }
+    let mut bad = sp.clone();
+    bad.tasks[i].shard.as_mut().unwrap().dir = "web".into();
+    let m = e(&bad, &id);
+    assert!(m.contains("where its tests were listed"), "{m}");
 }
 
 #[test]

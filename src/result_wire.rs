@@ -10,6 +10,20 @@
 //!
 //! The JSON `local-ci run` and `local-ci status` write is that of
 //! [`RunResult`] and does not change.
+//!
+//! What a receiver reads is bounded: the text ([`MAX_WIRE_BYTES`]), the number
+//! of units, jobs and steps ([`MAX_WIRE_ITEMS`]) and every string
+//! ([`MAX_WIRE_STRING`], [`MAX_WIRE_NOTE`]). `schema_version` is required in
+//! the wire results (a result without it is refused), unlike the types the
+//! engine reads from its own disk, which read a missing one as the first.
+//!
+//! A key the types do not know is refused, except in two of them:
+//! [`WireStepResult`] and [`WireJobResult`] hold an `#[serde(flatten)]` field
+//! ([`Outcome`]), and serde cannot refuse an unknown key there
+//! (`deny_unknown_fields` and `flatten` do not go together). A step or job
+//! result with a key of a newer writer is read without it. Read through
+//! [`crate::wire::Digested::from_json_checked`] to notice: when the sender's
+//! digest covers the key, the digest of what was read differs.
 
 use crate::complete::{validate_run_result, Completeness};
 use crate::exec::{JobResult, JobTime, Outcome, StepResult, UnitResult};
@@ -26,6 +40,30 @@ use std::path::{Component, Path, PathBuf};
 pub const MAX_WIRE_BYTES: usize = 64 * 1024 * 1024;
 /// The longest relative path a log may have.
 pub const MAX_LOG_PATH: usize = 1024;
+/// The most units, jobs and steps (together, counted over the whole result)
+/// and the most outcomes or artifacts a result read from another host may
+/// hold. A plan of this tool is far smaller; the bound keeps a hostile result
+/// from costing memory and a long check.
+pub const MAX_WIRE_ITEMS: usize = 100_000;
+/// The longest label, id, name or path a result read from another host may
+/// hold, in bytes.
+pub const MAX_WIRE_STRING: usize = 4 * 1024;
+/// The longest `note` (an error message, a skip reason) of a step, in bytes.
+pub const MAX_WIRE_NOTE: usize = 64 * 1024;
+
+fn check_string(what: &str, s: &str, max: usize) -> Result<()> {
+    if s.len() > max {
+        bail!("{what} is {} bytes; at most {max} are read", s.len());
+    }
+    Ok(())
+}
+
+fn check_count(what: &str, n: usize) -> Result<()> {
+    if n > MAX_WIRE_ITEMS {
+        bail!("{n} {what}; at most {MAX_WIRE_ITEMS} are read");
+    }
+    Ok(())
+}
 
 /// `p` relative to `base`, as a wire path: UTF-8, `/` separated, nothing
 /// that leaves `base`.
@@ -38,10 +76,14 @@ fn relative(base: &Path, p: &Path) -> Result<String> {
     Ok(text)
 }
 
-/// A path that is relative and stays below the directory it is joined to.
+/// A path that is relative and stays below the directory it is joined to,
+/// with no control character and no backslash.
 fn check_relative(text: &str) -> Result<()> {
-    if text.is_empty() || text.len() > MAX_LOG_PATH || text.contains('\0') {
-        bail!("not a log path: empty, too long or with a NUL");
+    if text.is_empty()
+        || text.len() > MAX_LOG_PATH
+        || text.chars().any(|c| c.is_control() || c == '\\')
+    {
+        bail!("not a log path: empty, too long, or with a control character or a backslash");
     }
     if !Path::new(text)
         .components()
@@ -95,6 +137,10 @@ impl WireStepResult {
     }
 
     pub fn into_step(self, base: &Path) -> Result<StepResult> {
+        check_string("a step label", &self.label, MAX_WIRE_STRING)?;
+        if let Some(n) = &self.note {
+            check_string("a step note", n, MAX_WIRE_NOTE)?;
+        }
         Ok(StepResult {
             label: self.label,
             outcome: self.outcome,
@@ -148,6 +194,14 @@ impl WireJobResult {
     }
 
     pub fn into_job(self, base: &Path) -> Result<JobResult> {
+        for (what, v) in [
+            ("a workflow", &self.workflow),
+            ("a job id", &self.job),
+            ("a job name", &self.display),
+        ] {
+            check_string(what, v, MAX_WIRE_STRING)?;
+        }
+        check_count("steps in a job", self.steps.len())?;
         Ok(JobResult {
             workflow: self.workflow,
             job: self.job,
@@ -163,6 +217,7 @@ impl WireJobResult {
 
 /// A [`UnitResult`] with relative logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireUnitResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<usize>,
@@ -195,6 +250,9 @@ impl WireUnitResult {
     }
 
     pub fn into_unit(self, base: &Path) -> Result<UnitResult> {
+        check_string("a workflow", &self.workflow, MAX_WIRE_STRING)?;
+        check_count("jobs in a unit", self.jobs.len())?;
+        check_count("outcomes in a unit", self.outcomes.len())?;
         Ok(UnitResult {
             unit: self.unit,
             workflow: self.workflow,
@@ -213,9 +271,10 @@ impl WireUnitResult {
 
 /// A [`RunResult`] without the host's `run_dir` and with relative logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireRunResult {
-    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
-    #[serde(default = "wire_version")]
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`]. Required: a result without
+    /// it is refused.
     pub schema_version: u32,
     pub version: String,
     pub sha: String,
@@ -233,7 +292,11 @@ pub struct WireRunResult {
     pub completeness: Completeness,
 }
 
-impl Digested for WireRunResult {}
+impl Digested for WireRunResult {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 impl WireRunResult {
     /// `r` with its logs relative to `r.run_dir`. Fails for a log outside it.
@@ -267,6 +330,7 @@ impl WireRunResult {
     /// relative or leaves the directory.
     pub fn into_run_result(self, run_dir: PathBuf) -> Result<RunResult> {
         check_version("run result", self.schema_version)?;
+        self.check_size()?;
         Ok(RunResult {
             version: self.version,
             sha: self.sha,
@@ -290,7 +354,22 @@ impl WireRunResult {
         })
     }
 
-    /// Read a result from JSON (at most [`MAX_WIRE_BYTES`] of it).
+    /// The result's size is within the bounds a receiver reads.
+    fn check_size(&self) -> Result<()> {
+        let mut items = self.setup.len() + self.units.len();
+        for u in &self.units {
+            items += u.jobs.len();
+            items += u.jobs.iter().map(|j| j.steps.len()).sum::<usize>();
+        }
+        check_count("units, jobs and steps", items)?;
+        check_count("warnings", self.warnings.len())?;
+        check_count("workflows not covered", self.not_covered.len())?;
+        check_count("skipped workflows", self.skipped_workflows.len())
+    }
+
+    /// Read a result from JSON (at most [`MAX_WIRE_BYTES`] of it). Prefer
+    /// [`crate::wire::Digested::from_json_checked`], which also checks the
+    /// digest.
     pub fn from_json(text: &str) -> Result<Self> {
         read_json(text, "run result")
     }
@@ -308,9 +387,10 @@ pub fn validate_wire_run_result(
 
 /// A [`TaskResult`] with relative logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireTaskResult {
-    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
-    #[serde(default = "wire_version")]
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`]. Required: a result without
+    /// it is refused.
     pub schema_version: u32,
     pub task: String,
     pub jobs: Vec<WireJobResult>,
@@ -321,7 +401,11 @@ pub struct WireTaskResult {
     pub shard: Option<ShardOutcome>,
 }
 
-impl Digested for WireTaskResult {}
+impl Digested for WireTaskResult {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 impl WireTaskResult {
     /// `r` with its logs relative to `base`, the directory the task kept them
@@ -345,6 +429,17 @@ impl WireTaskResult {
     /// The result with `base` as the directory its logs are in here.
     pub fn into_task_result(self, base: &Path) -> Result<TaskResult> {
         check_version("task result", self.schema_version)?;
+        check_string("a task id", &self.task, MAX_WIRE_STRING)?;
+        check_count("jobs", self.jobs.len())?;
+        check_count(
+            "steps",
+            self.jobs.iter().map(|j| j.steps.len()).sum::<usize>(),
+        )?;
+        check_count("outcomes", self.outcomes.len())?;
+        check_count("artifacts", self.artifacts.len())?;
+        for a in &self.artifacts {
+            crate::artifact::validate_name(a).map_err(|e| anyhow::anyhow!("an artifact: {e}"))?;
+        }
         Ok(TaskResult {
             schema_version: self.schema_version,
             task: self.task,
@@ -360,7 +455,9 @@ impl WireTaskResult {
         })
     }
 
-    /// Read a result from JSON (at most [`MAX_WIRE_BYTES`] of it).
+    /// Read a result from JSON (at most [`MAX_WIRE_BYTES`] of it). Prefer
+    /// [`crate::wire::Digested::from_json_checked`], which also checks the
+    /// digest.
     pub fn from_json(text: &str) -> Result<Self> {
         read_json(text, "task result")
     }

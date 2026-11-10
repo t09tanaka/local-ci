@@ -10,7 +10,7 @@
 //!
 //! The types hold nothing of a scheduler and nothing of the host: paths are
 //! relative to the workspace, and the one place where a workspace path would
-//! be in a command is written as [`WORKSPACE`].
+//! be in a command is a placeholder ([`SCRIPT`]).
 
 use crate::frozen::FrozenPlan;
 use crate::plan;
@@ -19,12 +19,11 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// In an `argv` of an ordinary step: the file the step's script is in, which
-/// the host that runs the step makes.
+/// In an `argv`: the file the step's script is in, which the host that runs
+/// the step makes. Every step, the one that runs the tests of a shard too, is
+/// started as its shell run on that file (that is what the executor does: the
+/// shard's command is the script).
 pub const SCRIPT: &str = "{script}";
-/// In an `argv` of a shard's test step: the workspace of the task, which a
-/// runner adapter puts in front of the files it names.
-pub const WORKSPACE: &str = "{workspace}";
 
 /// How much a step asks of a machine, as far as the plan says.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -50,13 +49,14 @@ pub struct DemandNode {
     pub step: usize,
     /// The step's label as written: it may hold an expression.
     pub label: String,
-    /// The working directory relative to the workspace (`""` for its root).
+    /// The working directory relative to the workspace (`""` for its root):
+    /// in its plain form, never absolute, never with `..`.
     pub cwd: String,
-    /// The command line. For an ordinary step: the shell with [`SCRIPT`] in
-    /// place of the file of the script. For the step that runs the tests of a
-    /// shard: the command the runner's adapter built, led by `env` and its
-    /// variables when it sets any, with [`WORKSPACE`] in place of the
-    /// workspace.
+    /// The command line the executor starts: the step's shell with
+    /// [`SCRIPT`] in place of the file of the script. The step that runs the
+    /// tests of a shard is listed the same way (its script is the command of
+    /// the runner's adapter, built when the task runs; `weight.tests` says how
+    /// many tests it has).
     pub argv: Vec<String>,
     /// The key the step's history is kept under (what a run hands an
     /// executor as the `key` of the step). `None` when the label holds an
@@ -81,7 +81,11 @@ pub struct TaskDemand {
     pub nodes: Vec<DemandNode>,
 }
 
-impl Digested for TaskDemand {}
+impl Digested for TaskDemand {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 /// The key a step's history is kept under: the workflow file (as `local-ci`
 /// names it in output), the job and the step's label.
@@ -104,41 +108,12 @@ fn shell_argv(shell: Option<&str>) -> Result<Vec<String>> {
     })
 }
 
-/// The command the adapter of a shard builds for the step that runs its tests.
-fn shard_argv(ts: &crate::dag::TaskShard) -> Result<Vec<String>> {
-    use crate::shard::{adapters, Shard};
-    let root = if ts.dir.is_empty() {
-        WORKSPACE.to_string()
-    } else {
-        format!("{WORKSPACE}/{}", ts.dir)
-    };
-    let adapter = adapters::from_info(&ts.runner, &root)
-        .ok_or_else(|| anyhow!("no adapter for runner `{}`", ts.runner.runner))?;
-    let inv = adapter.invoke(
-        &Shard {
-            index: ts.index,
-            tests: ts.tests.clone(),
-            load: 0,
-        },
-        ts.count,
-        ts.mode,
-    );
-    if adapters::script_of(&inv).is_none() {
-        bail!("a test name cannot be put in a command");
-    }
-    Ok(words_of(inv))
-}
-
-/// The command of an invocation as one list of words: led by `env` and the
-/// variables it sets, when it sets any.
-fn words_of(inv: crate::shard::Invocation) -> Vec<String> {
-    let mut argv = vec![];
-    if !inv.env.is_empty() {
-        argv.push("env".to_string());
-        argv.extend(inv.env.iter().map(|(k, v)| format!("{k}={v}")));
-    }
-    argv.extend(inv.argv);
-    argv
+/// A working directory of the plan as the workspace-relative path it is:
+/// nothing absolute, nothing with `..` or a NUL or a backslash. `a//b` and
+/// `./a` are read as `a/b` and `a`.
+pub(crate) fn workspace_dir(what: &str, dir: &str) -> Result<String> {
+    crate::artifact::normalize_rel(dir)
+        .map_err(|e| anyhow!("{what} {dir:?} is not a directory below the workspace: {e}"))
 }
 
 /// The commands task `task_id` of `fp` starts, as far as the plan tells.
@@ -167,6 +142,9 @@ pub fn plan_task_demand(fp: &FrozenPlan, task_id: &str) -> Result<TaskDemand> {
         .filter(|a| a.workflow == task.workflow)
         .map(|a| (a.job.as_str(), a.index))
         .collect();
+    if let Some(ts) = &task.shard {
+        workspace_dir("the shard's working directory", &ts.dir)?;
+    }
     let mut nodes: Vec<DemandNode> = vec![];
     let mut shard_step = false;
     for id in &task.jobs {
@@ -186,10 +164,21 @@ pub fn plan_task_demand(fp: &FrozenPlan, task_id: &str) -> Result<TaskDemand> {
                 continue;
             }
             let label = s.label();
-            let argv = match shard {
-                Some(ts) => shard_argv(ts)?,
-                None => shell_argv(plan::resolved_shell(w, job, s).as_deref())?,
-            };
+            if let Some(ts) = shard {
+                // the step runs where the tests were listed
+                if plan::step_dir(w, job, s) != ts.dir {
+                    bail!(
+                        "task {}: the working directory of step {n} is not {:?}, where its tests were listed",
+                        task.id,
+                        ts.dir
+                    );
+                }
+                // the shard's command must be one the step can run
+                crate::exec::shard_script(ts, std::path::Path::new(""))
+                    .map_err(|e| anyhow!("task {}: {e}", task.id))?;
+            }
+            let argv = shell_argv(plan::resolved_shell(w, job, s).as_deref())?;
+            let cwd = workspace_dir("the working directory", &plan::step_dir(w, job, s))?;
             let dynamic_label = label.contains("${{");
             let step_id = format!("{id}#{n}");
             nodes.push(DemandNode {
@@ -201,7 +190,7 @@ pub fn plan_task_demand(fp: &FrozenPlan, task_id: &str) -> Result<TaskDemand> {
                 step_id,
                 job: id.clone(),
                 step: n,
-                cwd: plan::step_dir(w, job, s),
+                cwd,
                 argv,
                 key: (!dynamic_label)
                     .then(|| history_key(&fp.config.default_workflows_dir, &w.file, id, &label)),
@@ -235,23 +224,4 @@ pub fn plan_task_demand(fp: &FrozenPlan, task_id: &str) -> Result<TaskDemand> {
         task_id: task.id.clone(),
         nodes,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shard::Invocation;
-
-    #[test]
-    fn variables_of_an_invocation_come_first_behind_env() {
-        let inv = |env: Vec<(&str, &str)>| Invocation {
-            argv: vec!["cargo".into(), "test".into()],
-            env: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-        };
-        assert_eq!(words_of(inv(vec![])), ["cargo", "test"]);
-        assert_eq!(
-            words_of(inv(vec![("A", "1 2"), ("B", "")])),
-            ["env", "A=1 2", "B=", "cargo", "test"]
-        );
-    }
 }

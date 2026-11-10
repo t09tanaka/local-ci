@@ -17,6 +17,8 @@ use crate::workflow::{Job, Service, Step, Trigger, Workflow};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as Y;
 
+pub use crate::digest::Digested;
+
 /// A matrix (or any part of one) as data with a fixed order.
 ///
 /// Mapping keys are strings. A key that is not a string in the YAML is written
@@ -422,27 +424,6 @@ pub fn check_version(what: &str, version: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A type that crosses the wire and has a digest: the SHA-256 of its canonical
-/// JSON (keys sorted at every level), `sha256:<hex>`. The digest is not a
-/// field of the type: the sender puts it next to the document, and the reader
-/// checks it with [`Digested::verify_digest`], so the document cannot hold a
-/// digest that is out of date.
-pub trait Digested: Serialize {
-    fn digest(&self) -> anyhow::Result<String> {
-        let v = serde_json::to_value(self)?;
-        Ok(crate::frozen::sha256_of(&crate::frozen::canonical_json(&v)))
-    }
-
-    /// Fail unless the digest of `self` is `expected`.
-    fn verify_digest(&self, expected: &str) -> anyhow::Result<()> {
-        let got = self.digest()?;
-        if got != expected {
-            anyhow::bail!("digest {expected} does not match the content ({got})");
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,10 +435,13 @@ mod tests {
         )
         .unwrap();
         let m = MatrixValue::from_yaml(&y);
-        let MatrixValue::Map(entries) = &m else {
-            panic!()
-        };
-        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        let v = serde_json::to_value(&m).unwrap();
+        let keys: Vec<&str> = v["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e[0].as_str().unwrap())
+            .collect();
         assert_eq!(keys, ["os", "1.5", "null", "true", "10", "include"]);
         // spec -> engine value -> spec is the identity
         assert_eq!(MatrixValue::from_yaml(&m.to_yaml()), m);
@@ -470,22 +454,87 @@ mod tests {
         assert_eq!(j["include"][0]["n"], serde_json::json!(1000.0));
     }
 
-    #[derive(Serialize)]
-    struct Doc {
-        b: u32,
-        a: Vec<u32>,
+    #[test]
+    fn null_tagged_and_composite_yaml_values_and_keys_are_kept() {
+        let y: Y = serde_yaml::from_str("a: null\nb: !t x\n!k c: d\n? [x, y]\n: v\n").unwrap();
+        let m = MatrixValue::from_yaml(&y);
+        let v = serde_json::to_value(&m).unwrap()["value"].clone();
+        assert_eq!(v[0], serde_json::json!(["a", {"type": "null"}]));
+        assert_eq!(
+            v[1],
+            serde_json::json!(["b", {"type": "string", "value": "x"}])
+        );
+        assert_eq!(v[2][0], "c");
+        assert_eq!(v[3][0], "- x\n- y");
+        assert_eq!(MatrixValue::Null.to_yaml(), Y::Null);
+        assert_eq!(MatrixValue::Null.to_json(), serde_json::Value::Null);
+        // a number that is not one is a string again
+        let n = MatrixValue::Number("x".into());
+        assert_eq!(n.to_yaml(), Y::String("x".into()));
+        assert_eq!(n.to_json(), serde_json::json!("x"));
     }
-    impl Digested for Doc {}
 
     #[test]
-    fn a_digest_is_of_the_canonical_form_and_checked() {
-        let d = Doc { b: 1, a: vec![2] };
-        let want = crate::frozen::sha256_of("{\"a\":[2],\"b\":1}");
-        assert_eq!(d.digest().unwrap(), want);
-        d.verify_digest(&want).unwrap();
-        let other = Doc { b: 2, a: vec![2] };
-        let e = other.verify_digest(&want).unwrap_err().to_string();
-        assert!(e.contains("does not match the content"), "{e}");
+    fn a_duplicate_key_is_found_below_a_sequence_too() {
+        let dup = MatrixValue::Map(vec![
+            ("a".into(), MatrixValue::Null),
+            ("a".into(), MatrixValue::Null),
+        ]);
+        assert_eq!(dup.duplicate_key().as_deref(), Some("a"));
+        assert_eq!(
+            MatrixValue::Seq(vec![MatrixValue::Null, dup])
+                .duplicate_key()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            MatrixValue::Seq(vec![MatrixValue::Null]).duplicate_key(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_push_workflow_keeps_the_filter_of_its_push_trigger() {
+        let wf = |event: &str| Selected {
+            wf: Workflow {
+                file: "f.yml".into(),
+                name: "n".into(),
+                triggers: vec![
+                    Trigger {
+                        event: "pull_request".into(),
+                        paths: vec!["pr/**".into()],
+                        ..Trigger::default()
+                    },
+                    Trigger {
+                        event: "push".into(),
+                        paths: vec!["push/**".into()],
+                        paths_ignore: vec!["push/skip/**".into()],
+                        ..Trigger::default()
+                    },
+                ],
+                env: vec![],
+                working_directory: None,
+                shell: None,
+                jobs: vec![],
+            },
+            event: event.into(),
+        };
+        for (event, paths, back) in [
+            ("push", "push/**", "push"),
+            ("pull_request", "pr/**", "pull_request"),
+        ] {
+            let spec = WorkflowSpec::from_selected(&wf(event));
+            assert_eq!(spec.path_filter.as_ref().unwrap().paths, [paths]);
+            let sel = spec.to_selected();
+            assert_eq!(sel.wf.triggers[0].event, back);
+            assert_eq!(sel.wf.triggers[0].paths, [paths]);
+            let ignore: &[&str] = if event == "push" {
+                &["push/skip/**"]
+            } else {
+                &[]
+            };
+            assert_eq!(sel.wf.triggers[0].paths_ignore, ignore);
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod config;
 pub mod context;
 pub mod dag;
 pub mod demand;
+mod digest;
 pub mod exec;
 pub mod expr;
 pub mod filter;

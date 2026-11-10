@@ -118,8 +118,16 @@ pub struct SetupRecipe {
     pub toolchain: Vec<ToolchainRequirement>,
 }
 
-impl crate::wire::Digested for SetupRecipe {}
-impl crate::wire::Digested for PreparedReceipt {}
+impl crate::wire::Digested for SetupRecipe {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for PreparedReceipt {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
 
 impl Default for SetupRecipe {
     fn default() -> Self {

@@ -1813,6 +1813,23 @@ fn finish(
         &[],
         None,
     )?;
+    // The index tree is kept by a ref of its own too (a commit around it), so
+    // that a prune of the store does not take what was staged and an export
+    // can carry it.
+    if let Some(tree) = &m.index_tree {
+        let ic = index_commit(ctx, git_dir, tree)?;
+        pg(
+            ctx,
+            git_dir,
+            &[
+                "update-ref",
+                &format!("refs/local-ci/index/{}", m.source_id),
+                &ic,
+            ],
+            &[],
+            None,
+        )?;
+    }
     let secrets = if bundle_files.is_empty() {
         None
     } else {

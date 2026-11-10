@@ -434,7 +434,7 @@ cargo test --features browser-tests   # without the feature, the tests that star
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
 `src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`,
-`src/shard/coverage.rs`, `src/shard/isolation.rs`, `src/demand.rs`) are gated on 100% line coverage over the whole test suite.
+`src/shard/coverage.rs`, `src/shard/isolation.rs`, `src/demand.rs`, `src/result_wire.rs`) are gated on 100% line coverage over the whole test suite (`src/wire.rs` and `src/digest.rs` are held to the mutation gate only: the line counts of their generic and per-crate code are not stable enough for a 100% line gate).
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 
@@ -453,7 +453,10 @@ cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan -
 cargo schemata --file src/artifact.rs -- --lib artifact
 cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
 cargo schemata --file src/demand.rs -- --lib --test task_demand
+cargo schemata --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
 ```
+
+The wire gate leaves out the mutant `wire_version -> 1` (`-E`): the version is 1, so it changes nothing.
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is
 inside the repository. Tests that need "not a git repository" therefore set

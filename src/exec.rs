@@ -281,7 +281,7 @@ struct ShardHold {
 
 /// The script of the step that runs the tests of the shard `ts`: its command,
 /// built where the tests are (`root` is the working directory of the step).
-fn shard_script(ts: &dag::TaskShard, root: &Path) -> Result<String, String> {
+pub(crate) fn shard_script(ts: &dag::TaskShard, root: &Path) -> Result<String, String> {
     use crate::shard::{adapters, Shard};
     let adapter = adapters::from_info(&ts.runner, &root.to_string_lossy())
         .ok_or_else(|| format!("no adapter for runner `{}`", ts.runner.runner))?;

@@ -317,6 +317,7 @@ impl FrozenPlan {
         for t in &self.tasks {
             crate::wire::check_version(&format!("plan task {}", t.id), t.schema_version)?;
         }
+        self.verify_shard_dirs()?;
         let want = sha256_of(&canonical_json(&serde_json::to_value(&self.config)?));
         if want != self.config_digest {
             bail!("plan config digest does not match its config");
@@ -330,6 +331,33 @@ impl FrozenPlan {
                 "plan digest {} does not match its content ({want})",
                 self.digest
             );
+        }
+        Ok(())
+    }
+
+    /// A shard task's working directory is a directory below the workspace,
+    /// and the one its step runs in (a plan from elsewhere is not believed to
+    /// send a command out of the workspace).
+    fn verify_shard_dirs(&self) -> Result<()> {
+        let plan = self.to_plan();
+        for t in &self.tasks {
+            let Some(ts) = &t.shard else { continue };
+            crate::demand::workspace_dir(
+                &format!("task {}: the shard's directory", t.id),
+                &ts.dir,
+            )?;
+            let step_dir = t.jobs.first().and_then(|j| {
+                let w = &plan.selected.iter().find(|s| s.wf.file == t.workflow)?.wf;
+                let job = w.jobs.iter().find(|x| &x.id == j)?;
+                Some(crate::plan::step_dir(w, job, job.steps.get(ts.step)?))
+            });
+            if step_dir.is_some_and(|d| d != ts.dir) {
+                bail!(
+                    "task {}: the shard's directory {:?} is not where its step runs",
+                    t.id,
+                    ts.dir
+                );
+            }
         }
         Ok(())
     }
