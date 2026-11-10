@@ -338,6 +338,49 @@ into a prefix of the run, so neither changes your machine.
   other worktree has. The workflow's own `env` still wins. The block is given
   back when the copy is removed. `--no-portool` turns this off.
 
+## Splitting a test job into shards (library)
+
+`local_ci::shard` divides the tests of one job among shards that run side by
+side; nothing is split unless the caller asks (`FrozenPlan::with_shards`), and
+the CLI never does. A runner adapter lists the tests, names each shard's tests in
+a command and reads what a shard reported: `cargo test`, Vitest and Jest (by
+file or test name), Playwright (by file, or by test where the suite is fully parallel)
+and Cypress (by spec file). The shards must cover the listed tests exactly once, each shard may report
+only what it was given, a report that cannot be read or holds no test is a
+problem, and a job that cannot be split safely stays one job with the reasons
+(`NotSplit`).
+
+A job is not split when:
+
+- its own command has a name filter, tag, skip or an argument that is not known to
+  leave the tests alone, when a test path is part of another, or when its step is
+  not one plain command in the directory the tests were listed in (`continue-on-error`
+  included);
+- it collects coverage (`--coverage`, `--cov`, `nyc`, `COVERAGE=1`, a coverage setting in the Vitest
+  or Jest configuration or `package.json`): `exec` does not collect the shards' reports.
+  `shard::coverage::merge` is a library function that nothing here calls; the caller that
+  collects the reports wires it. It puts together Istanbul `coverage-final.json` and LCOV
+  reports, only for the same code in every shard (Vitest's `v8` provider maps each shard's
+  files differently, so it stops at `Mismatch`); `cargo llvm-cov` profile data and other formats
+  are an `Unsupported` error;
+- it starts something the shards would share: job `services`, a container tool
+  (`docker`, `podman`, `kubectl`), a server or a port (`npm start`, `pnpm dev`, `next dev`,
+  `localhost:3000`, a `PORT` variable, a command sent to the background), a database tool
+  (`psql`, `prisma migrate`) or a service action. That is a list of words over what the workflow
+  says. The main defence is the type of the end-to-end adapters: they take an `Isolation`, which
+  is `None` until the caller declares (`Isolation::Declared { evidence }`) that each shard has its
+  own database, port and browser profile;
+- (Playwright) the configuration has a `webServer`, a global setup or teardown, `repeatEach` or a
+  `shard`; a project depends on another or has a teardown (the listing script compares `--list
+  --project P` with and without `--no-deps`, and reads the configuration file by text); or the
+  runner is older than 1.56 (no `--test-list`). Unless the suite is fully parallel, the tests of
+  a file are one unit, and so are those of a file that declares serial tests; read a shard's
+  report with `collect_given` so that each unit is reported once;
+- (Cypress) the configuration says which files are specs (`specPattern` and friends), or the
+  command has `--config-file` or `--project`: the adapter lists `cypress/e2e/**/*.cy.{js,jsx,ts,tsx}`
+  and does not evaluate the configuration. A shard runs Cypress through its module API in a small
+  script, which prints one JSON line with a result per spec file and exits non-zero when a test failed.
+
 ## Capturing a working directory (library)
 
 `source::capture_source` fixes the input of a run as the working directory is
@@ -383,12 +426,15 @@ most), and the locks.
 
 ```sh
 (cd examples/sharding/node && npm ci)   # the shard adapter tests run real Vitest and Jest
-cargo test
-./scripts/coverage-gate.sh   # 100% line coverage on the pure modules
+(cd examples/sharding/playwright && npm ci && npx playwright install chromium)   # and real Playwright
+(cd examples/sharding/cypress && npm ci && npx cypress install)   # and real Cypress (its test is ignored off Linux)
+cargo test --features browser-tests   # without the feature, the tests that start a browser are left out
+./scripts/coverage-gate.sh   # 100% line coverage on the pure modules (no browser tests)
 ```
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
-`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`) are gated on 100% line coverage over the whole test suite.
+`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`,
+`src/shard/coverage.rs`, `src/shard/isolation.rs`) are gated on 100% line coverage over the whole test suite.
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 

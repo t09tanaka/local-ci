@@ -1,0 +1,9 @@
+{
+  "name": "shard-example-cypress",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A small Cypress suite that local-ci's shard adapter runs against.",
+  "devDependencies": {
+    "cypress": "14.5.4"
+  }
+}

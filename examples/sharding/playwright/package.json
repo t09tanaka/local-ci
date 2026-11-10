@@ -1,0 +1,12 @@
+{
+  "name": "shard-example-playwright",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Small Playwright suites that local-ci's shard adapter runs against.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

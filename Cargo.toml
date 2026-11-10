@@ -19,6 +19,15 @@ path = "src/lib.rs"
 name = "local-ci"
 path = "src/main.rs"
 
+[features]
+# the tests that run Playwright (Chromium) and Cypress for real; the coverage
+# gate does not use them
+browser-tests = []
+
+[[test]]
+name = "shard_browsers"
+required-features = ["browser-tests"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

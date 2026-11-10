@@ -465,6 +465,16 @@ pub enum NotSplit {
     PathOverlap,
     /// The shard's command would be too long to start.
     ArgvTooLarge,
+    /// The job collects coverage; each shard would measure only its own tests
+    /// and nothing here puts the reports together.
+    CoverageNotMerged,
+    /// A Playwright project depends on another (or has a teardown), so a
+    /// shard that runs its tests also runs the other project's, in every
+    /// shard.
+    ProjectDependencies,
+    /// The runner is too old for a shard to name its tests (Playwright before
+    /// `--test-list`), or its version cannot be read.
+    RunnerTooOld,
 }
 
 /// A job (or the jobs of a task) that could become several shards, and the
@@ -936,6 +946,13 @@ fn connection_reason(
     let Some(run) = run else {
         return Some(NotSplit::NotConnectable);
     };
+    // a container, a server on a port or a service the shards would share
+    if crate::shard::isolation::reason_in(&w.env, job).is_some() {
+        return Some(NotSplit::NoIsolation);
+    }
+    if crate::shard::isolation::coverage_reason(&w.env, job).is_some() {
+        return Some(NotSplit::CoverageNotMerged);
+    }
     let Some(parsed) = crate::shard::adapters::parse_command(run) else {
         return Some(NotSplit::NotConnectable);
     };
