@@ -26,6 +26,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/sharding/node/package-lock.json
+
+      - name: Install the Node example (the shard adapter tests run Vitest and Jest)
+        run: npm ci
+        working-directory: examples/sharding/node
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -54,8 +64,17 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/sharding/node/package-lock.json
+
+      - name: Install the Node example (the shard adapter tests run Vitest and Jest)
+        run: npm ci
+        working-directory: examples/sharding/node
       - uses: Swatinem/rust-cache@v2
-      - name: 100% line coverage on matrix / filter / gate / dag / frozen / artifact
+      - name: 100% line coverage on matrix / filter / gate / dag / frozen / artifact / shard
         run: ./scripts/coverage-gate.sh
 
   # Each mutant reruns the tests, so a module is checked against the test
@@ -101,4 +120,18 @@ jobs:
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh src/frozen.rs
       - name: zero survivors in frozen
-        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan
+
+  mutants-shard:
+    name: mutation gate (shard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/shard.rs
+      - name: zero survivors in shard
+        run: cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan

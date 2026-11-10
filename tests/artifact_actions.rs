@@ -1486,6 +1486,7 @@ fn the_cli_and_the_library_agree_on_the_artifacts_a_task_must_publish() {
         outcomes: r.units.iter().flat_map(|u| u.outcomes.clone()).collect(),
         receipt_ignored: None,
         artifacts: mine,
+        shard: None,
     };
     lib.outcomes.retain(|o| o.job == "a");
     let why = local_ci::verify_task_result(a, &lib);

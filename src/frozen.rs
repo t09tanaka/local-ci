@@ -7,8 +7,9 @@
 //! sorted, no whitespace), so the same decisions always give the same digest,
 //! wherever the repository was cloned.
 
-use crate::dag::{self, ExecutionTask, JobGraph, ShardGroup};
+use crate::dag::{self, ExecutionTask, JobGraph, ShardGroup, ShardRequest};
 use crate::plan::Plan;
+use crate::shard::{Basis, Discovered, Shard, ShardPlan};
 use crate::wire::{JobSpec, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Bumped when the shape of a [`FrozenPlan`] changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// What the plan was made from: a [`crate::source::SourceManifest`] by its
 /// id, the commit the jobs run against, and the ref the changed files were
@@ -234,7 +235,15 @@ impl FrozenPlan {
     /// A workflow whose jobs cannot be run in an order (a cycle, a `needs` of a
     /// job that does not exist) is left out and listed in `skipped` with the
     /// reason, as GitHub does not start that workflow; the others are planned.
-    pub fn new(mut parts: PlanParts) -> Result<Self> {
+    pub fn new(parts: PlanParts) -> Result<Self> {
+        Self::new_with_shards(parts, &[])
+    }
+
+    /// Like [`FrozenPlan::new`], splitting the jobs `shards` ask to split into
+    /// one task per shard (those whose split is safe and whose shards hold the
+    /// listed tests exactly once; the others stay one task with the reasons in
+    /// their shard group).
+    pub fn new_with_shards(mut parts: PlanParts, shards: &[ShardRequest]) -> Result<Self> {
         let config_digest = sha256_of(&canonical_json(&serde_json::to_value(&parts.config)?));
         let specs = |plan: &Plan| {
             (
@@ -255,7 +264,7 @@ impl FrozenPlan {
             (workflows, units) = specs(&parts.plan);
         }
         let graph = dag::build_graph(&workflows, &units)?;
-        let (tasks, shard_groups) = dag::derive_tasks(&parts.plan, &workflows, &units);
+        let (tasks, shard_groups) = dag::derive_tasks(&parts.plan, &workflows, &units, shards);
         let unrunnable = std::mem::take(&mut parts.plan.unrunnable);
         let mut fp = FrozenPlan {
             schema_version: SCHEMA_VERSION,
@@ -360,7 +369,24 @@ impl FrozenPlan {
     /// This plan with `plan` as its workflows and units (for running a
     /// part of it), sealed again under a new digest.
     pub fn with_plan(&self, plan: Plan) -> Result<Self> {
-        FrozenPlan::new(PlanParts {
+        FrozenPlan::new_with_shards(
+            PlanParts {
+                repository: self.repository.clone(),
+                source: self.source.clone(),
+                branch: self.branch.clone(),
+                changed_files: self.changed_files.clone(),
+                config: self.config.clone(),
+                filters: self.filters.clone(),
+                disabled: self.disabled.clone(),
+                plan,
+            },
+            &self.shard_requests(),
+        )
+    }
+
+    /// This plan with `shards` split, sealed again.
+    pub fn with_shards(&self, shards: &[ShardRequest]) -> Result<Self> {
+        let parts = PlanParts {
             repository: self.repository.clone(),
             source: self.source.clone(),
             branch: self.branch.clone(),
@@ -368,8 +394,48 @@ impl FrozenPlan {
             config: self.config.clone(),
             filters: self.filters.clone(),
             disabled: self.disabled.clone(),
-            plan,
-        })
+            plan: self.to_plan(),
+        };
+        FrozenPlan::new_with_shards(parts, shards)
+    }
+
+    /// The splits the plan holds, as the requests that made them.
+    pub fn shard_requests(&self) -> Vec<ShardRequest> {
+        self.shard_groups
+            .iter()
+            .filter(|g| g.split)
+            .filter_map(|g| {
+                let first = self.task(g.shards.first()?)?;
+                let ts = first.shard.as_ref()?;
+                Some(ShardRequest {
+                    workflow: g.workflow.clone(),
+                    job: g.source_jobs.first()?.clone(),
+                    plan: ShardPlan {
+                        runner: g.runner.clone().unwrap_or_default(),
+                        mode: ts.mode,
+                        basis: Basis::Fallback,
+                        shards: g
+                            .shards
+                            .iter()
+                            .filter_map(|id| self.task(id)?.shard.as_ref())
+                            .map(|s| Shard {
+                                index: s.index,
+                                tests: s.tests.clone(),
+                                load: 0,
+                            })
+                            .collect(),
+                        not_split: vec![],
+                    },
+                    step: ts.step,
+                    dir: ts.dir.clone(),
+                    discovered: Discovered {
+                        tests: g.manifest.clone(),
+                        complete: g.manifest_exact,
+                    },
+                    fail_fast: g.fail_fast,
+                })
+            })
+            .collect()
     }
 
     /// This plan naming `source_id` as its input, sealed again. For a run of

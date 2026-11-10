@@ -13,6 +13,7 @@
 use crate::artifact;
 use crate::expr::NeedsRef;
 use crate::plan::{self, Plan};
+use crate::shard::{Discovered, RunnerInfo, ShardPlan, SplitMode};
 use crate::wire::{JobSpec, MatrixValue, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,10 @@ pub enum OutputAggregation {
     /// wins. (GitHub takes the variant that finished last, which no one can
     /// plan for.)
     MatrixOrder,
+    /// The shards of a split test job: each test once, whatever the shard it
+    /// ran in; a test that was not reported, or twice, is a problem
+    /// ([`crate::complete::aggregate_shard_group`]).
+    TestIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -355,10 +360,66 @@ pub struct ExecutionTask {
     pub retry: RetryPolicy,
     pub verification: OutputVerification,
     pub grouped_reason: Option<GroupedReason>,
+    /// The part of a split job this task runs.
+    #[serde(default)]
+    pub shard: Option<TaskShard>,
+}
+
+/// Which part of a split job a task runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskShard {
+    /// The shard group (the id of the job's task before the split).
+    pub group: String,
+    pub index: usize,
+    pub count: usize,
+    pub mode: SplitMode,
+    /// The tests of this shard (empty for the runner's own shard feature).
+    pub tests: Vec<String>,
+    /// The runner and the arguments of the job's own command: what the shard's
+    /// command is built from when the task runs.
+    #[serde(default)]
+    pub runner: RunnerInfo,
+    /// The step of the job that runs the tests; the task runs the shard's
+    /// command in its place.
+    #[serde(default)]
+    pub step: usize,
+    /// The working directory (relative to the plan root, `""` for the root)
+    /// the runner's tests were listed in: the step runs the shard's command
+    /// there, so it must be the step's own directory.
+    #[serde(default)]
+    pub dir: String,
+}
+
+/// `<workflow file>::<job id>@<index>`: the task of one shard of a split job.
+pub fn shard_task_id(workflow: &str, job: &str, index: usize) -> String {
+    format!("{workflow}::{job}@{index}")
+}
+
+/// A request to split one job, made by the caller from a listing and a history
+/// (the plan cannot run a runner). Nothing is split without one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShardRequest {
+    /// The workflow file.
+    pub workflow: String,
+    pub job: String,
+    pub plan: ShardPlan,
+    /// The step (index in the job's `steps`) whose `run` is the command the
+    /// plan's runner was made from, with its working directory as the project
+    /// root. A shard's task runs its own command in place of that step.
+    pub step: usize,
+    /// The directory the runner listed its tests in, relative to the plan root
+    /// (`""` for the root). The step must run there: with another
+    /// `working-directory` the shards would run other tests than the ones
+    /// listed.
+    pub dir: String,
+    /// What the runner listed; the shards are checked against it.
+    pub discovered: Discovered,
+    /// A failed shard cancels the shards that have not finished.
+    pub fail_fast: bool,
 }
 
 /// Why a task is not split into shards of one test run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotSplit {
     /// No runner adapter can list and partition its tests yet.
@@ -369,22 +430,75 @@ pub enum NotSplit {
     HasServices,
     /// It runs one variant of a matrix; the matrix is the split.
     MatrixVariant,
+    /// A runner adapter knows the job and the split was not asked for.
+    NotRequested,
+    /// The runner cannot list its tests.
+    NoEnumeration,
+    /// The runner's listing failed.
+    DiscoveryFailed,
+    /// The listing is not all the tests (they are generated at run time) and
+    /// the runner has no shard feature of its own.
+    IncompleteDiscovery,
+    /// A run cannot be told which tests to run.
+    NoShardTarget,
+    /// The shards would update state they share.
+    SharedState,
+    /// A database, port or container cannot be given to each shard.
+    NoIsolation,
+    /// The shards' results do not merge to the verdict of the whole job.
+    InexactAggregation,
+    /// Too few tests, or too little time, for a second shard to pay.
+    TooSmall,
+    /// The shards do not hold the listed tests exactly once.
+    ManifestMismatch,
+    /// The job's own command has a name filter, a skip or a tag: the shards
+    /// would run the tests of the whole job.
+    JobFilter,
+    /// The job's own command has an argument (or shell syntax) that is not
+    /// known to leave the set of tests alone.
+    UnreadableArgs,
+    /// The step the shard's command would replace is not one plain command of
+    /// the runner the plan was made for.
+    NotConnectable,
+    /// A test file's path is part of another's: a path given as a filter
+    /// would run both.
+    PathOverlap,
+    /// The shard's command would be too long to start.
+    ArgvTooLarge,
 }
 
 /// A job (or the jobs of a task) that could become several shards, and the
-/// reasons it did not. Only the type and the reasons exist so far; nothing
-/// splits a task.
+/// reasons it did not. A task is split only on a [`ShardRequest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardGroup {
     pub id: String,
     pub workflow: String,
     pub source_jobs: Vec<String>,
-    /// The tasks the source is run as (one, while nothing is split).
+    /// The tasks the source is run as (one, when nothing is split).
     pub shards: Vec<String>,
     pub split: bool,
     pub not_split: Vec<NotSplit>,
-    /// How shard results would be merged (none until a split exists).
+    /// How shard results are merged (none when not split).
     pub aggregation: Option<OutputAggregation>,
+    /// The runner of a split job.
+    #[serde(default)]
+    pub runner: Option<RunnerInfo>,
+    /// The tests the shards hold together, once each (empty when the runner's
+    /// own shard feature divides them).
+    #[serde(default)]
+    pub manifest: Vec<String>,
+    /// A failed shard cancels the others.
+    #[serde(default)]
+    pub fail_fast: bool,
+    /// The tests of each shard, in the order of `shards` (empty for a native
+    /// split).
+    #[serde(default)]
+    pub assignments: Vec<Vec<String>>,
+    /// `manifest` is all the tests there are. `false` for a native split whose
+    /// listing may be partial: every listed test must be reported, others may
+    /// be.
+    #[serde(default)]
+    pub manifest_exact: bool,
 }
 
 /// The outputs of other jobs that `job` reads, found by reading its
@@ -446,6 +560,7 @@ pub(crate) fn derive_tasks(
     plan: &Plan,
     specs: &[WorkflowSpec],
     units: &[UnitSpec],
+    requests: &[ShardRequest],
 ) -> (Vec<ExecutionTask>, Vec<ShardGroup>) {
     let mut tasks: Vec<ExecutionTask> = Vec::new();
     for (ui, u) in units.iter().enumerate() {
@@ -597,6 +712,7 @@ pub(crate) fn derive_tasks(
                         .collect(),
                 },
                 grouped_reason,
+                shard: None,
             };
             let external: BTreeSet<&str> = specs_of
                 .iter()
@@ -632,6 +748,37 @@ pub(crate) fn derive_tasks(
                 other => {
                     let dynamic = matches!(other, Some((_, MatrixPlan::Dynamic(_))));
                     let id = format!("{}::{}", wf.file, ids.join("+"));
+                    let split = other
+                        .as_ref()
+                        .filter(|(_, m)| matches!(m, MatrixPlan::None))
+                        .and_then(|(j, _)| request_for(requests, &wf.file, &j.id))
+                        .filter(|r| {
+                            structural_reasons(&base).is_empty()
+                                && manifest_ok(r)
+                                && connection_reason(r, w, ids.len()).is_none()
+                        });
+                    if let Some(r) = split.filter(|r| r.plan.is_split()) {
+                        let count = r.plan.shards.len();
+                        for s in &r.plan.shards {
+                            tasks.push(ExecutionTask {
+                                id: shard_task_id(&wf.file, &ids[0], s.index),
+                                nodes: ids.iter().map(|j| node_id(&wf.file, j)).collect(),
+                                needs_outputs: needs_outputs.clone(),
+                                shard: Some(TaskShard {
+                                    group: id.clone(),
+                                    index: s.index,
+                                    count,
+                                    mode: r.plan.mode,
+                                    tests: s.tests.clone(),
+                                    runner: r.plan.runner.clone(),
+                                    step: r.step,
+                                    dir: r.dir.clone(),
+                                }),
+                                ..base.clone()
+                            });
+                        }
+                        continue;
+                    }
                     tasks.push(ExecutionTask {
                         id,
                         nodes: ids.iter().map(|j| node_id(&wf.file, j)).collect(),
@@ -668,31 +815,157 @@ pub(crate) fn derive_tasks(
         }
         t.depends_on = deps.into_iter().collect();
     }
-    let shard_groups = tasks
-        .iter()
-        .map(|t| {
-            let mut not_split = vec![NotSplit::NoRunnerAdapter];
-            if t.workspace.shared_by_jobs {
-                not_split.push(NotSplit::SharedWorkspace);
+    let mut shard_groups = Vec::new();
+    for t in &tasks {
+        let request = |t: &ExecutionTask| {
+            (t.jobs.len() == 1)
+                .then(|| request_for(requests, &t.workflow, &t.jobs[0]))
+                .flatten()
+        };
+        if let Some(s) = &t.shard {
+            if s.index == 0 {
+                let r = request(t).expect("a shard comes from a request");
+                shard_groups.push(ShardGroup {
+                    id: s.group.clone(),
+                    workflow: t.workflow.clone(),
+                    source_jobs: t.jobs.clone(),
+                    shards: tasks
+                        .iter()
+                        .filter(|o| o.shard.as_ref().is_some_and(|x| x.group == s.group))
+                        .map(|o| o.id.clone())
+                        .collect(),
+                    split: true,
+                    not_split: vec![],
+                    aggregation: Some(OutputAggregation::TestIdentity),
+                    runner: Some(r.plan.runner.clone()),
+                    manifest: manifest_of(r),
+                    fail_fast: r.fail_fast,
+                    assignments: r.plan.shards.iter().map(|s| s.tests.clone()).collect(),
+                    manifest_exact: r.plan.mode != SplitMode::Native || r.discovered.complete,
+                });
             }
-            if !t.services.is_empty() {
-                not_split.push(NotSplit::HasServices);
+            continue;
+        }
+        let mut not_split = structural_reasons(t);
+        let asked = request(t).filter(|_| t.variant.is_none());
+        match asked {
+            None => not_split.insert(0, NotSplit::NoRunnerAdapter),
+            Some(r) => {
+                if t.dynamic_matrix {
+                    not_split.push(NotSplit::MatrixVariant);
+                }
+                not_split.extend(r.plan.not_split.iter().cloned());
+                if !manifest_ok(r) {
+                    not_split.push(NotSplit::ManifestMismatch);
+                }
+                let sel = plan.selected.iter().find(|x| x.wf.file == t.workflow);
+                if let Some(why) = sel.and_then(|x| connection_reason(r, &x.wf, t.jobs.len())) {
+                    not_split.push(why);
+                }
             }
-            if t.variant.is_some() {
-                not_split.push(NotSplit::MatrixVariant);
-            }
-            ShardGroup {
-                id: t.id.clone(),
-                workflow: t.workflow.clone(),
-                source_jobs: t.jobs.clone(),
-                shards: vec![t.id.clone()],
-                split: false,
-                not_split,
-                aggregation: None,
-            }
-        })
-        .collect();
+        }
+        shard_groups.push(ShardGroup {
+            id: t.id.clone(),
+            workflow: t.workflow.clone(),
+            source_jobs: t.jobs.clone(),
+            shards: vec![t.id.clone()],
+            split: false,
+            not_split,
+            aggregation: None,
+            runner: asked.map(|r| r.plan.runner.clone()),
+            manifest: vec![],
+            fail_fast: false,
+            assignments: vec![],
+            manifest_exact: false,
+        });
+    }
     (tasks, shard_groups)
+}
+
+fn request_for<'a>(
+    requests: &'a [ShardRequest],
+    workflow: &str,
+    job: &str,
+) -> Option<&'a ShardRequest> {
+    requests
+        .iter()
+        .find(|r| r.workflow == workflow && r.job == job)
+}
+
+/// What about the task itself keeps it from being split.
+fn structural_reasons(t: &ExecutionTask) -> Vec<NotSplit> {
+    let mut out = Vec::new();
+    if t.workspace.shared_by_jobs {
+        out.push(NotSplit::SharedWorkspace);
+    }
+    if !t.services.is_empty() {
+        out.push(NotSplit::HasServices);
+    }
+    if t.variant.is_some() {
+        out.push(NotSplit::MatrixVariant);
+    }
+    out
+}
+
+/// Why the step a request names cannot be replaced by a shard's command: it is
+/// not one plain command of the runner the plan was made for, or it would run
+/// under a shell that does not read one.
+fn connection_reason(
+    r: &ShardRequest,
+    w: &crate::workflow::Workflow,
+    jobs_in_task: usize,
+) -> Option<NotSplit> {
+    let job = w.jobs.iter().find(|j| j.id == r.job);
+    let step = job
+        .and_then(|j| j.steps.get(r.step))
+        .filter(|_| jobs_in_task == 1);
+    let (Some(job), Some(step)) = (job, step) else {
+        return Some(NotSplit::NotConnectable);
+    };
+    // one plain command, run by a shell that reads it as one; a step that may
+    // fail without failing the job would hide a failed shard
+    let run = step.run.as_ref().filter(|_| {
+        step.uses.is_none()
+            && !step.continue_on_error
+            && plan::step_dir(w, job, step) == r.dir
+            && matches!(
+                plan::resolved_shell(w, job, step).as_deref().map(str::trim),
+                None | Some("bash") | Some("sh")
+            )
+    });
+    let Some(run) = run else {
+        return Some(NotSplit::NotConnectable);
+    };
+    let Some(parsed) = crate::shard::adapters::parse_command(run) else {
+        return Some(NotSplit::NotConnectable);
+    };
+    if let Some(why) = parsed.blocked.first() {
+        return Some(why.clone());
+    }
+    (parsed.runner != r.plan.runner.runner || parsed.args != r.plan.runner.config)
+        .then_some(NotSplit::NotConnectable)
+}
+
+/// The shards of the request hold the tests it lists, each once.
+fn manifest_ok(r: &ShardRequest) -> bool {
+    r.plan.verify(&r.discovered).is_ok()
+}
+
+fn manifest_of(r: &ShardRequest) -> Vec<String> {
+    r.plan
+        .shards
+        .iter()
+        .flat_map(|s| s.tests.iter())
+        .chain(
+            r.discovered
+                .tests
+                .iter()
+                .filter(|_| r.plan.mode == SplitMode::Native),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// The groups in an order where each comes after the groups it needs, the

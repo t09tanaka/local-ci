@@ -23,6 +23,7 @@ pub mod report;
 mod run;
 mod script;
 pub mod setup;
+pub mod shard;
 pub mod source;
 pub mod step_executor;
 pub mod task;
