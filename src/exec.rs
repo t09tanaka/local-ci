@@ -256,6 +256,24 @@ pub struct Runner<'a> {
     refused: HashMap<usize, String>,
 }
 
+/// The script of the step that runs the tests of the shard `ts`: its command,
+/// built where the tests are (`root` is the working directory of the step).
+fn shard_script(ts: &dag::TaskShard, root: &Path) -> Result<String, String> {
+    use crate::shard::{adapters, Shard};
+    let adapter = adapters::from_info(&ts.runner, &root.to_string_lossy())
+        .ok_or_else(|| format!("no adapter for runner `{}`", ts.runner.runner))?;
+    let inv = adapter.invoke(
+        &Shard {
+            index: ts.index,
+            tests: ts.tests.clone(),
+            load: 0,
+        },
+        ts.count,
+        ts.mode,
+    );
+    adapters::script_of(&inv).ok_or_else(|| "a test name cannot be put in a command".to_string())
+}
+
 /// The descriptor a script holding the token is read from, and how a shell is
 /// told to read it.
 const PIPE_FD: i32 = 3;
@@ -1690,6 +1708,7 @@ impl<'a> Runner<'a> {
                 .collect(),
             receipt_ignored: None,
             artifacts: vec![],
+            shard: None,
         })
     }
 
@@ -1881,6 +1900,14 @@ impl<'a> Runner<'a> {
         let mut inputs = TaskInputs::default();
         let mut jobs = Vec::new();
         let mut outcomes: Vec<JobOutcome> = Vec::new();
+        // the shards of each split job that ran so far: what they reported,
+        // how their jobs ended, and where the last one is in `jobs`
+        type Held = (
+            Vec<crate::shard::ShardOutcome>,
+            Vec<JobOutcome>,
+            Option<usize>,
+        );
+        let mut shards: HashMap<String, Held> = HashMap::new();
         // A copy of the setup workspace is another workspace: it gets an id of
         // its own, and the receipts of the setup are bound to it, as the copy
         // holds what the setup made.
@@ -1929,6 +1956,35 @@ impl<'a> Runner<'a> {
                 true,
             ) {
                 Ok(r) => {
+                    // A shard is not the job: the job is its shards together,
+                    // checked against the tests they were to run.
+                    if let (Some(ts), Some(so)) = (&task.shard, r.shard.clone()) {
+                        for o in &r.outcomes {
+                            inputs.run_cancelled |= o.status == JobStatus::Cancelled;
+                        }
+                        jobs.extend(r.jobs);
+                        let held = shards.entry(ts.group.clone()).or_default();
+                        held.0.push(so);
+                        held.1.extend(r.outcomes);
+                        held.2 = Some(jobs.len().saturating_sub(1));
+                        let group = self.fp.shard_groups.iter().find(|g| g.id == ts.group);
+                        if let Some(g) = group.filter(|g| g.shards.len() == held.0.len()) {
+                            let agg = crate::complete::aggregate_shard_group(g, &held.0);
+                            let mut o =
+                                combine(&g.source_jobs.join("+"), std::mem::take(&mut held.1));
+                            if !agg.ok() && o.status == JobStatus::Success {
+                                let why = agg.problems().join("; ");
+                                o.status = JobStatus::Failure;
+                                o.skipped = Some(why.clone());
+                                if let Some(last) = held.2.and_then(|i| jobs.get_mut(i)) {
+                                    last.outcome = Outcome::Error(why);
+                                }
+                            }
+                            outcomes.push(o.clone());
+                            inputs.needs.insert(o.job.clone(), o);
+                        }
+                        continue;
+                    }
                     for o in r.outcomes {
                         inputs.run_cancelled |= o.status == JobStatus::Cancelled;
                         outcomes.push(o.clone());
@@ -2025,6 +2081,28 @@ impl<'a> Runner<'a> {
             .with_context(|| format!("the plan has no workflow {}", task.workflow))?;
         let sel = &self.plan.selected[wi];
         let w = &sel.wf;
+        // A shard's task runs its own command in place of one step. When that
+        // cannot be done, the task is not run at all: running the job as it is
+        // would run every test once per shard, and its result would stand for
+        // the whole job.
+        if let Some(ts) = &task.shard {
+            let step = (task.jobs.len() == 1)
+                .then(|| self.plan.job(wi, &task.jobs[0]).steps.get(ts.step))
+                .flatten()
+                .filter(|s| s.run.is_some() && s.uses.is_none());
+            if step.is_none()
+                || ts.mode == crate::shard::SplitMode::Single
+                || (ts.mode == crate::shard::SplitMode::Listed && ts.tests.is_empty())
+                || crate::shard::adapters::from_info(&ts.runner, "").is_none()
+            {
+                bail!(
+                    "task {} is a shard of a split job, but step {} of its job is not a command of runner `{}` that can be given the shard's tests",
+                    task.id,
+                    ts.step,
+                    ts.runner.runner
+                );
+            }
+        }
         for id in &task.jobs {
             let job = self.plan.job(wi, id);
             if let Some(n) = job
@@ -2068,6 +2146,7 @@ impl<'a> Runner<'a> {
         let mut needs_ctx = inputs.context();
         let mut jobs = Vec::new();
         let mut outcomes = Vec::new();
+        let mut shard = None;
         for id in &task.jobs {
             let job = self.plan.job(wi, id);
             // `failure()` of a job: a job it needs, or one of theirs, failed
@@ -2089,6 +2168,7 @@ impl<'a> Runner<'a> {
                 places.get(id).unwrap_or(&none),
                 locked,
                 only,
+                task.shard.as_ref(),
             );
             let parts: Vec<JobOutcome> = results
                 .iter()
@@ -2111,11 +2191,16 @@ impl<'a> Runner<'a> {
                 ..outcome
             };
             needs_ctx.insert(id.clone(), task::ctx_of(&outcome));
-            jobs.extend(results.into_iter().map(|r| r.0));
+            let results: Vec<JobResult> = results.into_iter().map(|r| r.0).collect();
+            if let Some(ts) = &task.shard {
+                shard = Some(self.shard_outcome(ws, w, job, task, ts, results.first()));
+            }
+            jobs.extend(results);
             outcomes.push(outcome);
         }
         Ok(TaskResult {
             task: task.id.clone(),
+            shard,
             jobs,
             outcomes,
             receipt_ignored,
@@ -2129,6 +2214,52 @@ impl<'a> Runner<'a> {
                     .collect::<Vec<_>>(),
             ),
         })
+    }
+
+    /// What the shard `ts` of `task` reported, from the log of the step that
+    /// ran its tests. A step that did not run (the job's condition, an earlier
+    /// step that failed) reported nothing, and the outcome says it failed.
+    fn shard_outcome(
+        &self,
+        ws: &Path,
+        w: &Workflow,
+        job: &Job,
+        task: &ExecutionTask,
+        ts: &dag::TaskShard,
+        result: Option<&JobResult>,
+    ) -> crate::shard::ShardOutcome {
+        use crate::shard::{adapters, CommandOutput, ShardOutcome};
+        let none = |exit_ok| ShardOutcome {
+            job_id: job.id.clone(),
+            shard_id: task.id.clone(),
+            tests: vec![],
+            exit_ok,
+            parsed: false,
+        };
+        let Some(step) = job.steps.get(ts.step) else {
+            return none(false);
+        };
+        let root = ws.join(plan::step_dir(w, job, step));
+        let ran = result.and_then(|r| r.steps.get(ts.step));
+        let (Some(ran), Some(adapter)) = (
+            ran,
+            adapters::from_info(&ts.runner, &root.to_string_lossy()),
+        ) else {
+            return none(false);
+        };
+        let log = ran
+            .log
+            .as_ref()
+            .and_then(|l| fs::read(l).ok())
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        let out = CommandOutput {
+            stdout: log.clone().unwrap_or_default(),
+            stderr: String::new(),
+            success: ran.outcome == Outcome::Pass && ran.exit == Some(0),
+        };
+        let mut o = adapter.collect(&job.id, &task.id, &out);
+        o.parsed &= log.is_some();
+        o
     }
 
     /// One job, all its matrix combinations. Returns each combination's result and outputs.
@@ -2150,6 +2281,8 @@ impl<'a> Runner<'a> {
         locked: bool,
         // run only this entry of the matrix
         only: Option<usize>,
+        // the part of a split job this runs: its step runs the shard's command
+        shard: Option<&dag::TaskShard>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
         let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
@@ -2281,6 +2414,10 @@ impl<'a> Runner<'a> {
                     None => job.id.clone(),
                 }
             };
+            // each shard of a job has a name (and so a log) of its own
+            if let Some(t) = shard {
+                display = format!("{display} (shard {}/{})", t.index + 1, t.count);
+            }
             // a name over some of the matrix only: keep the entries (and their logs) apart
             if !seen.insert(display.clone()) {
                 display = format!("{display} #{}", idx + 1);
@@ -2334,7 +2471,7 @@ impl<'a> Runner<'a> {
             if stop.is_some_and(|s| s.load(Ordering::SeqCst)) {
                 return skip(display, "fail-fast".into());
             }
-            let mut r = self.run_combo(ws, w, job, prepared, cm, display, stop);
+            let mut r = self.run_combo(ws, w, job, prepared, cm, display, stop, shard);
             drop(slot);
             drop(lock);
             let secs = r.0.secs;
@@ -2430,6 +2567,8 @@ impl<'a> Runner<'a> {
         display: String,
         // set when another entry of a fail-fast matrix failed
         stop: Option<&AtomicBool>,
+        // the part of a split job this runs: its step runs the shard's command
+        shard: Option<&dag::TaskShard>,
     ) -> (JobResult, Map<String, Value>) {
         let t0 = Instant::now();
         let mut stopped = false;
@@ -2780,6 +2919,19 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let wd = plan::step_dir(w, job, s);
+            // the step that runs the tests of a shard runs the shard's command
+            // (after the expressions of the step were read: a name is not one)
+            let script = match shard.filter(|t| t.step == n) {
+                Some(ts) => match shard_script(ts, &ws.join(&wd)) {
+                    Ok(sc) => sc,
+                    Err(e) => {
+                        push(&mut steps, Outcome::Error(e.clone()), None, None, None);
+                        errored.get_or_insert(format!("{label}: {e}"));
+                        continue;
+                    }
+                },
+                None => script,
+            };
             let files_dir = self
                 .tools
                 .join(format!("files/{}", self.seq.fetch_add(1, Ordering::SeqCst)));
@@ -4028,6 +4180,7 @@ mod tests {
             }],
             receipt_ignored: Some("another commit".into()),
             artifacts: vec!["bundle".into()],
+            shard: None,
         };
         let text = serde_json::to_string(&r).unwrap();
         let back: crate::task::TaskResult = serde_json::from_str(&text).unwrap();

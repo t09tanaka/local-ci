@@ -9,7 +9,7 @@
 
 use crate::dag::{self, ExecutionTask, JobGraph, ShardGroup, ShardRequest};
 use crate::plan::Plan;
-use crate::shard::{Basis, Discovered, Shard, ShardPlan, SplitMode};
+use crate::shard::{Basis, Discovered, Shard, ShardPlan};
 use crate::wire::{JobSpec, UnitSpec, WorkflowSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -426,9 +426,10 @@ impl FrozenPlan {
                             .collect(),
                         not_split: vec![],
                     },
+                    step: ts.step,
                     discovered: Discovered {
                         tests: g.manifest.clone(),
-                        complete: ts.mode != SplitMode::Native,
+                        complete: g.manifest_exact,
                     },
                     fail_fast: g.fail_fast,
                 })

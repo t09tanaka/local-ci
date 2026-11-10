@@ -59,6 +59,10 @@ const JOBS: &str = "  test:
         n: [1, 2]
     steps:
       - run: cargo test
+  vt:
+    runs-on: x
+    steps:
+      - run: npx vitest run
   dynmx:
     runs-on: x
     strategy:
@@ -119,6 +123,7 @@ fn request(job: &str, plan: ShardPlan, d: Discovered) -> ShardRequest {
         workflow: F.into(),
         job: job.into(),
         plan,
+        step: 0,
         discovered: d,
         fail_fast: true,
     }
@@ -212,9 +217,9 @@ fn a_native_split_lists_no_tests() {
     let a = local_ci::shard::adapters::Vitest::new("2", "/p", &[], Safety::default());
     let p = partition_tests(&a, &d, &History::default(), 3, &PartitionOpts::default());
     assert_eq!(p.mode, SplitMode::Native);
-    let sp = fp.with_shards(&[request("test", p, d)]).unwrap();
+    let sp = fp.with_shards(&[request("vt", p, d)]).unwrap();
     sp.verify().unwrap();
-    let g = group(&sp, "test");
+    let g = group(&sp, "vt");
     assert!(g.split && g.manifest.is_empty());
     assert_eq!(g.shards.len(), 3);
     assert_eq!(sp.with_plan(sp.to_plan()).unwrap(), sp);
@@ -307,6 +312,7 @@ fn outcome(job: &str, shard: &str, ok: bool, tests: &[(&str, TestStatus)]) -> Sh
             })
             .collect(),
         exit_ok: ok,
+        parsed: true,
     }
 }
 
@@ -385,5 +391,11 @@ fn shard_results_are_put_together_by_job_shard_and_test() {
 fn the_adapter_merge_is_the_same_check() {
     let a = CargoTest::new("1", &[], Safety::default());
     let m = a.merge(Some(&["x".to_string()]), &[outcome("j", "s", true, &[])]);
-    assert_eq!(m.problems, vec!["`x` was not reported"]);
+    assert_eq!(
+        m.problems,
+        vec![
+            "`x` was not reported",
+            "shard s of j succeeded but reported no test"
+        ]
+    );
 }

@@ -6,15 +6,24 @@
 //!
 //! Test identities: `cargo test` lists tests by libtest name (a name that two
 //! test targets share makes the listing incomplete, since a name filter cannot
-//! tell them apart, and so does a doctest, which cannot be run by name);
+//! tell them apart, and so does a doctest, which cannot be run by name, and a
+//! target with its own harness, which does not list the way libtest does);
 //! Vitest and Jest split by file, and a file is named relative to the project
-//! root.
+//! root, which is the working directory of the step that runs the tests.
+//!
+//! An adapter is made from the job's own command ([`parse_command`]) and keeps
+//! only the arguments that are known to leave the set of tests alone; a name
+//! filter, a skip, a tag or an argument it does not know makes the job
+//! unsplittable, since a shard's command would run more (or other) tests than
+//! the job did. [`from_info`] makes the adapter again from what a plan holds,
+//! where the tests are run.
 
 use super::{
     Capabilities, CommandOutput, Discovered, Invocation, RunnerAdapter, RunnerInfo, Shard,
     ShardOutcome, SplitMode, TestResult, TestStatus,
 };
 use crate::context::ExecContext;
+use crate::dag::NotSplit;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -40,7 +49,7 @@ impl Default for Safety {
     }
 }
 
-fn caps(native_shard: bool, safety: Safety) -> Capabilities {
+fn caps(native_shard: bool, safety: Safety, blocked: &[NotSplit], substring: bool) -> Capabilities {
     Capabilities {
         enumerates: true,
         targets: true,
@@ -48,7 +57,235 @@ fn caps(native_shard: bool, safety: Safety) -> Capabilities {
         shared_state: safety.shared_state,
         isolated_fixtures: safety.isolated_fixtures,
         aggregates_exactly: true,
+        job_filtered: blocked.contains(&NotSplit::JobFilter),
+        unreadable_args: blocked.contains(&NotSplit::UnreadableArgs),
+        substring_targets: substring,
     }
+}
+
+// ---- the job's own command ----
+
+/// The command of a job, read: which runner, the arguments to keep, and why
+/// the job cannot be split (empty when it can).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parsed {
+    /// `cargo-test`, `vitest` or `jest`.
+    pub runner: &'static str,
+    /// The arguments every command of the runner keeps (they say which
+    /// project, config or features, not which tests).
+    pub args: Vec<String>,
+    pub blocked: Vec<NotSplit>,
+}
+
+/// Which arguments of a runner are known.
+struct Known {
+    /// Flags that change nothing about the set of tests.
+    flags: &'static [&'static str],
+    /// The same, with a value (`--config x` or `--config=x`).
+    valued: &'static [&'static str],
+    /// Flags that choose tests.
+    filters: &'static [&'static str],
+    /// The same, with a value.
+    filters_valued: &'static [&'static str],
+}
+
+const CARGO: Known = Known {
+    flags: &[
+        "--workspace",
+        "--all",
+        "--lib",
+        "--bins",
+        "--tests",
+        "--release",
+        "-r",
+        "--all-features",
+        "--no-default-features",
+        "--locked",
+        "--offline",
+        "--frozen",
+        "--no-fail-fast",
+    ],
+    valued: &[
+        "-p",
+        "--package",
+        "--features",
+        "-F",
+        "--target",
+        "--manifest-path",
+        "--profile",
+        "--exclude",
+        "-j",
+        "--jobs",
+        "--test",
+        "--bin",
+    ],
+    filters: &[],
+    filters_valued: &[],
+};
+
+const VITEST: Known = Known {
+    flags: &["--silent"],
+    valued: &["--config", "-c", "--project"],
+    filters: &["--changed"],
+    filters_valued: &["-t", "--testNamePattern", "--exclude", "--shard", "--dir"],
+};
+
+const JEST: Known = Known {
+    flags: &["--ci", "--silent", "--runInBand", "-i"],
+    valued: &["--config", "-c"],
+    filters: &["--onlyChanged", "-o", "--onlyFailures"],
+    filters_valued: &[
+        "-t",
+        "--testNamePattern",
+        "--testPathPattern",
+        "--testPathPatterns",
+        "--testPathIgnorePatterns",
+        "--testMatch",
+        "--testRegex",
+        "--changedSince",
+        "--findRelatedTests",
+        "--shard",
+    ],
+};
+
+/// The command of `run` as one of the runners, `None` when it is none.
+///
+/// Anything but one plain command (a `&&`, a pipe, a variable, a quote that
+/// does not close) leaves the arguments unread. So does every argument that is
+/// not known to keep the tests as they are. The name filters of `cargo test`
+/// are the words before and after its `--`.
+pub fn parse_command(run: &str) -> Option<Parsed> {
+    let words = shlex::split(run.trim())?;
+    let (runner, known, args): (&'static str, &Known, &[String]) = match words.as_slice() {
+        [c, t, rest @ ..] if c == "cargo" && t == "test" => ("cargo-test", &CARGO, rest),
+        [n, v, rest @ ..] if n == "npx" && v == "vitest" => ("vitest", &VITEST, rest),
+        [v, rest @ ..] if v == "vitest" => ("vitest", &VITEST, rest),
+        [n, j, rest @ ..] if n == "npx" && j == "jest" => ("jest", &JEST, rest),
+        [j, rest @ ..] if j == "jest" => ("jest", &JEST, rest),
+        _ => return None,
+    };
+    let mut parsed = Parsed {
+        runner,
+        args: vec![],
+        blocked: vec![],
+    };
+    if run.chars().any(|c| ";|&<>`$()\n".contains(c)) {
+        parsed.blocked.push(NotSplit::UnreadableArgs);
+        return Some(parsed);
+    }
+    let mut block = |why: NotSplit| {
+        if !parsed.blocked.contains(&why) {
+            parsed.blocked.push(why);
+        }
+    };
+    let mut keep = Vec::new();
+    let mut i = 0;
+    // Vitest's `run` is its default mode, not a filter
+    if runner == "vitest" && args.first().is_some_and(|a| a == "run") {
+        i = 1;
+    }
+    while i < args.len() {
+        let a = args[i].as_str();
+        let name = if a.starts_with("--") {
+            a.split('=').next().unwrap_or(a)
+        } else {
+            a
+        };
+        let inline = a.starts_with("--") && a.contains('=');
+        // the words after `--` go to the test binary of `cargo test`
+        if runner == "cargo-test" && a == "--" {
+            let rest = &args[i + 1..];
+            if !rest.is_empty() {
+                let narrows = rest.iter().any(|t| {
+                    !t.starts_with('-')
+                        || ["--skip", "--ignored", "--include-ignored", "--exact"]
+                            .iter()
+                            .any(|f| t.split('=').next() == Some(f))
+                });
+                block(if narrows {
+                    NotSplit::JobFilter
+                } else {
+                    NotSplit::UnreadableArgs
+                });
+            }
+            break;
+        }
+        let takes_value = !inline;
+        if known.flags.contains(&name) && !inline {
+            if name != "--no-fail-fast" {
+                keep.push(a.to_string());
+            }
+        } else if known.valued.contains(&name) {
+            keep.push(a.to_string());
+            if takes_value {
+                match args.get(i + 1) {
+                    Some(v) => keep.push(v.clone()),
+                    None => block(NotSplit::UnreadableArgs),
+                }
+                i += 1;
+            }
+        } else if known.filters.contains(&name) && !inline {
+            block(NotSplit::JobFilter);
+        } else if known.filters_valued.contains(&name) {
+            block(NotSplit::JobFilter);
+            if takes_value {
+                i += 1;
+            }
+        } else if !a.starts_with('-') {
+            block(NotSplit::JobFilter);
+        } else {
+            block(NotSplit::UnreadableArgs);
+        }
+        i += 1;
+    }
+    parsed.args = keep;
+    Some(parsed)
+}
+
+/// The adapter a plan's runner was made for, to run and read one shard where
+/// the tests are: `root` is the project root (the working directory of the
+/// step). `None` for a runner this module does not know.
+pub fn from_info(info: &RunnerInfo, root: &str) -> Option<Box<dyn RunnerAdapter>> {
+    let safety = Safety::default();
+    Some(match info.runner.as_str() {
+        "cargo-test" => Box::new(CargoTest {
+            info: info.clone(),
+            safety,
+            args: info.config.clone(),
+            blocked: vec![],
+        }),
+        "vitest" => Box::new(Vitest {
+            info: info.clone(),
+            safety,
+            root: root.into(),
+            command: argv(&["npx", "vitest"]),
+            blocked: vec![],
+        }),
+        "jest" => Box::new(Jest {
+            info: info.clone(),
+            safety,
+            root: root.into(),
+            command: argv(&["npx", "jest"]),
+            blocked: vec![],
+        }),
+        _ => return None,
+    })
+}
+
+/// A command as the text of a shell script (the words quoted), and `None` for
+/// a word a shell cannot be given.
+pub fn script_of(inv: &Invocation) -> Option<String> {
+    let mut words = Vec::new();
+    if !inv.env.is_empty() {
+        words.push("env".to_string());
+        for (k, v) in &inv.env {
+            words.push(shlex::try_quote(&format!("{k}={v}")).ok()?.into_owned());
+        }
+    }
+    for a in &inv.argv {
+        words.push(shlex::try_quote(a).ok()?.into_owned());
+    }
+    Some(words.join(" "))
 }
 
 /// Run `inv` in `cwd` and capture what it prints.
@@ -96,9 +333,13 @@ pub struct CargoTest {
     /// Arguments of the job's own `cargo test` before the `--`
     /// (`--workspace`, `--features x`), without the filter.
     args: Vec<String>,
+    /// Why the job's own command cannot be split.
+    blocked: Vec<NotSplit>,
 }
 
 impl CargoTest {
+    /// A runner for a command whose arguments `args` are known to leave the
+    /// tests alone.
     pub fn new(version: &str, args: &[&str], safety: Safety) -> Self {
         CargoTest {
             info: RunnerInfo {
@@ -109,7 +350,20 @@ impl CargoTest {
             },
             safety,
             args: args.iter().map(|s| s.to_string()).collect(),
+            blocked: vec![],
         }
+    }
+
+    /// The runner of a job's `run` text; `None` when it is not `cargo test`.
+    /// A filter or an argument it does not know is kept as a reason the job is
+    /// not split.
+    pub fn from_command(version: &str, run: &str, safety: Safety) -> Option<Self> {
+        let p = parse_command(run).filter(|p| p.runner == "cargo-test")?;
+        let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
+        Some(CargoTest {
+            blocked: p.blocked,
+            ..CargoTest::new(version, &args, safety)
+        })
     }
 
     fn command(&self, extra: &[&str]) -> Vec<String> {
@@ -124,13 +378,23 @@ fn is_doctest(name: &str) -> bool {
     name.contains(" - ") && name.ends_with(')') && name.contains("(line ")
 }
 
+/// A line `N tests, M benchmarks`: what libtest ends a listing with.
+fn is_list_summary(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    matches!(words.as_slice(), [n, t, m, b]
+        if n.parse::<u64>().is_ok()
+            && matches!(*t, "test," | "tests,")
+            && m.parse::<u64>().is_ok()
+            && matches!(*b, "benchmark" | "benchmarks"))
+}
+
 impl RunnerAdapter for CargoTest {
     fn info(&self) -> &RunnerInfo {
         &self.info
     }
 
     fn capabilities(&self) -> Capabilities {
-        caps(false, self.safety)
+        caps(false, self.safety, &self.blocked, false)
     }
 
     fn discover_command(&self) -> Invocation {
@@ -149,6 +413,18 @@ impl RunnerAdapter for CargoTest {
                 complete = false;
             }
             tests.push(name.to_string());
+        }
+        // Every target cargo ran ends its listing with a summary. A target
+        // with a harness of its own (`harness = false`) prints what it likes,
+        // so its tests are not in the list.
+        let targets = out
+            .stderr
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Running "))
+            .count();
+        let summaries = out.stdout.lines().filter(|l| is_list_summary(l)).count();
+        if targets > summaries {
+            complete = false;
         }
         tests.sort();
         tests.dedup();
@@ -189,37 +465,63 @@ impl RunnerAdapter for CargoTest {
             shard_id: shard_id.into(),
             tests,
             exit_ok: out.success,
+            // a run that got as far as running tests ends with a result line
+            parsed: out.stdout.lines().any(|l| l.starts_with("test result:")),
         }
     }
 }
 
 // ---- Vitest and Jest ----
 
-/// A file of a JS project, relative to `root` when it is under it.
+/// A file of a JS project, relative to `root` when it is under it. The root is
+/// compared as the system spells it (links followed), which is how reporters
+/// print the paths of files.
 fn relative(root: &str, path: &str) -> String {
-    let root = root.trim_end_matches('/');
-    path.strip_prefix(root)
-        .and_then(|p| p.strip_prefix('/'))
-        .unwrap_or(path)
-        .to_string()
+    let real = std::fs::canonicalize(root).ok();
+    let real = real.as_deref().and_then(Path::to_str);
+    for r in real.into_iter().chain([root]) {
+        let r = r.trim_end_matches('/');
+        if let Some(rest) = path.strip_prefix(r).and_then(|p| p.strip_prefix('/')) {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
+/// A file as a command is given it: a path outside the root as it is, one
+/// under it from the root, spelled as the system does (a runner compares paths
+/// with the real ones).
 fn absolute(root: &str, file: &str) -> String {
+    if Path::new(file).is_absolute() {
+        return file.to_string();
+    }
+    let real = std::fs::canonicalize(root).ok();
+    let root = real.as_deref().and_then(Path::to_str).unwrap_or(root);
     format!("{}/{file}", root.trim_end_matches('/'))
 }
 
-/// The JSON a reporter printed: the whole of stdout, or what starts at the
-/// first line that opens an object.
+/// The JSON report a reporter printed among other output: the first value
+/// that starts a line and has a list of `testResults`.
 fn json_of(stdout: &str) -> Option<Value> {
-    serde_json::from_str(stdout.trim()).ok().or_else(|| {
-        let at = stdout.find("\n{")? + 1;
-        serde_json::from_str(stdout[at..].trim()).ok()
-    })
+    let mut start = 0;
+    for line in stdout.split_inclusive('\n') {
+        if line.starts_with('{') {
+            let mut values =
+                serde_json::Deserializer::from_str(&stdout[start..]).into_iter::<Value>();
+            if let Some(Ok(v)) = values.next() {
+                if v.get("testResults").is_some_and(Value::is_array) {
+                    return Some(v);
+                }
+            }
+        }
+        start += line.len();
+    }
+    None
 }
 
 /// How a test file went, from its own status and that of its tests.
 fn file_status(file: &str, tests: &[&str]) -> TestStatus {
-    if tests.contains(&"failed") || (tests.is_empty() && file == "failed") {
+    if file == "failed" || tests.contains(&"failed") {
         TestStatus::Failed
     } else if !tests.is_empty()
         && tests
@@ -234,9 +536,10 @@ fn file_status(file: &str, tests: &[&str]) -> TestStatus {
 
 /// The files of a Vitest or Jest JSON report, by the name they are listed by.
 fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome {
-    let report = json_of(&out.stdout).unwrap_or_default();
+    let report = json_of(&out.stdout);
     let tests = report
-        .get("testResults")
+        .as_ref()
+        .and_then(|r| r.get("testResults"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
@@ -263,6 +566,7 @@ fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> 
         shard_id: shard_id.into(),
         tests,
         exit_ok: out.success,
+        parsed: report.is_some(),
     }
 }
 
@@ -295,6 +599,7 @@ pub struct Vitest {
     root: String,
     /// The command that starts Vitest.
     command: Vec<String>,
+    blocked: Vec<NotSplit>,
 }
 
 impl Vitest {
@@ -309,7 +614,18 @@ impl Vitest {
             safety,
             root: root.into(),
             command: argv(&["npx", "vitest"]),
+            blocked: vec![],
         }
+    }
+
+    /// The runner of a job's `run` text; `None` when it is not Vitest.
+    pub fn from_command(version: &str, root: &str, run: &str, safety: Safety) -> Option<Self> {
+        let p = parse_command(run).filter(|p| p.runner == "vitest")?;
+        let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
+        Some(Vitest {
+            blocked: p.blocked,
+            ..Vitest::new(version, root, &args, safety)
+        })
     }
 }
 
@@ -319,7 +635,8 @@ impl RunnerAdapter for Vitest {
     }
 
     fn capabilities(&self) -> Capabilities {
-        caps(true, self.safety)
+        // a path given to Vitest is a filter on the paths of files
+        caps(true, self.safety, &self.blocked, true)
     }
 
     fn discover_command(&self) -> Invocation {
@@ -357,6 +674,7 @@ pub struct Jest {
     safety: Safety,
     root: String,
     command: Vec<String>,
+    blocked: Vec<NotSplit>,
 }
 
 impl Jest {
@@ -371,7 +689,18 @@ impl Jest {
             safety,
             root: root.into(),
             command: argv(&["npx", "jest"]),
+            blocked: vec![],
         }
+    }
+
+    /// The runner of a job's `run` text; `None` when it is not Jest.
+    pub fn from_command(version: &str, root: &str, run: &str, safety: Safety) -> Option<Self> {
+        let p = parse_command(run).filter(|p| p.runner == "jest")?;
+        let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
+        Some(Jest {
+            blocked: p.blocked,
+            ..Jest::new(version, root, &args, safety)
+        })
     }
 }
 
@@ -381,7 +710,7 @@ impl RunnerAdapter for Jest {
     }
 
     fn capabilities(&self) -> Capabilities {
-        caps(true, self.safety)
+        caps(true, self.safety, &self.blocked, false)
     }
 
     fn discover_command(&self) -> Invocation {

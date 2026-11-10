@@ -11,6 +11,7 @@ use crate::dag::{JobNode, NodeKind};
 use crate::exec::{JobResult, Opts, Outcome, Runner, Workspace};
 use crate::frozen::FrozenPlan;
 use crate::setup::{PreparedReceipt, PreparedSetup, SetupRecipe, TemplateContext, TemplateKey};
+use crate::shard::ShardOutcome;
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -149,6 +150,11 @@ pub struct TaskResult {
     /// its workflow (the `artifacts` a task's
     /// [`crate::dag::OutputVerification`] asks for are checked against this).
     pub artifacts: Vec<String>,
+    /// For the task of one shard of a split job: what the shard's tests
+    /// reported, read from the log of the step that ran them. `None` for any
+    /// other task.
+    #[serde(default)]
+    pub shard: Option<ShardOutcome>,
 }
 
 /// One job, or one matrix entry of it, from its result and outputs.

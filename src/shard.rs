@@ -44,6 +44,14 @@ pub struct Capabilities {
     pub isolated_fixtures: bool,
     /// The results of the shards merge to the verdict of the whole job.
     pub aggregates_exactly: bool,
+    /// The job's own command has a name filter, a skip or a tag.
+    pub job_filtered: bool,
+    /// The job's own command has an argument that is not known to leave the
+    /// set of tests alone.
+    pub unreadable_args: bool,
+    /// A test is targeted by a substring of its name (a path given to Vitest
+    /// is a filter), so a name that is part of another selects both.
+    pub substring_targets: bool,
 }
 
 /// The tests a runner lists.
@@ -177,6 +185,14 @@ pub struct ShardOutcome {
     pub tests: Vec<TestResult>,
     /// The runner's command exited with success.
     pub exit_ok: bool,
+    /// The report of the runner was read. `false` when its output holds no
+    /// report (no JSON, no test line): then `tests` says nothing.
+    #[serde(default = "yes")]
+    pub parsed: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The shards of one job together.
@@ -259,7 +275,33 @@ pub fn not_split_reasons(caps: &Capabilities, discovered: &Discovered) -> Vec<No
     if !caps.aggregates_exactly {
         out.push(NotSplit::InexactAggregation);
     }
+    if caps.job_filtered {
+        out.push(NotSplit::JobFilter);
+    }
+    if caps.unreadable_args {
+        out.push(NotSplit::UnreadableArgs);
+    }
+    if caps.substring_targets && has_overlap(&discovered.tests) {
+        out.push(NotSplit::PathOverlap);
+    }
     out
+}
+
+/// One of the names is part of another one.
+fn has_overlap(tests: &[String]) -> bool {
+    let names: BTreeSet<&String> = tests.iter().collect();
+    names
+        .iter()
+        .any(|a| names.iter().any(|b| a != b && b.contains(a.as_str())))
+}
+
+/// The most a shard's command may take (the arguments of a process are
+/// limited; this keeps well under the smallest limit in use).
+pub const MAX_ARGV_BYTES: usize = 100 * 1024;
+
+/// The length of a command, as the system counts it.
+fn argv_bytes(inv: &Invocation) -> usize {
+    inv.argv.iter().map(|a| a.len() + 1).sum()
 }
 
 fn single(
@@ -322,7 +364,18 @@ pub fn partition_tests(
     }
     let listed = caps.enumerates && caps.targets && discovered.complete;
     if !listed {
-        // the runner's own shard feature: nothing to list, nothing to weigh
+        // the runner's own shard feature: nothing to weigh. With a listing
+        // that is all there is, a shard holds at least one of its tests, so
+        // there are no more shards than tests (a partial listing is a lower
+        // bound only).
+        let shard_count = if caps.enumerates && discovered.complete {
+            shard_count.min(names.len())
+        } else {
+            shard_count
+        };
+        if shard_count <= 1 {
+            return single(runner, names, Basis::Fallback, 0, vec![NotSplit::TooSmall]);
+        }
         return ShardPlan {
             runner,
             mode: SplitMode::Native,
@@ -402,13 +455,29 @@ pub fn partition_tests(
             }
         })
         .collect();
-    ShardPlan {
+    let plan = ShardPlan {
         runner,
         mode: SplitMode::Listed,
         basis,
         shards,
         not_split: vec![],
+    };
+    let longest = plan
+        .shards
+        .iter()
+        .map(|s| argv_bytes(&adapter.invoke(s, plan.shards.len(), SplitMode::Listed)))
+        .max()
+        .unwrap_or(0);
+    if longest > MAX_ARGV_BYTES {
+        return single(
+            plan.runner,
+            names,
+            basis,
+            total,
+            vec![NotSplit::ArgvTooLarge],
+        );
     }
+    plan
 }
 
 impl ShardPlan {
@@ -464,18 +533,53 @@ impl ShardPlan {
 /// The shards of one job together. With a `manifest`, every test in it must be
 /// reported once and no other; each test is counted once whatever the shard.
 pub fn merge_outcomes(manifest: Option<&[String]>, outcomes: &[ShardOutcome]) -> Merged {
+    merge_with(manifest, &Rules::default(), outcomes)
+}
+
+/// What a merge checks besides the manifest.
+#[derive(Debug, Clone, Default)]
+pub struct Rules<'a> {
+    /// A test reported that is not in the manifest is not a problem (the
+    /// listing may be partial).
+    pub allow_unlisted: bool,
+    /// The tests each shard (by `shard_id`) was given; a test reported by
+    /// another shard is a problem. A shard not named here is not checked.
+    pub assigned: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+/// [`merge_outcomes`] with `rules`.
+pub fn merge_with(
+    manifest: Option<&[String]>,
+    rules: &Rules<'_>,
+    outcomes: &[ShardOutcome],
+) -> Merged {
+    let listed: Option<BTreeSet<&str>> = manifest.map(|m| m.iter().map(String::as_str).collect());
     let mut seen: BTreeMap<&str, Vec<&TestResult>> = BTreeMap::new();
     for t in outcomes.iter().flat_map(|o| &o.tests) {
         seen.entry(&t.identity).or_default().push(t);
     }
     let mut m = Merged::default();
+    for o in outcomes {
+        if let Some(own) = rules.assigned.get(o.shard_id.as_str()) {
+            for t in o
+                .tests
+                .iter()
+                .filter(|t| !own.contains(t.identity.as_str()))
+            {
+                m.problems.push(format!(
+                    "`{}` was reported by shard {} of {}, which was not given it",
+                    t.identity, o.shard_id, o.job_id
+                ));
+            }
+        }
+    }
     for (id, rs) in &seen {
         if rs.len() > 1 {
             m.problems
                 .push(format!("`{id}` was reported more than once"));
         }
-        if let Some(man) = manifest {
-            if !man.iter().any(|x| x == id) {
+        if let Some(man) = &listed {
+            if !rules.allow_unlisted && !man.contains(id) {
                 m.problems
                     .push(format!("`{id}` was reported but was not listed"));
             }
@@ -488,12 +592,23 @@ pub fn merge_outcomes(manifest: Option<&[String]>, outcomes: &[ShardOutcome]) ->
         }
         m.tests.push(r.clone());
     }
-    for t in manifest.unwrap_or_default() {
-        if !seen.contains_key(t.as_str()) {
+    for t in listed.iter().flatten() {
+        if !seen.contains_key(t) {
             m.problems.push(format!("`{t}` was not reported"));
         }
     }
     for o in outcomes {
+        if !o.parsed {
+            m.problems.push(format!(
+                "the report of shard {} of {} could not be read",
+                o.shard_id, o.job_id
+            ));
+        } else if o.exit_ok && o.tests.is_empty() {
+            m.problems.push(format!(
+                "shard {} of {} succeeded but reported no test",
+                o.shard_id, o.job_id
+            ));
+        }
         if !o.exit_ok && !o.tests.iter().any(|t| t.status == TestStatus::Failed) {
             m.problems.push(format!(
                 "shard {} of {} failed without a failed test",
@@ -521,6 +636,9 @@ mod tests {
         shared_state: false,
         isolated_fixtures: true,
         aggregates_exactly: true,
+        job_filtered: false,
+        unreadable_args: false,
+        substring_targets: false,
     };
 
     fn fake(caps: Capabilities) -> Fake {
@@ -559,6 +677,7 @@ mod tests {
                 shard_id: shard_id.into(),
                 tests: vec![],
                 exit_ok: true,
+                parsed: true,
             }
         }
     }
@@ -1025,6 +1144,7 @@ mod tests {
                 })
                 .collect(),
             exit_ok: ok,
+            parsed: true,
         }
     }
 
@@ -1131,5 +1251,200 @@ mod tests {
             .shard_id,
             "s"
         );
+    }
+
+    fn makespan(shards: &[Vec<&str>], millis: &BTreeMap<String, u64>) -> u64 {
+        shards
+            .iter()
+            .map(|s| s.iter().map(|n| millis[*n]).sum::<u64>())
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn longest_first_beats_a_split_by_name_order() {
+        // the slow tests come first by name: halves by name put them together
+        let weights = [
+            ("t0", 90),
+            ("t1", 80),
+            ("t2", 70),
+            ("t3", 60),
+            ("t4", 10),
+            ("t5", 20),
+            ("t6", 30),
+            ("t7", 40),
+        ];
+        let h = hist(&weights);
+        let all: Vec<&str> = weights.iter().map(|(n, _)| *n).collect();
+        let d = found(&all);
+        let p = partition_tests(&fake(OK), &d, &h, 2, &PartitionOpts::default());
+        let lpt = makespan(&names(&p), &h.millis);
+        let naive: Vec<Vec<&str>> = all.chunks(4).map(<[&str]>::to_vec).collect();
+        let by_name = makespan(&naive, &h.millis);
+        assert_eq!((lpt, by_name), (200, 300));
+        assert!(lpt < by_name);
+    }
+
+    #[test]
+    fn a_native_split_has_no_more_shards_than_listed_tests() {
+        let native = Capabilities {
+            targets: false,
+            native_shard: true,
+            ..OK
+        };
+        let d = found(&["a", "b", "c"]);
+        let p = partition_tests(
+            &fake(native),
+            &d,
+            &History::default(),
+            8,
+            &PartitionOpts::default(),
+        );
+        assert_eq!((p.mode, p.shards.len()), (SplitMode::Native, 3));
+        // one test is nothing to split
+        let one = found(&["a"]);
+        let p = partition_tests(
+            &fake(native),
+            &one,
+            &History::default(),
+            8,
+            &PartitionOpts::default(),
+        );
+        assert_eq!(p.not_split, vec![NotSplit::TooSmall]);
+        assert!(!p.is_split());
+    }
+
+    #[test]
+    fn what_the_job_filters_is_a_reason_not_to_split() {
+        let d = found(&["a", "b"]);
+        let bad = |c: Capabilities| not_split_reasons(&c, &d);
+        assert_eq!(
+            bad(Capabilities {
+                job_filtered: true,
+                ..OK
+            }),
+            vec![NotSplit::JobFilter]
+        );
+        assert_eq!(
+            bad(Capabilities {
+                unreadable_args: true,
+                ..OK
+            }),
+            vec![NotSplit::UnreadableArgs]
+        );
+        // a path that is part of another selects both when given as a filter
+        let sub = Capabilities {
+            substring_targets: true,
+            ..OK
+        };
+        assert_eq!(bad(sub), vec![]);
+        let overlapping = found(&["src/a.test.js", "lib/src/a.test.js", "b.test.js"]);
+        assert_eq!(
+            not_split_reasons(&sub, &overlapping),
+            vec![NotSplit::PathOverlap]
+        );
+        assert_eq!(not_split_reasons(&OK, &overlapping), vec![]);
+        assert!(!has_overlap(&["a".into(), "a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn a_command_too_long_to_start_is_not_split() {
+        use super::adapters::{CargoTest, Safety};
+        let c = CargoTest::new("1", &[], Safety::default());
+        let long = "x".repeat(1100);
+        let names: Vec<String> = (0..200).map(|i| format!("{long}{i:04}")).collect();
+        let d = Discovered {
+            tests: names,
+            complete: true,
+        };
+        let p = partition_tests(&c, &d, &History::default(), 2, &PartitionOpts::default());
+        assert_eq!(p.not_split, vec![NotSplit::ArgvTooLarge]);
+        assert!(!p.is_split());
+        // the same names in shards that fit are split
+        let p = partition_tests(&c, &d, &History::default(), 8, &PartitionOpts::default());
+        assert!(p.is_split());
+        let longest = p
+            .shards
+            .iter()
+            .map(|s| argv_bytes(&c.invoke(s, 8, SplitMode::Listed)))
+            .max()
+            .unwrap();
+        assert!(longest <= MAX_ARGV_BYTES);
+    }
+
+    #[test]
+    fn a_shard_that_reports_nothing_readable_is_a_problem() {
+        use TestStatus::*;
+        let mut unread = outcome("s0", true, &[]);
+        unread.parsed = false;
+        let m = merge_outcomes(None, &[unread]);
+        assert_eq!(
+            m.problems,
+            vec!["the report of shard s0 of j could not be read"]
+        );
+        // it succeeded and ran nothing
+        let m = merge_outcomes(None, &[outcome("s0", true, &[])]);
+        assert_eq!(
+            m.problems,
+            vec!["shard s0 of j succeeded but reported no test"]
+        );
+        // a failure with no report is the failure, once
+        let m = merge_outcomes(None, &[outcome("s0", false, &[])]);
+        assert_eq!(
+            m.problems,
+            vec!["shard s0 of j failed without a failed test"]
+        );
+        assert!(merge_outcomes(None, &[outcome("s0", true, &[("a", Passed)])]).ok());
+    }
+
+    #[test]
+    fn a_shard_reports_only_what_it_was_given() {
+        use TestStatus::*;
+        let man: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let mut rules = Rules::default();
+        rules.assigned.insert("s0", ["a"].into());
+        rules.assigned.insert("s1", ["b"].into());
+        let both = [
+            outcome("s0", true, &[("a", Passed)]),
+            outcome("s1", true, &[("b", Passed)]),
+        ];
+        assert!(merge_with(Some(&man), &rules, &both).ok());
+        // s1 ran a test of s0: the set is complete, but not as it was divided
+        let swapped = [
+            outcome("s0", true, &[("a", Passed), ("b", Passed)]),
+            outcome("s1", true, &[("b", Passed)]),
+        ];
+        let m = merge_with(Some(&man), &rules, &swapped);
+        assert_eq!(
+            m.problems,
+            vec![
+                "`b` was reported by shard s0 of j, which was not given it",
+                "`b` was reported more than once"
+            ]
+        );
+        // a shard the rules do not name is not checked
+        let m = merge_with(Some(&man), &Rules::default(), &swapped);
+        assert_eq!(m.problems, vec!["`b` was reported more than once"]);
+        // a partial listing: more than listed is fine, less is not
+        let partial = Rules {
+            allow_unlisted: true,
+            ..Rules::default()
+        };
+        let m = merge_with(
+            Some(&man),
+            &partial,
+            &[outcome(
+                "s0",
+                true,
+                &[("a", Passed), ("z", Passed), ("b", Passed)],
+            )],
+        );
+        assert!(m.ok(), "{:?}", m.problems);
+        let m = merge_with(
+            Some(&man),
+            &partial,
+            &[outcome("s0", true, &[("z", Passed)])],
+        );
+        assert_eq!(m.problems.len(), 2);
     }
 }

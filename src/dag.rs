@@ -375,6 +375,14 @@ pub struct TaskShard {
     pub mode: SplitMode,
     /// The tests of this shard (empty for the runner's own shard feature).
     pub tests: Vec<String>,
+    /// The runner and the arguments of the job's own command: what the shard's
+    /// command is built from when the task runs.
+    #[serde(default)]
+    pub runner: RunnerInfo,
+    /// The step of the job that runs the tests; the task runs the shard's
+    /// command in its place.
+    #[serde(default)]
+    pub step: usize,
 }
 
 /// `<workflow file>::<job id>@<index>`: the task of one shard of a split job.
@@ -390,6 +398,10 @@ pub struct ShardRequest {
     pub workflow: String,
     pub job: String,
     pub plan: ShardPlan,
+    /// The step (index in the job's `steps`) whose `run` is the command the
+    /// plan's runner was made from, with its working directory as the project
+    /// root. A shard's task runs its own command in place of that step.
+    pub step: usize,
     /// What the runner listed; the shards are checked against it.
     pub discovered: Discovered,
     /// A failed shard cancels the shards that have not finished.
@@ -429,6 +441,20 @@ pub enum NotSplit {
     TooSmall,
     /// The shards do not hold the listed tests exactly once.
     ManifestMismatch,
+    /// The job's own command has a name filter, a skip or a tag: the shards
+    /// would run the tests of the whole job.
+    JobFilter,
+    /// The job's own command has an argument (or shell syntax) that is not
+    /// known to leave the set of tests alone.
+    UnreadableArgs,
+    /// The step the shard's command would replace is not one plain command of
+    /// the runner the plan was made for.
+    NotConnectable,
+    /// A test file's path is part of another's: a path given as a filter
+    /// would run both.
+    PathOverlap,
+    /// The shard's command would be too long to start.
+    ArgvTooLarge,
 }
 
 /// A job (or the jobs of a task) that could become several shards, and the
@@ -454,6 +480,15 @@ pub struct ShardGroup {
     /// A failed shard cancels the others.
     #[serde(default)]
     pub fail_fast: bool,
+    /// The tests of each shard, in the order of `shards` (empty for a native
+    /// split).
+    #[serde(default)]
+    pub assignments: Vec<Vec<String>>,
+    /// `manifest` is all the tests there are. `false` for a native split whose
+    /// listing may be partial: every listed test must be reported, others may
+    /// be.
+    #[serde(default)]
+    pub manifest_exact: bool,
 }
 
 /// The outputs of other jobs that `job` reads, found by reading its
@@ -707,7 +742,11 @@ pub(crate) fn derive_tasks(
                         .as_ref()
                         .filter(|(_, m)| matches!(m, MatrixPlan::None))
                         .and_then(|(j, _)| request_for(requests, &wf.file, &j.id))
-                        .filter(|r| structural_reasons(&base).is_empty() && manifest_ok(r));
+                        .filter(|r| {
+                            structural_reasons(&base).is_empty()
+                                && manifest_ok(r)
+                                && connection_reason(r, w, ids.len()).is_none()
+                        });
                     if let Some(r) = split.filter(|r| r.plan.is_split()) {
                         let count = r.plan.shards.len();
                         for s in &r.plan.shards {
@@ -721,6 +760,8 @@ pub(crate) fn derive_tasks(
                                     count,
                                     mode: r.plan.mode,
                                     tests: s.tests.clone(),
+                                    runner: r.plan.runner.clone(),
+                                    step: r.step,
                                 }),
                                 ..base.clone()
                             });
@@ -788,6 +829,8 @@ pub(crate) fn derive_tasks(
                     runner: Some(r.plan.runner.clone()),
                     manifest: manifest_of(r),
                     fail_fast: r.fail_fast,
+                    assignments: r.plan.shards.iter().map(|s| s.tests.clone()).collect(),
+                    manifest_exact: r.plan.mode != SplitMode::Native || r.discovered.complete,
                 });
             }
             continue;
@@ -804,6 +847,10 @@ pub(crate) fn derive_tasks(
                 if !manifest_ok(r) {
                     not_split.push(NotSplit::ManifestMismatch);
                 }
+                let sel = plan.selected.iter().find(|x| x.wf.file == t.workflow);
+                if let Some(why) = sel.and_then(|x| connection_reason(r, &x.wf, t.jobs.len())) {
+                    not_split.push(why);
+                }
             }
         }
         shard_groups.push(ShardGroup {
@@ -817,6 +864,8 @@ pub(crate) fn derive_tasks(
             runner: asked.map(|r| r.plan.runner.clone()),
             manifest: vec![],
             fail_fast: false,
+            assignments: vec![],
+            manifest_exact: false,
         });
     }
     (tasks, shard_groups)
@@ -847,6 +896,37 @@ fn structural_reasons(t: &ExecutionTask) -> Vec<NotSplit> {
     out
 }
 
+/// Why the step a request names cannot be replaced by a shard's command: it is
+/// not one plain command of the runner the plan was made for, or it would run
+/// under a shell that does not read one.
+fn connection_reason(
+    r: &ShardRequest,
+    w: &crate::workflow::Workflow,
+    jobs_in_task: usize,
+) -> Option<NotSplit> {
+    let job = w.jobs.iter().find(|j| j.id == r.job)?;
+    let step = job.steps.get(r.step).filter(|_| jobs_in_task == 1);
+    let Some((step, run)) = step.and_then(|s| s.run.as_ref().map(|r| (s, r))) else {
+        return Some(NotSplit::NotConnectable);
+    };
+    if step.uses.is_some()
+        || !matches!(
+            plan::resolved_shell(w, job, step).as_deref().map(str::trim),
+            None | Some("bash") | Some("sh")
+        )
+    {
+        return Some(NotSplit::NotConnectable);
+    }
+    let Some(parsed) = crate::shard::adapters::parse_command(run) else {
+        return Some(NotSplit::NotConnectable);
+    };
+    if let Some(why) = parsed.blocked.first() {
+        return Some(why.clone());
+    }
+    (parsed.runner != r.plan.runner.runner || parsed.args != r.plan.runner.config)
+        .then_some(NotSplit::NotConnectable)
+}
+
 /// The shards of the request hold the tests it lists, each once.
 fn manifest_ok(r: &ShardRequest) -> bool {
     r.plan.verify(&r.discovered).is_ok()
@@ -856,7 +936,14 @@ fn manifest_of(r: &ShardRequest) -> Vec<String> {
     r.plan
         .shards
         .iter()
-        .flat_map(|s| s.tests.iter().cloned())
+        .flat_map(|s| s.tests.iter())
+        .chain(
+            r.discovered
+                .tests
+                .iter()
+                .filter(|_| r.plan.mode == SplitMode::Native),
+        )
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()

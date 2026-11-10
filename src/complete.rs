@@ -17,7 +17,7 @@ use crate::dag::{self, ExecutionTask, MatrixPlan, ShardGroup};
 use crate::exec::{JobResult, Outcome, UnitResult};
 use crate::frozen::FrozenPlan;
 use crate::report::RunResult;
-use crate::shard::{merge_outcomes, Merged, ShardOutcome};
+use crate::shard::{merge_with, Merged, Rules, ShardOutcome};
 use crate::task::{JobOutcome, JobStatus, TaskResult};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -458,7 +458,18 @@ pub fn aggregate_shard_group(group: &ShardGroup, results: &[ShardOutcome]) -> Sh
         .map(|(s, _)| s.to_string())
         .collect();
     let manifest = (!group.manifest.is_empty()).then_some(group.manifest.as_slice());
-    let merged = merge_outcomes(manifest, results);
+    let rules = Rules {
+        allow_unlisted: !group.manifest_exact,
+        // a listed shard reports only the tests it was given
+        assigned: group
+            .shards
+            .iter()
+            .zip(&group.assignments)
+            .filter(|(_, tests)| !tests.is_empty())
+            .map(|(id, tests)| (id.as_str(), tests.iter().map(String::as_str).collect()))
+            .collect(),
+    };
+    let merged = merge_with(manifest, &rules, results);
     let failed = results.iter().any(|r| {
         !r.exit_ok
             || r.tests
