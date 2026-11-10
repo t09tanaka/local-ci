@@ -25,6 +25,14 @@ fn example(name: &str) -> PathBuf {
 fn ctx(extra: &[(&str, &str)]) -> ExecContext {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     env.remove("SHARD_EXAMPLE_FAIL");
+    // a coverage run instruments the crate under test, not the example
+    env.retain(|k, _| {
+        !(k.starts_with("CARGO_LLVM_COV")
+            || k.starts_with("LLVM_")
+            || k.ends_with("RUSTFLAGS")
+            || k.starts_with("RUSTC_")
+            || k == "CARGO_TARGET_DIR")
+    });
     for (k, v) in extra {
         env.insert(k.to_string(), v.to_string());
     }
