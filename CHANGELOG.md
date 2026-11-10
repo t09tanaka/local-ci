@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+- `exec::Opts` has a new field `executor: Option<Arc<dyn StepExecutor>>`
+  (`src/step_executor.rs`). When set, every step is handed to it as a
+  `StepRequest` (key, argv, cwd, env, log, timeout, script pipe, cancel
+  handle) instead of being started by local-ci, and the `StepExit` it returns
+  (exit, run time, queue wait) is what the result reports; the contract an
+  implementation keeps is in the trait's documentation. `exec::Exit` and
+  `CancelHandle::track_pgid` / `untrack_pgid` are now public for this. With no
+  executor nothing changes. Code that builds `Opts` by hand adds
+  `executor: None`.
+
 ## [0.9.0] - 2026-11-10
 
 - CLI breaking change: the tool that queues heavy steps, canirun, is now

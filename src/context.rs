@@ -48,11 +48,12 @@ impl CancelHandle {
         self.0.cancelled.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn track_pgid(&self, pg: i32) {
+    /// Make [`CancelHandle::cancel`] signal this process group until it is untracked.
+    pub fn track_pgid(&self, pg: i32) {
         self.0.pgids.lock().unwrap().push(pg);
     }
 
-    pub(crate) fn untrack_pgid(&self, pg: i32) {
+    pub fn untrack_pgid(&self, pg: i32) {
         self.0.pgids.lock().unwrap().retain(|&p| p != pg);
     }
 

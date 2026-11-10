@@ -11,6 +11,7 @@ use crate::plan::{self, Plan, Unit};
 use crate::setup::{
     self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe, TemplateContext,
 };
+use crate::step_executor::{ScriptPipe, StepExecutor, StepRequest};
 use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, TaskResult};
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
@@ -194,6 +195,9 @@ pub struct UnitResult {
 pub struct Opts {
     pub parallel: usize,
     pub traffic_controller: Option<PathBuf>,
+    /// Runs every step in place of local-ci's own child process (and of
+    /// `traffic_controller`); see [`crate::step_executor::StepExecutor`].
+    pub executor: Option<Arc<dyn crate::step_executor::StepExecutor>>,
     /// Gives jobs that bind fixed ports a block of their own (`--no-portool` turns it off).
     pub portool: Option<PathBuf>,
     /// Exclusive jobs that may run at once, across all runs on the machine.
@@ -317,7 +321,9 @@ pub fn tail(path: &Path, n: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(n)..].to_vec()
 }
 
-enum Exit {
+/// How a step's command ended. A signal is `Code(128 + signal)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
     Code(i32),
     Timeout,
     Cancelled,
@@ -968,6 +974,7 @@ impl<'a> Runner<'a> {
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
                 && attempt < 3
+                && self.opts.executor.is_none()
                 && self.opts.traffic_controller.is_some()
                 && ledger_timed_out(log, from))
             {
@@ -999,7 +1006,8 @@ impl<'a> Runner<'a> {
         // shells are not changed (a Python script may begin with
         // `from __future__`); their wait is read from the log.
         let turn = self.tools.join(format!("scripts/step-{n}.turn"));
-        let queued = self.opts.traffic_controller.is_some() && key.is_some();
+        let queued =
+            self.opts.executor.is_none() && self.opts.traffic_controller.is_some() && key.is_some();
         let marked = queued && matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
         let sh_family = matches!(shell.map(str::trim), None | Some("bash") | Some("sh"));
         // bash and sh read a script that is not a file one byte at a time, so
@@ -1054,7 +1062,11 @@ impl<'a> Runner<'a> {
             // keep in step with `plan::shell_supported`
             Some(other) => bail!("unsupported shell `{other}`"),
         };
-        if let (Some(c), Some(k)) = (&self.opts.traffic_controller, key) {
+        if let (Some(c), Some(k), true) = (
+            &self.opts.traffic_controller,
+            key.clone(),
+            self.opts.executor.is_none(),
+        ) {
             let mut w = vec![
                 c.to_string_lossy().into_owned(),
                 "exec".into(),
@@ -1074,6 +1086,21 @@ impl<'a> Runner<'a> {
                 ),
             )?;
             return Ok((Exit::Code(1), Duration::ZERO));
+        }
+        if let Some(ex) = &self.opts.executor {
+            return self.shell_via_executor(
+                ex.as_ref(),
+                n,
+                &file,
+                argv,
+                cwd,
+                env,
+                timeout,
+                log,
+                key,
+                &body,
+                piped,
+            );
         }
         let out = OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
@@ -1219,6 +1246,70 @@ impl<'a> Runner<'a> {
             )),
             waited,
         ))
+    }
+
+    /// The step through `ex` (see [`StepExecutor`]) instead of a child process
+    /// of ours: the script file or pipe is made here, the command is not.
+    #[allow(clippy::too_many_arguments)]
+    fn shell_via_executor(
+        &self,
+        ex: &dyn StepExecutor,
+        n: usize,
+        file: &Path,
+        argv: Vec<String>,
+        cwd: &Path,
+        env: &[(String, String)],
+        timeout: Option<Duration>,
+        log: &Path,
+        key: Option<String>,
+        body: &str,
+        piped: bool,
+    ) -> Result<(Exit, Duration)> {
+        let mut vars = self.ctx.env().clone();
+        vars.extend(env.iter().cloned());
+        let (writer_stop, mut writer, mut script_fd, mut read_end) =
+            (Arc::new(AtomicBool::new(false)), None, None, None);
+        if piped {
+            let (r, w) = script_pipe(&self.tools.join(format!("scripts/step-{n}.fifo")))?;
+            script_fd = Some(ScriptPipe {
+                read_fd: std::os::fd::AsRawFd::as_raw_fd(&r),
+                child_fd: PIPE_FD,
+            });
+            read_end = Some(r);
+            // The thread owns the write end, so the command sees the end of the
+            // script once it is written (as in the default path).
+            let (body, stop) = (body.to_string(), writer_stop.clone());
+            writer = Some(std::thread::spawn(move || {
+                write_until_stopped(w, body.as_bytes(), &stop)
+            }));
+        }
+        let req = StepRequest {
+            key,
+            argv,
+            cwd: cwd.to_path_buf(),
+            env: vars.into_iter().collect(),
+            log: log.to_path_buf(),
+            timeout,
+            script_pipe: script_fd,
+            cancel: self.ctx.cancel.clone(),
+        };
+        let res = ex.run(&req);
+        writer_stop.store(true, Ordering::SeqCst);
+        if let Some(h) = writer {
+            let _ = h.join();
+        }
+        drop(read_end);
+        if !piped {
+            let _ = fs::remove_file(file);
+        }
+        let done = res?;
+        let waited = Duration::try_from_secs_f64(done.queue_wait_secs.unwrap_or(0.0).max(0.0))
+            .unwrap_or(Duration::ZERO);
+        let exit = match done.exit {
+            Exit::Code(_) if self.ctx.cancel.is_cancelled() => Exit::Cancelled,
+            e => e,
+        };
+        Ok((exit, waited))
     }
 
     fn log_path(&self, wf: &str, job: &str, n: usize, label: &str) -> PathBuf {
@@ -2264,7 +2355,7 @@ impl<'a> Runner<'a> {
         let at_once = job.max_parallel.unwrap_or(usize::MAX);
         if todo.len() > 1
             && at_once > 1
-            && self.opts.traffic_controller.is_some()
+            && (self.opts.traffic_controller.is_some() || self.opts.executor.is_some())
             && (!exclusive || !locked)
         {
             let done = Mutex::new(Vec::new());

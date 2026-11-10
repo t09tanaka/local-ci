@@ -217,6 +217,7 @@ fn executing_a_built_plan_gives_what_run_gives() {
     let opts = local_ci::exec::Opts {
         parallel: 2,
         traffic_controller: None,
+        executor: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,

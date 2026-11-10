@@ -707,6 +707,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         let opts = exec::Opts {
             parallel,
             traffic_controller,
+            executor: None,
             portool: if a.no_portool {
                 None
             } else {

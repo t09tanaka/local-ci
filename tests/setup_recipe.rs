@@ -152,6 +152,7 @@ impl<'a> Place<'a> {
         Opts {
             parallel: 1,
             traffic_controller: None,
+            executor: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,
@@ -976,6 +977,7 @@ fn a17_building_a_plus_b_does_not_change_a_and_consumers_are_apart() {
     let opts = Opts {
         parallel: 1,
         traffic_controller: None,
+        executor: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,

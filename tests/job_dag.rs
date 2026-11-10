@@ -363,6 +363,7 @@ impl Lab {
         let opts = local_ci::exec::Opts {
             parallel: 1,
             traffic_controller: None,
+            executor: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,
@@ -980,6 +981,7 @@ impl Lab {
         let opts = local_ci::exec::Opts {
             parallel: 2,
             traffic_controller: None,
+            executor: None,
             portool: None,
             containers: 1,
             job_timeout_min: 5.0,
