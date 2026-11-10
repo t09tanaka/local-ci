@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.9.0] - 2026-11-10
 
 - CLI breaking change: the tool that queues heavy steps, canirun, is now
   task-traffic-controller, and local-ci no longer uses the old name. It looks
