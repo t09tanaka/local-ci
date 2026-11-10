@@ -240,6 +240,16 @@ mod tests {
     }
 
     #[test]
+    fn paths_ignore_does_not_skip_a_run_that_changed_nothing() {
+        let w = parse(
+            "a.yml",
+            "on:\n  pull_request:\n    paths-ignore: ['**.md']\njobs: {}\n",
+        )
+        .unwrap();
+        assert!(matches!(decide(&w, &ev(&[])), Decision::Run { .. }));
+    }
+
+    #[test]
     fn events_types_and_branches() {
         let w = parse("a.yml", "on:\n  push:\n    branches: [main]\njobs: {}\n").unwrap();
         assert!(matches!(decide(&w, &ev(&["a"])), Decision::Skip { .. }));
@@ -293,6 +303,44 @@ mod tests {
             decide(&w, &ev(&["a"])),
             Decision::Skip {
                 reason: "push: tags only".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_glob_matches_nothing() {
+        let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(last_match(&p(&["[a"]), "a"), None);
+        assert_eq!(last_match(&p(&["[a", "a"]), "a"), Some(true));
+        assert_eq!(last_match(&p(&["a", "!b"]), "a"), Some(true));
+        assert_eq!(last_match(&p(&["a", "!a"]), "a"), Some(false));
+    }
+
+    #[test]
+    fn branches_and_branches_ignore() {
+        let mut e = ev(&["a"]);
+        let w = parse("a.yml", "on:\n  push:\n    branches: [main]\njobs: {}\n").unwrap();
+        e.head = None;
+        // a push with no branch cannot satisfy a branch filter
+        assert!(matches!(decide(&w, &e), Decision::Skip { .. }));
+        let w = parse(
+            "a.yml",
+            "on:\n  pull_request:\n    branches-ignore: [main]\njobs: {}\n",
+        )
+        .unwrap();
+        assert!(matches!(decide(&w, &ev(&["a"])), Decision::Skip { .. }));
+        let mut other = ev(&["a"]);
+        other.base = "dev".into();
+        assert!(matches!(decide(&w, &other), Decision::Run { .. }));
+    }
+
+    #[test]
+    fn a_workflow_with_no_triggers_says_so() {
+        let w = parse("a.yml", "jobs: {}\n").unwrap();
+        assert_eq!(
+            decide(&w, &ev(&["a"])),
+            Decision::Skip {
+                reason: "only no triggers".into()
             }
         );
     }

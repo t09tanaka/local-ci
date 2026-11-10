@@ -132,4 +132,25 @@ mod tests {
         assert!(expand(&json!({"project": []})).is_err());
         assert!(expand(&json!("x")).is_err());
     }
+
+    #[test]
+    fn scalar_values_are_single_variants_and_expressions_are_refused() {
+        let c = expand(&json!({"os": "linux", "node": 20})).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].get("os"), Some(&json!("linux")));
+        assert_eq!(c[0].get("node"), Some(&json!(20)));
+        let err = expand(&json!({"os": "${{ fromJSON(x) }}"})).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("`os` is an unevaluated expression"));
+        // a plain string is a value, not an expression
+        assert_eq!(expand(&json!({"os": "a$b"})).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn include_entries_that_are_not_mappings_are_skipped() {
+        let c = expand(&json!({"os": ["a"], "include": ["x", 3, {"os": "b"}]})).unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].get("os"), Some(&json!("b")));
+    }
 }

@@ -103,9 +103,8 @@ pub(crate) fn matrix_plan(job: &JobSpec) -> MatrixPlan {
     };
     match m {
         MatrixValue::Map(_) if !m.has_expression() => match crate::matrix::expand(&m.to_json()) {
-            // no variant at all is a job that runs nothing: keep it a plain job
-            Ok(c) if !c.is_empty() => MatrixPlan::Static(c),
-            Ok(_) => MatrixPlan::None,
+            // `expand` never returns no variant: it fails instead
+            Ok(c) => MatrixPlan::Static(c),
             Err(_) => MatrixPlan::Dynamic("matrix".into()),
         },
         MatrixValue::String(s) => MatrixPlan::Dynamic(s.clone()),
