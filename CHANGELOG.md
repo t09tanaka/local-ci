@@ -150,7 +150,96 @@
 - `exec` refuses a shard task whose runner cannot divide its tests the way the
   task says (a listed split for a runner that cannot target tests, a native
   split for one without a shard feature of its own).
-- The plan schema version is 5; a plan of version 4 is refused by name.
+- The plan schema version is 6; a plan of an earlier version is refused by
+  name (`plan schema version N is not supported (this is 6)`).
+- New `plan_task_demand(&FrozenPlan, task_id)` (`demand` module): the commands
+  a task will start, as plain data that depends on no scheduler: for each
+  `run` step its id, label, working directory (relative to the workspace, in
+  its plain form), `argv`, the key its history is kept under (the `key` a run
+  hands an executor; `None` when the label holds an expression), a weight
+  hint, the node before it, and `conditional: true` where the step may not
+  run (an `if:`, a matrix that is an expression, an install a receipt may have
+  done, an install skipped where its tool is missing). `argv` is what the
+  executor is asked to start: the step's shell with `{script}` (`SCRIPT`) in
+  place of the script file, for the step that runs the tests of a shard as
+  for any other (a shard's command is its script; `weight.tests` counts the
+  tests). It fails for a task that could not run (unknown task, a shell that
+  cannot be run, a shard without a command or whose directory is not the
+  step's) and for a working directory that is absolute or holds `..`, a
+  backslash or a NUL.
+- `schema_version` (`#[serde(default)]`, reading as 1 when absent) is on
+  `SetupRecipe`, `PreparedReceipt`, `TaskInputs`, `TaskResult`,
+  `ExecutionTask` and `JobGraph`, and `wire::Digested::digest` gives each of
+  them (and the wire results below) a `sha256:` digest of its canonical JSON.
+  The digest is not a field: the sender sends it next to the document and the
+  reader checks it with `verify_digest`. `execute_task`, `execute_setup` and
+  `verify_task_result` refuse a version other than `wire::WIRE_SCHEMA_VERSION`.
+- New `result_wire` module: `WireRunResult` and `WireTaskResult` are
+  `RunResult` and `TaskResult` as they cross between hosts: logs are paths
+  relative to the directory of the run or task, and there is no `run_dir`.
+  They read back (`into_run_result(run_dir)`, `into_task_result(dir)`) with a
+  directory of the receiver's, and refuse a log path that is absolute, holds
+  `..`, a backslash or a control character, or leaves the directory; a version
+  this build does not read; an artifact name that is not one file name (the
+  rule of the artifact area: not `.` or `..`, at most 200 bytes, no
+  separator); JSON over 64 MiB; more than 100 000 units, jobs and steps
+  together (`MAX_WIRE_ITEMS`); and a string over 4 KiB (`MAX_WIRE_STRING`; a
+  step note, 64 KiB). `schema_version` is required in them (the types the
+  engine reads from its own disk still read a missing one as the first), and a
+  key they do not know is refused, except in the step and job results, which
+  hold a flattened field serde cannot refuse a key of.
+  `validate_wire_run_result` is `validate_run_result` for such a result.
+  `complete::Verdict` and `Completeness` now also derive `Deserialize`. The
+  JSON `local-ci run` and `local-ci status` write is unchanged (pinned
+  byte for byte by a test, for the saved `result.json` and the task result
+  too).
+- `wire::Digested::from_json_checked(text, digest)` reads a document the way a
+  receiver must (parse, version, digest, in that order); `Digested` types
+  report their `schema_version`. A digest is defined only for what this
+  implementation's serializer writes (a duration is a floating-point number),
+  so another implementation may not reproduce it.
+- `source::export_objects` also puts the index tree (what is staged) in the
+  bundle, as a parentless commit of its own under
+  `refs/local-ci/index/<source id>`, and `import_objects` takes that ref (and
+  the snapshot refs of the source and its dirty submodules, by name, not by
+  pattern) and refuses a bundle that lacks it, carries another tree than the
+  manifest names, or an index commit with a history, so a worker can tell what
+  was staged (`git diff --cached`). A capture now keeps that ref next to the
+  snapshot ref, so a prune of the store does not take the tree; an export
+  writes it only when it is not the same already (two exports at once do not
+  fight over the ref's lock). A source captured by the previous build and
+  pruned since cannot be exported (its index tree is gone), and a bundle made
+  by the previous build is refused by an import.
+  `source::remove_imported_refs(ctx, clone_dir, source_id)` removes the two
+  refs an import made; the worker that owns the clone calls it from its own
+  garbage collection.
+- `.local-ci.toml`: a `secret_files` entry written as a table refuses a key it
+  does not know (`requird = true` was read as `required = false`).
+- Breaking changes for external code:
+  - The plan schema version is 6 (a plan of version 5 is refused by name):
+    `ExecutionTask` and `JobGraph` carry `schema_version`, so every digest
+    changed.
+  - `SetupRecipe`, `PreparedReceipt`, `TaskInputs`, `TaskResult`,
+    `ExecutionTask` and `JobGraph` have the new field `schema_version: u32`.
+    A struct literal outside this crate adds it
+    (`schema_version: local_ci::wire::WIRE_SCHEMA_VERSION`, or
+    `..Default::default()` for the types that have a `Default`).
+  - `SetupRecipe`, `TaskInputs` and `JobGraph` no longer derive `Default`;
+    they implement it by hand (the current version, nothing else).
+  - `TaskResult` and `ExecutionTask` literals add `schema_version` too (as
+    named above), and `wire::Digested` has the required method
+    `schema_version`.
+  - `source::export_objects` writes `refs/local-ci/index/<source id>` in the
+    store and fails when the index tree of the source is not in the store.
+    `import_objects` needs the index ref in the bundle (a bundle made by the
+    previous build is refused) and imports only the named refs.
+  - `export_objects` and `import_objects` (`check_ids`) refuse a manifest
+    whose index or worktree tree is not 40 hexadecimal digits, as they
+    already did for the commits.
+  - A plan of an earlier schema version is refused with the one message
+    `plan schema version N is not supported (this is 6)`.
+  - `demand::WORKSPACE` does not exist: a shard's step is listed as its shell
+    on `{script}`.
 
 ## [0.9.0] - 2026-11-10
 

@@ -82,8 +82,11 @@ impl JobOutcome {
 
 /// What a task is given about the jobs it needs, by job id. Jobs of the same
 /// task are not listed: they are run in order and see each other.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskInputs {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     pub needs: BTreeMap<String, JobOutcome>,
     /// The run was cancelled: what `cancelled()` answers in a job, whether or
     /// not a job it needs was cancelled. A coordinator sets it for the tasks it
@@ -91,6 +94,27 @@ pub struct TaskInputs {
     /// outcomes it is given.
     #[serde(default)]
     pub run_cancelled: bool,
+}
+
+impl crate::wire::Digested for TaskInputs {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for TaskResult {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl Default for TaskInputs {
+    fn default() -> Self {
+        TaskInputs {
+            schema_version: crate::wire::wire_version(),
+            needs: BTreeMap::new(),
+            run_cancelled: false,
+        }
+    }
 }
 
 impl TaskInputs {
@@ -104,6 +128,7 @@ impl TaskInputs {
         cancel_requested: bool,
     ) -> Self {
         TaskInputs {
+            schema_version: crate::wire::wire_version(),
             needs: needs
                 .into_iter()
                 .map(|o| (o.job.clone(), o.clone()))
@@ -136,6 +161,9 @@ pub(crate) fn ctx_of(o: &JobOutcome) -> Value {
 /// What running a task produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     pub task: String,
     /// Each job (each matrix entry) with its steps, as a run reports them.
     pub jobs: Vec<JobResult>,
@@ -272,6 +300,7 @@ pub fn execute_setup(
     ws: &Workspace,
     opts: Opts,
 ) -> Result<PreparedSetup> {
+    crate::wire::check_version("setup recipe", recipe.schema_version)?;
     let runner = Runner::new(ctx, fp, ws, opts);
     runner.prepare_tools()?;
     let r = runner.run_recipe(recipe, key.digest());
@@ -309,6 +338,10 @@ pub fn execute_task(
     let task = fp
         .task(task_id)
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
+    crate::wire::check_version("task inputs", inputs.schema_version)?;
+    if let Some((receipt, _)) = prepared {
+        crate::wire::check_version("receipt", receipt.schema_version)?;
+    }
     let keep = opts.keep;
     let runner = Runner::new(ctx, fp, ws, opts);
     // as in a run: an artifact step local-ci cannot run fails the task's jobs

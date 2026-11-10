@@ -272,6 +272,203 @@ fn a_step_reaches_the_executor_with_what_it_needs_and_nothing_is_started_here() 
     assert!(l.dir.exists());
 }
 
+const SHARDED: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  t:\n    runs-on: x\n    defaults:\n      run:\n        shell: sh\n    steps:\n      - run: cargo test\n";
+
+/// The step that runs the tests of a shard is listed as its shell on the
+/// script, as every step is, and that is what the executor is asked to start.
+#[test]
+fn the_demand_of_a_shard_step_is_the_shell_the_executor_starts() {
+    use local_ci::shard::adapters::{CargoTest, Safety};
+    use local_ci::shard::{partition_tests, Discovered, History, PartitionOpts};
+    let mut l = lab_for(SHARDED);
+    let a = CargoTest::from_command("1", "cargo test", Safety::default()).unwrap();
+    let d = Discovered {
+        tests: ["a", "b", "c", "d"].map(String::from).to_vec(),
+        complete: true,
+        blocked: vec![],
+    };
+    let plan = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
+    l.fp =
+        l.fp.with_shards(&[local_ci::dag::ShardRequest {
+            workflow: W1.into(),
+            job: "t".into(),
+            plan,
+            step: 0,
+            dir: String::new(),
+            discovered: d,
+            fail_fast: true,
+        }])
+        .unwrap();
+    let id =
+        l.fp.tasks
+            .iter()
+            .find(|t| t.shard.is_some())
+            .unwrap()
+            .id
+            .clone();
+    let demand = local_ci::plan_task_demand(&l.fp, &id).unwrap();
+    assert_eq!(demand.nodes.len(), 1);
+    assert_eq!(demand.nodes[0].argv, ["sh", "-e", local_ci::demand::SCRIPT]);
+    let rec = Recorder::new(Exit::Code(0), None);
+    let opts = Opts {
+        parallel: 1,
+        traffic_controller: None,
+        executor: Some(rec.clone()),
+        portool: None,
+        containers: 1,
+        job_timeout_min: 5.0,
+        keep: true,
+        trash: l.tmp.path().join("lab/trash"),
+    };
+    local_ci::execute_task(
+        &l.ctx,
+        &l.fp,
+        &id,
+        &TaskInputs::default(),
+        None,
+        &l.ws,
+        opts,
+    )
+    .unwrap();
+    let seen = rec.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (script, shell) = seen[0].argv.split_last().unwrap();
+    assert!(script.ends_with(".sh"), "{script}");
+    assert_eq!(shell, &demand.nodes[0].argv[..2]);
+    assert_eq!(l.ws.root.join(&demand.nodes[0].cwd), seen[0].cwd);
+}
+
+#[test]
+fn the_demand_of_a_task_is_what_its_steps_ask_the_executor() {
+    let l = lab_for(TWO_STEPS);
+    let demand = local_ci::plan_task_demand(&l.fp, &l.fp.tasks[0].id).unwrap();
+    let rec = Recorder::new(Exit::Code(0), None);
+    l.run(Some(rec.clone()));
+    let seen = rec.seen.lock().unwrap();
+    assert_eq!(demand.nodes.len(), seen.len());
+    for (n, req) in demand.nodes.iter().zip(seen.iter()) {
+        assert_eq!(n.key, req.key, "{}", n.step_id);
+        assert_eq!(l.ws.root.join(&n.cwd), req.cwd, "{}", n.step_id);
+        // the script file is the one word the host fills in
+        let (script, shell) = req.argv.split_last().unwrap();
+        assert!(script.ends_with(".sh"), "{script}");
+        assert_eq!(n.argv.split_last().unwrap().1, shell);
+        assert_eq!(n.argv.last().unwrap(), local_ci::demand::SCRIPT);
+        assert_eq!(
+            n.weight.timeout_minutes.map(|m| (m * 60.0) as u64),
+            n.weight
+                .timeout_minutes
+                .and(req.timeout.map(|t| t.as_secs())),
+            "{}",
+            n.step_id
+        );
+    }
+}
+
+#[test]
+fn a_task_of_another_wire_version_is_not_started_and_its_result_travels_without_paths() {
+    use local_ci::wire::{Digested, WIRE_SCHEMA_VERSION};
+    use local_ci::WireTaskResult;
+    let l = lab_for(TWO_STEPS);
+    let bad = WIRE_SCHEMA_VERSION + 1;
+    let opts = || Opts {
+        parallel: 1,
+        traffic_controller: None,
+        executor: Some(Recorder::new(Exit::Code(0), None)),
+        portool: None,
+        containers: 1,
+        job_timeout_min: 5.0,
+        keep: true,
+        trash: l.tmp.path().join("lab/trash"),
+    };
+    let id = &l.fp.tasks[0].id;
+    let inputs = TaskInputs {
+        schema_version: bad,
+        ..TaskInputs::default()
+    };
+    let e = local_ci::execute_task(&l.ctx, &l.fp, id, &inputs, None, &l.ws, opts())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("task inputs: schema version"), "{e}");
+    let mut receipt = local_ci::setup::PreparedReceipt::empty("k", "s");
+    receipt.schema_version = bad;
+    let tctx = local_ci::setup::TemplateContext::local(&l.fp, "r");
+    let e = local_ci::execute_task(
+        &l.ctx,
+        &l.fp,
+        id,
+        &TaskInputs::default(),
+        Some((&receipt, &tctx)),
+        &l.ws,
+        opts(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("receipt: schema version"), "{e}");
+
+    let recipe = local_ci::setup::SetupRecipe {
+        schema_version: bad,
+        ..Default::default()
+    };
+    let key = recipe.template_key(&tctx);
+    let e = local_ci::execute_setup(&l.ctx, &l.fp, &recipe, &key, &l.ws, opts())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("setup recipe: schema version"), "{e}");
+
+    // a result as the worker made it, and as it crosses: no path of the host
+    let r = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert_eq!(r.schema_version, WIRE_SCHEMA_VERSION);
+    assert!(r.jobs[0].steps[0].log.is_some());
+    let wire = WireTaskResult::from_task_result(&r, &l.ws.run_dir).unwrap();
+    let text = serde_json::to_string(&wire).unwrap();
+    assert!(!text.contains(l.ws.run_dir.to_str().unwrap()), "{text}");
+    assert!(
+        text.contains("\"log\":\"one-a/01-echo-first.log\""),
+        "{text}"
+    );
+    let back = WireTaskResult::from_json(&text)
+        .unwrap()
+        .into_task_result(&l.ws.run_dir)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&back).unwrap(),
+        serde_json::to_value(&r).unwrap()
+    );
+    assert_eq!(wire.digest().unwrap(), wire.digest().unwrap());
+    // the coordinator puts its own directory back
+    let elsewhere = std::path::Path::new("/coordinator/run");
+    let moved = WireTaskResult::from_json(&text)
+        .unwrap()
+        .into_task_result(elsewhere)
+        .unwrap();
+    assert!(moved.jobs[0].steps[0]
+        .log
+        .as_ref()
+        .unwrap()
+        .starts_with(elsewhere));
+    // a log of another directory is not carried
+    let e = WireTaskResult::from_task_result(&r, std::path::Path::new("/else/where"))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("outside"), "{e}");
+    // a version of another build is refused
+    let mut other = wire.clone();
+    other.schema_version = bad;
+    assert!(other.into_task_result(&l.ws.run_dir).is_err());
+    // and a result that says it is of another version is a problem of the task
+    let mut r2 = r;
+    r2.schema_version = bad;
+    let problems = local_ci::verify_task_result(&l.fp.tasks[0], &r2);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("task result: schema version")),
+        "{problems:?}"
+    );
+}
+
 #[test]
 fn what_the_executor_returns_is_how_the_step_ended() {
     // a failing exit

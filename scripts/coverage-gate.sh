@@ -20,6 +20,8 @@ want = {
     "src/shard/adapters.rs",
     "src/shard/coverage.rs",
     "src/shard/isolation.rs",
+    "src/demand.rs",
+    "src/result_wire.rs",
 }
 seen = set()
 bad = []

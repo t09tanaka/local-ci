@@ -134,7 +134,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # without the `browser-tests` feature: the gate measures the unit tests of
       # the adapters, not a browser
-      - name: 100% line coverage on matrix / filter / gate / dag / frozen / artifact / shard
+      - name: 100% line coverage on matrix / filter / gate / dag / frozen / artifact / shard / demand / result_wire
         run: ./scripts/coverage-gate.sh
 
   # Each mutant reruns the tests, so a module is checked against the test
@@ -180,7 +180,7 @@ jobs:
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh src/frozen.rs
       - name: zero survivors in frozen
-        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
 
   mutants-shard:
     name: mutation gate (shard)
@@ -195,3 +195,31 @@ jobs:
         run: scripts/mutation-targets-check.sh src/shard.rs
       - name: zero survivors in shard
         run: cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
+
+  mutants-demand:
+    name: mutation gate (demand)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/demand.rs
+      - name: zero survivors in demand
+        run: cargo schemata --file src/demand.rs -- --lib --test task_demand
+
+  mutants-wire:
+    name: mutation gate (wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/wire.rs src/result_wire.rs src/digest.rs
+      - name: zero survivors in wire, result_wire and digest
+        run: cargo schemata --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag

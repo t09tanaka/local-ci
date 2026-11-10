@@ -17,6 +17,8 @@ use crate::workflow::{Job, Service, Step, Trigger, Workflow};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as Y;
 
+pub use crate::digest::Digested;
+
 /// A matrix (or any part of one) as data with a fixed order.
 ///
 /// Mapping keys are strings. A key that is not a string in the YAML is written
@@ -396,6 +398,32 @@ impl UnitSpec {
     }
 }
 
+/// The version of the types that cross between a coordinator and a worker:
+/// [`crate::setup::SetupRecipe`], [`crate::setup::PreparedReceipt`],
+/// [`crate::task::TaskInputs`], [`crate::task::TaskResult`],
+/// [`crate::dag::ExecutionTask`], [`crate::dag::JobGraph`], and the types of
+/// [`crate::result_wire`] and [`crate::demand`]. Each carries it as
+/// `schema_version`. A document without one was written before it existed and
+/// reads as this version (`#[serde(default = ...)]`); a reader refuses a
+/// version it does not know ([`check_version`]).
+pub const WIRE_SCHEMA_VERSION: u32 = 1;
+
+/// The `schema_version` of a document that has none (see
+/// [`WIRE_SCHEMA_VERSION`]), and of every document this build writes.
+pub fn wire_version() -> u32 {
+    WIRE_SCHEMA_VERSION
+}
+
+/// Fail unless `version` is the one this build reads.
+pub fn check_version(what: &str, version: u32) -> anyhow::Result<()> {
+    if version != WIRE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "{what}: schema version {version} is not supported (this is {WIRE_SCHEMA_VERSION})"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,10 +435,13 @@ mod tests {
         )
         .unwrap();
         let m = MatrixValue::from_yaml(&y);
-        let MatrixValue::Map(entries) = &m else {
-            panic!()
-        };
-        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        let v = serde_json::to_value(&m).unwrap();
+        let keys: Vec<&str> = v["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e[0].as_str().unwrap())
+            .collect();
         assert_eq!(keys, ["os", "1.5", "null", "true", "10", "include"]);
         // spec -> engine value -> spec is the identity
         assert_eq!(MatrixValue::from_yaml(&m.to_yaml()), m);
@@ -421,6 +452,99 @@ mod tests {
         let j = m.to_json();
         assert!(j.as_object().unwrap().contains_key("1.5"));
         assert_eq!(j["include"][0]["n"], serde_json::json!(1000.0));
+    }
+
+    #[test]
+    fn null_tagged_and_composite_yaml_values_and_keys_are_kept() {
+        let y: Y = serde_yaml::from_str("a: null\nb: !t x\n!k c: d\n? [x, y]\n: v\n").unwrap();
+        let m = MatrixValue::from_yaml(&y);
+        let v = serde_json::to_value(&m).unwrap()["value"].clone();
+        assert_eq!(v[0], serde_json::json!(["a", {"type": "null"}]));
+        assert_eq!(
+            v[1],
+            serde_json::json!(["b", {"type": "string", "value": "x"}])
+        );
+        assert_eq!(v[2][0], "c");
+        assert_eq!(v[3][0], "- x\n- y");
+        assert_eq!(MatrixValue::Null.to_yaml(), Y::Null);
+        assert_eq!(MatrixValue::Null.to_json(), serde_json::Value::Null);
+        // a number that is not one is a string again
+        let n = MatrixValue::Number("x".into());
+        assert_eq!(n.to_yaml(), Y::String("x".into()));
+        assert_eq!(n.to_json(), serde_json::json!("x"));
+    }
+
+    #[test]
+    fn a_duplicate_key_is_found_below_a_sequence_too() {
+        let dup = MatrixValue::Map(vec![
+            ("a".into(), MatrixValue::Null),
+            ("a".into(), MatrixValue::Null),
+        ]);
+        assert_eq!(dup.duplicate_key().as_deref(), Some("a"));
+        assert_eq!(
+            MatrixValue::Seq(vec![MatrixValue::Null, dup])
+                .duplicate_key()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            MatrixValue::Seq(vec![MatrixValue::Null]).duplicate_key(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_push_workflow_keeps_the_filter_of_its_push_trigger() {
+        let wf = |event: &str| Selected {
+            wf: Workflow {
+                file: "f.yml".into(),
+                name: "n".into(),
+                triggers: vec![
+                    Trigger {
+                        event: "pull_request".into(),
+                        paths: vec!["pr/**".into()],
+                        ..Trigger::default()
+                    },
+                    Trigger {
+                        event: "push".into(),
+                        paths: vec!["push/**".into()],
+                        paths_ignore: vec!["push/skip/**".into()],
+                        ..Trigger::default()
+                    },
+                ],
+                env: vec![],
+                working_directory: None,
+                shell: None,
+                jobs: vec![],
+            },
+            event: event.into(),
+        };
+        for (event, paths, back) in [
+            ("push", "push/**", "push"),
+            ("pull_request", "pr/**", "pull_request"),
+        ] {
+            let spec = WorkflowSpec::from_selected(&wf(event));
+            assert_eq!(spec.path_filter.as_ref().unwrap().paths, [paths]);
+            let sel = spec.to_selected();
+            assert_eq!(sel.wf.triggers[0].event, back);
+            assert_eq!(sel.wf.triggers[0].paths, [paths]);
+            let ignore: &[&str] = if event == "push" {
+                &["push/skip/**"]
+            } else {
+                &[]
+            };
+            assert_eq!(sel.wf.triggers[0].paths_ignore, ignore);
+        }
+    }
+
+    #[test]
+    fn only_this_schema_version_is_read() {
+        assert_eq!(wire_version(), WIRE_SCHEMA_VERSION);
+        check_version("x", WIRE_SCHEMA_VERSION).unwrap();
+        for v in [0, WIRE_SCHEMA_VERSION + 1] {
+            let e = check_version("a recipe", v).unwrap_err().to_string();
+            assert!(e.starts_with("a recipe: schema version"), "{e}");
+        }
     }
 
     #[test]

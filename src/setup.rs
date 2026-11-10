@@ -105,14 +105,40 @@ pub struct ToolchainRequirement {
 }
 
 /// What a task prepares before its own steps.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetupRecipe {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     pub task: String,
     /// In the order they run.
     pub steps: Vec<RecipeStep>,
     /// Preparation that stays in its job, with the reason.
     pub left_in_place: Vec<LeftInPlace>,
     pub toolchain: Vec<ToolchainRequirement>,
+}
+
+impl crate::wire::Digested for SetupRecipe {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for PreparedReceipt {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl Default for SetupRecipe {
+    fn default() -> Self {
+        SetupRecipe {
+            schema_version: crate::wire::wire_version(),
+            task: String::new(),
+            steps: vec![],
+            left_in_place: vec![],
+            toolchain: vec![],
+        }
+    }
 }
 
 impl SetupRecipe {
@@ -390,6 +416,9 @@ pub struct ArtifactDigest {
 /// The steps of a recipe that were really prepared in a workspace.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedReceipt {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     /// Digest of the [`TemplateKey`] it was made for.
     pub template_key: String,
     /// The commit it was prepared on.
@@ -421,6 +450,7 @@ impl PreparedReceipt {
     /// A receipt that prepared nothing.
     pub fn empty(template_key: &str, source: &str) -> Self {
         PreparedReceipt {
+            schema_version: crate::wire::wire_version(),
             template_key: template_key.into(),
             source: source.into(),
             workspace: String::new(),
@@ -448,6 +478,7 @@ impl PreparedReceipt {
     /// What this receipt says about the steps of `recipe` only, under `key`.
     pub fn restricted_to(&self, recipe: &SetupRecipe, key: &TemplateKey) -> PreparedReceipt {
         PreparedReceipt {
+            schema_version: crate::wire::wire_version(),
             template_key: key.digest().into(),
             source: self.source.clone(),
             workspace: self.workspace.clone(),

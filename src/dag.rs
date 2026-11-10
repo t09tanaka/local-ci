@@ -85,9 +85,32 @@ pub struct JobNode {
 
 /// The jobs of the plan as a DAG. `nodes` are in dependency order (a node
 /// comes after everything it depends on), otherwise in plan order.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobGraph {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     pub nodes: Vec<JobNode>,
+}
+
+impl crate::wire::Digested for JobGraph {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+impl crate::wire::Digested for ExecutionTask {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl Default for JobGraph {
+    fn default() -> Self {
+        JobGraph {
+            schema_version: crate::wire::wire_version(),
+            nodes: vec![],
+        }
+    }
 }
 
 impl JobGraph {
@@ -261,7 +284,10 @@ fn order(nodes: Vec<JobNode>) -> Result<JobGraph> {
             }
         }
     }
-    Ok(JobGraph { nodes: done })
+    Ok(JobGraph {
+        nodes: done,
+        ..JobGraph::default()
+    })
 }
 
 // ---- tasks ----
@@ -335,6 +361,9 @@ pub struct TaskVariant {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionTask {
+    /// See [`crate::wire::WIRE_SCHEMA_VERSION`].
+    #[serde(default = "crate::wire::wire_version")]
+    pub schema_version: u32,
     pub id: String,
     /// The workflow file.
     pub workflow: String,
@@ -665,6 +694,7 @@ pub(crate) fn derive_tasks(
                 }
             });
             let base = ExecutionTask {
+                schema_version: crate::wire::wire_version(),
                 id: String::new(),
                 workflow: wf.file.clone(),
                 jobs: ids.clone(),

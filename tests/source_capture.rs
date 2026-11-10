@@ -6,8 +6,9 @@
 mod common;
 use local_ci::source::{
     capture_directory, capture_source, export_objects, import_objects, materialize_secrets,
-    materialize_source, publishable, seal_manifest, secret_digest, CaptureOptions, ObjectStore,
-    SecretBundle, SecretSpec, SourceError, SourceInfo, SourceKind, Stage,
+    materialize_source, publishable, remove_imported_refs, seal_manifest, secret_digest,
+    CaptureOptions, ObjectStore, SecretBundle, SecretSpec, SourceError, SourceInfo, SourceKind,
+    Stage,
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
@@ -1545,6 +1546,273 @@ fn a_tracked_file_that_matches_secret_files_is_commit_content_and_warns() {
     // it is in the tree, so the tree is still HEAD's
     let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
     publishable(&c, &f.dir, &SourceInfo::of(m), &head).unwrap();
+}
+
+fn clone_of(f: &Fixture, name: &str) -> PathBuf {
+    let fresh = f.home.join(name);
+    git(
+        f.dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    fresh
+}
+
+fn has(dir: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", sha])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn the_index_tree_reaches_the_worker_so_that_what_was_staged_can_be_told() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let itree = m.index_tree.clone().unwrap();
+    let head = m.original_head.clone().unwrap();
+    let fresh = clone_of(&f, "fresh");
+    assert!(!has(&fresh, &format!("{itree}^{{tree}}")));
+
+    let bundle = export_objects(&c, &m).unwrap();
+    import_objects(&c, &fresh, &bundle, &m).unwrap();
+    assert!(has(&fresh, &format!("{itree}^{{tree}}")));
+    // `git diff --cached` of the original, from the worker
+    let staged = git_out(&fresh, &["diff", "--name-only", &head, &itree]);
+    assert_eq!(staged, "staged.txt\nstaged_then_changed.txt");
+    let want = git_out(&f.dir, &["diff", "--cached", "--name-only"]);
+    assert_eq!(staged, want);
+    // a commit of its own, with no parent, under a ref of its own
+    let r = format!("refs/local-ci/index/{}", m.source_id);
+    assert_eq!(
+        git_out(&fresh, &["rev-parse", &format!("{r}^{{tree}}")]),
+        itree
+    );
+    assert_eq!(git_out(&fresh, &["rev-list", "--count", &r]), "1");
+    assert!(!git_out(&f.dir, &["for-each-ref"]).contains("local-ci"));
+
+    // exporting again, also from several threads at once, gives a bundle that
+    // imports the same way
+    let results: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4).map(|_| s.spawn(|| export_objects(&c, &m))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let again = clone_of(&f, "again");
+    for r in results {
+        import_objects(&c, &again, &r.unwrap(), &m).unwrap();
+    }
+    assert!(has(&again, &format!("{itree}^{{tree}}")));
+}
+
+#[test]
+fn a_bundle_without_the_index_tree_is_not_taken_for_the_capture() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let private = private_repo_of(&f.home);
+    // only the snapshot, as a bundle made without the index commit has it
+    let old = f.home.join("old.bundle");
+    git(
+        &private,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            old.to_str().unwrap(),
+            &format!("refs/local-ci/snapshots/{}", m.source_id),
+        ],
+    );
+    let fresh = clone_of(&f, "fresh");
+    let err = import_objects(&c, &fresh, &old, &m).unwrap_err();
+    assert!(format!("{err:#}").contains("index"), "{err:#}");
+
+    // the manifest names a tree that is not the one the bundle carries
+    let bundle = export_objects(&c, &m).unwrap();
+    let mut other = m.clone();
+    other.index_tree = other.worktree_tree.clone();
+    let other = seal_manifest(other);
+    let err = import_objects(&c, &fresh, &bundle, &other).unwrap_err();
+    assert!(format!("{err}").contains("index tree"), "{err}");
+    // an index tree that is not in the store cannot be exported
+    let mut gone = m.clone();
+    gone.index_tree = Some("0123456789012345678901234567890123456789".into());
+    let err = export_objects(&c, &gone).unwrap_err();
+    assert!(format!("{err:#}").contains("index tree"), "{err:#}");
+    // and one that is not an id at all is refused before git sees it
+    let mut odd = m.clone();
+    odd.index_tree = Some("--output=x".into());
+    let odd = seal_manifest(odd);
+    assert!(format!("{}", export_objects(&c, &odd).unwrap_err()).contains("not a tree id"));
+    assert!(
+        format!("{}", import_objects(&c, &fresh, &bundle, &odd).unwrap_err())
+            .contains("not a tree id")
+    );
+}
+
+#[test]
+fn the_capture_keeps_the_index_tree_under_a_ref_so_that_a_prune_cannot_take_it() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let itree = m.index_tree.clone().unwrap();
+    let private = private_repo_of(&f.home);
+    let r = format!("refs/local-ci/index/{}", m.source_id);
+    assert_eq!(
+        git_out(&private, &["rev-parse", &format!("{r}^{{tree}}")]),
+        itree
+    );
+    assert_eq!(git_out(&private, &["rev-list", "--count", &r]), "1");
+    git(&private, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&private, &["gc", "-q", "--prune=now"]);
+    assert!(has(&private, &format!("{itree}^{{tree}}")));
+    export_objects(&c, &m).unwrap();
+
+    // a source captured by a build that kept no such ref, and pruned since,
+    // cannot be exported: its index tree is gone
+    git(&private, &["update-ref", "-d", &r]);
+    git(&private, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&private, &["gc", "-q", "--prune=now"]);
+    assert!(!has(&private, &format!("{itree}^{{tree}}")));
+    let err = export_objects(&c, &m).unwrap_err();
+    assert!(format!("{err:#}").contains("index tree"), "{err:#}");
+}
+
+#[test]
+fn an_export_that_changes_nothing_does_not_write_the_ref_and_a_locked_one_is_an_error() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let private = private_repo_of(&f.home);
+    let r = format!("refs/local-ci/index/{}", m.source_id);
+    // a ref somebody else is writing right now: the same value is not written
+    let lock = private.join(format!("{r}.lock"));
+    std::fs::write(&lock, "").unwrap();
+    export_objects(&c, &m).unwrap();
+    // another value would have to be written, and cannot be
+    std::fs::remove_file(&lock).unwrap();
+    git(&private, &["update-ref", "-d", &r]);
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "").unwrap();
+    let err = export_objects(&c, &m).unwrap_err();
+    assert!(format!("{err:#}").contains("lock"), "{err:#}");
+    // and once the lock is gone, it is written
+    std::fs::remove_file(&lock).unwrap();
+    export_objects(&c, &m).unwrap();
+    assert_eq!(
+        git_out(&private, &["rev-parse", &format!("{r}^{{tree}}")]),
+        m.index_tree.clone().unwrap()
+    );
+}
+
+#[test]
+fn only_the_refs_of_the_source_are_taken_from_a_bundle_and_the_index_commit_has_no_history() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let private = private_repo_of(&f.home);
+    let snap = format!("refs/local-ci/snapshots/{}", m.source_id);
+    let idx = format!("refs/local-ci/index/{}", m.source_id);
+    let commit = m.execution_commit.clone().unwrap();
+    let itree = m.index_tree.clone().unwrap();
+    let head = m.original_head.clone().unwrap();
+    // a bundle that carries more refs than the source's own
+    let other = "src-00000000000000000000000000000000";
+    git(
+        &private,
+        &[
+            "update-ref",
+            &format!("refs/local-ci/snapshots/{other}"),
+            &commit,
+        ],
+    );
+    git(
+        &private,
+        &["update-ref", "refs/local-ci/index/other", &commit],
+    );
+    git(&private, &["update-ref", "refs/heads/loose", &commit]);
+    let wide = f.home.join("wide.bundle");
+    git(
+        &private,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            wide.to_str().unwrap(),
+            &snap,
+            &idx,
+            &format!("refs/local-ci/snapshots/{other}"),
+            "refs/local-ci/index/other",
+            "refs/heads/loose",
+        ],
+    );
+    let fresh = clone_of(&f, "fresh");
+    import_objects(&c, &fresh, &wide, &m).unwrap();
+    let refs = git_out(
+        &fresh,
+        &["for-each-ref", "--format=%(refname)", "refs/local-ci"],
+    );
+    assert_eq!(refs, format!("{idx}\n{snap}"), "{refs}");
+    assert!(!git_out(&fresh, &["for-each-ref", "refs/heads"]).contains("loose"));
+
+    // an index commit with a history is not the commit around the tree
+    let with_parent = git_out(&private, &["commit-tree", &itree, "-p", &head, "-m", "x"]);
+    git(&private, &["update-ref", &idx, &with_parent]);
+    let long = f.home.join("long.bundle");
+    git(
+        &private,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            long.to_str().unwrap(),
+            &snap,
+            &idx,
+        ],
+    );
+    let fresh = clone_of(&f, "fresh2");
+    let err = import_objects(&c, &fresh, &long, &m).unwrap_err();
+    assert!(format!("{err}").contains("has a history"), "{err}");
+}
+
+#[test]
+fn the_refs_an_import_made_can_be_removed_by_source_id() {
+    let f = fixture();
+    dirty(&f);
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let fresh = clone_of(&f, "fresh");
+    import_objects(&c, &fresh, &export_objects(&c, &m).unwrap(), &m).unwrap();
+    let local = || {
+        git_out(
+            &fresh,
+            &["for-each-ref", "--format=%(refname)", "refs/local-ci"],
+        )
+    };
+    assert!(local().contains(&m.source_id));
+    remove_imported_refs(&c, &fresh, &m.source_id).unwrap();
+    assert_eq!(local(), "");
+    // nothing to remove is not an error; an id that is none is refused
+    remove_imported_refs(&c, &fresh, &m.source_id).unwrap();
+    for odd in [
+        "",
+        "src-x",
+        "../heads/main",
+        "src-0000000000000000000000000000000G",
+    ] {
+        assert!(remove_imported_refs(&c, &fresh, odd).is_err(), "{odd}");
+    }
 }
 
 #[test]

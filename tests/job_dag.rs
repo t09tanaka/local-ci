@@ -534,6 +534,7 @@ fn matrix_outputs_follow_the_matrix_whatever_order_the_variants_finish_in() {
 fn a_task_reads_needs_outputs_and_results_from_its_inputs() {
     let mut lab = Lab::new(WORKFLOW);
     let given = |status, v: &str| TaskInputs {
+        schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
         needs: [(
             "prep".to_string(),
             JobOutcome {
@@ -1183,6 +1184,7 @@ fn cancelled_is_the_run_being_cancelled_and_failure_is_not_cancelled() {
     );
     // a cancelled job alone, with the run not marked cancelled, is not the run being cancelled
     let alone = TaskInputs {
+        schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
         needs: [("a".to_string(), a(Cancelled))].into(),
         run_cancelled: false,
     };

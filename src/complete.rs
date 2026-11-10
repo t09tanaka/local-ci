@@ -19,11 +19,11 @@ use crate::frozen::FrozenPlan;
 use crate::report::RunResult;
 use crate::shard::{merge_with, Merged, Rules, ShardOutcome};
 use crate::task::{JobOutcome, JobStatus, TaskResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Everything the plan expects is there, and nothing was left out.
@@ -39,7 +39,7 @@ pub enum Verdict {
     Invalid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completeness {
     pub verdict: Verdict,
     /// Units the plan expects.
@@ -362,6 +362,9 @@ fn check_outputs(
 /// accepts it.
 pub fn verify_task_result(task: &ExecutionTask, r: &TaskResult) -> Vec<String> {
     let mut out = Vec::new();
+    if let Err(e) = crate::wire::check_version("task result", r.schema_version) {
+        out.push(e.to_string());
+    }
     if r.task != task.id {
         out.push(format!(
             "the result is of task `{}`, not of `{}`",

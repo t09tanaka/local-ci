@@ -29,7 +29,7 @@ pub use materialize::{
 };
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
 pub use store::{ObjectStore, RelPath};
-pub use transfer::{export_from, export_objects, import_objects};
+pub use transfer::{export_from, export_objects, import_objects, remove_imported_refs};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
