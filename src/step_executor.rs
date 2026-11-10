@@ -37,7 +37,19 @@ use std::time::Duration;
 ///   [`CancelHandle::track_pgid`] with its pid as soon as it has one and
 ///   [`CancelHandle::untrack_pgid`] when the command has ended, so that
 ///   [`CancelHandle::cancel`] (which sends `SIGTERM` to the tracked groups,
-///   possibly from a signal handler thread) reaches it.
+///   possibly from a signal handler thread) reaches it. Only the pid of a
+///   process group leader (greater than 1) is tracked; `track_pgid` ignores
+///   anything else. The order is: spawn, `track_pgid`, then check
+///   `req.cancel.is_cancelled()` again and, when it is already cancelled,
+///   send `SIGTERM` to the group yourself (a `cancel` that came before
+///   `track_pgid` did not reach it). `untrack_pgid` must be called on every
+///   way out of `run` (`Ok`, `Err` and a panic); a guard that untracks on
+///   drop is the way to do it.
+/// - **Concurrency.** A matrix job runs its legs at once, up to its
+///   `max_parallel`, so that many calls of `run` on the same instance can be
+///   in progress together. Limiting how many commands run at a time, and the
+///   resources they use, is the implementation's job: `Opts::parallel` does
+///   not do it.
 /// - **Script pipe.** When `req.script_pipe` is set, the command must be
 ///   started with `child_fd` being the read end `read_fd` (a `dup2` between
 ///   fork and exec, which clears close-on-exec on the copy; when
@@ -60,7 +72,10 @@ use std::time::Duration;
 ///   reported as an error, not as a failure).
 /// - **Waiting.** When the command had to wait for resources, report that time
 ///   in [`StepExit::queue_wait_secs`], so it is counted apart from the step's
-///   running time (`wait_queue_secs` of the job's time).
+///   running time (`wait_queue_secs` of the job's time). A value that is
+///   negative, NaN or too large to be a duration counts as 0. local-ci uses
+///   only `queue_wait_secs` for waiting time: [`StepExit::run_secs`] is for
+///   information and is not used.
 pub trait StepExecutor: Send + Sync {
     fn run(&self, req: &StepRequest) -> Result<StepExit>;
 }

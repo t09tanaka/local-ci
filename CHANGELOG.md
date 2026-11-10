@@ -11,6 +11,9 @@
   `CancelHandle::track_pgid` / `untrack_pgid` are now public for this. With no
   executor nothing changes. Code that builds `Opts` by hand adds
   `executor: None`.
+  This is a breaking change for external code: because the field is public,
+  every struct literal of `exec::Opts` outside this crate must add
+  `executor: None` to keep compiling.
 
 ## [0.9.0] - 2026-11-10
 

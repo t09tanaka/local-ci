@@ -2350,8 +2350,10 @@ impl<'a> Runner<'a> {
             r
         };
         // Each combination at once, in its own copy of the workspace, as each
-        // gets its own runner on GitHub. Only with task-traffic-controller, which keeps the CPU
-        // in check, and for exclusive jobs only when they cannot collide.
+        // gets its own runner on GitHub. Only with task-traffic-controller or an
+        // executor, which keep the CPU in check (an executor is called by up to
+        // `max_parallel` legs at once), and for exclusive jobs only when they
+        // cannot collide.
         let at_once = job.max_parallel.unwrap_or(usize::MAX);
         if todo.len() > 1
             && at_once > 1

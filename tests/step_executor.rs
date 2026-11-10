@@ -154,6 +154,26 @@ impl Lab {
     }
 }
 
+impl Lab {
+    fn run_plan(
+        &self,
+        executor: Arc<dyn StepExecutor>,
+        parallel: usize,
+    ) -> local_ci::report::RunResult {
+        let opts = Opts {
+            parallel,
+            traffic_controller: None,
+            executor: Some(executor),
+            portool: None,
+            containers: 1,
+            job_timeout_min: 5.0,
+            keep: true,
+            trash: self.tmp.path().join("lab/trash"),
+        };
+        local_ci::execute_plan(&self.ctx, &self.fp, &self.ws, opts).unwrap()
+    }
+}
+
 fn job(r: &TaskResult) -> &JobResult {
     &r.jobs[0]
 }
@@ -246,7 +266,9 @@ fn a_step_reaches_the_executor_with_what_it_needs_and_nothing_is_started_here() 
     // the executor's wait is the job's queue time, and is not part of its work
     let t = job(&r).time.as_ref().unwrap();
     assert_eq!(t.wait_queue_secs, 3.0);
-    assert!(t.work_secs <= job(&r).secs);
+    // the fake queued 1.5 s on each of two steps; the work is what is left of
+    // local-ci's own clock for the job (the fake runs instantly), never below 0
+    assert_eq!(t.work_secs, (job(&r).secs - 3.0).max(0.0));
     assert!(l.dir.exists());
 }
 
@@ -261,6 +283,20 @@ fn what_the_executor_returns_is_how_the_step_ended() {
     // the job stops at the first failing step
     assert_eq!(rec.seen.lock().unwrap().len(), 1);
     assert_eq!(job(&r).time.as_ref().unwrap().wait_queue_secs, 0.0);
+
+    // an exit by signal, as 128 + the signal
+    let l = lab_for(TWO_STEPS);
+    let r = l.run(Some(Recorder::new(Exit::Code(143), None)));
+    assert_eq!(job(&r).outcome, Outcome::Fail);
+    assert_eq!(job(&r).steps[0].exit, Some(143));
+
+    // a queue wait that is NaN, negative or infinite counts as 0
+    for bad in [f64::NAN, -2.0, f64::INFINITY, f64::NEG_INFINITY] {
+        let l = lab_for(TWO_STEPS);
+        let r = l.run(Some(Recorder::new(Exit::Code(0), Some(bad))));
+        assert_eq!(job(&r).outcome, Outcome::Pass, "{bad}");
+        assert_eq!(job(&r).time.as_ref().unwrap().wait_queue_secs, 0.0, "{bad}");
+    }
 
     // a timeout
     let l = lab_for(TWO_STEPS);
@@ -308,6 +344,17 @@ fn a_cancel_seen_by_the_executor_is_a_cancelled_step() {
 /// group of its own, with the script pipe at `child_fd`.
 struct Spawning {
     argv0_seen: Mutex<Vec<Vec<String>>>,
+    /// Told once the process group is tracked.
+    tracked: Option<std::sync::mpsc::Sender<i32>>,
+}
+
+impl Spawning {
+    fn new() -> Arc<Self> {
+        Arc::new(Spawning {
+            argv0_seen: Mutex::new(vec![]),
+            tracked: None,
+        })
+    }
 }
 
 impl StepExecutor for Spawning {
@@ -342,10 +389,23 @@ impl StepExecutor for Spawning {
         let mut child = cmd.spawn()?;
         let pid = child.id() as i32;
         req.cancel.track_pgid(pid);
+        if let Some(tx) = &self.tracked {
+            let _ = tx.send(pid);
+        }
+        // a cancel that came before the group was tracked did not reach it
+        if req.cancel.is_cancelled() {
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+        }
         let st = child.wait()?;
         req.cancel.untrack_pgid(pid);
+        // a command that ended on a signal is 128 + the signal
+        let code = st.code().unwrap_or_else(|| {
+            128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)
+        });
         Ok(StepExit {
-            exit: Exit::Code(st.code().unwrap_or(1)),
+            exit: Exit::Code(code),
             run_secs: 0.0,
             queue_wait_secs: None,
         })
@@ -356,9 +416,7 @@ impl StepExecutor for Spawning {
 fn an_executor_that_starts_the_command_runs_a_step_including_one_that_reads_its_script_from_a_pipe()
 {
     let l = lab_for(TWO_STEPS);
-    let ex = Arc::new(Spawning {
-        argv0_seen: Mutex::new(vec![]),
-    });
+    let ex = Spawning::new();
     let r = l.run(Some(ex.clone()));
     assert_eq!(job(&r).outcome, Outcome::Pass, "{:?}", job(&r));
     let log = std::fs::read_to_string(job(&r).steps[0].log.as_ref().unwrap()).unwrap();
@@ -366,9 +424,7 @@ fn an_executor_that_starts_the_command_runs_a_step_including_one_that_reads_its_
 
     // a script with the token is read from fd 3, which local-ci writes
     let l = lab_for(TOKEN_JOB);
-    let ex = Arc::new(Spawning {
-        argv0_seen: Mutex::new(vec![]),
-    });
+    let ex = Spawning::new();
     let r = l.run(Some(ex.clone()));
     assert_eq!(job(&r).outcome, Outcome::Pass, "{:?}", job(&r));
     assert!(ex.argv0_seen.lock().unwrap()[0].contains(&"/dev/fd/3".to_string()));
@@ -384,4 +440,121 @@ fn without_an_executor_a_step_is_started_here_as_before() {
     let log = std::fs::read_to_string(job(&r).steps[1].log.as_ref().unwrap()).unwrap();
     assert_eq!(log, "second\n");
     assert_eq!(job(&r).time.as_ref().unwrap().wait_queue_secs, 0.0);
+}
+
+const SLEEPER: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: sleep 60\n";
+const MATRIX: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    strategy:\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.n }}\n";
+
+#[test]
+fn a_command_that_ends_on_a_signal_is_128_plus_the_signal() {
+    let l = lab_for(
+        "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: kill -KILL $$\n",
+    );
+    let r = l.run(Some(Spawning::new()));
+    assert_eq!(job(&r).outcome, Outcome::Fail, "{:?}", job(&r));
+    assert_eq!(job(&r).steps[0].exit, Some(128 + 9));
+}
+
+#[test]
+fn a_cancel_stops_the_tracked_group_and_the_step_is_cancelled() {
+    let l = lab_for(SLEEPER);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ex = Arc::new(Spawning {
+        argv0_seen: Mutex::new(vec![]),
+        tracked: Some(tx),
+    });
+    let cancel = l.ctx.cancel.clone();
+    let canceller = std::thread::spawn(move || {
+        let pg = rx.recv().unwrap();
+        cancel.cancel();
+        pg
+    });
+    let started = std::time::Instant::now();
+    let r = l.run(Some(ex));
+    let pg = canceller.join().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(job(&r).cancelled, "{:?}", job(&r));
+    assert_ne!(job(&r).outcome, Outcome::Pass);
+    // the group is gone (reaped by the executor's wait)
+    assert_eq!(unsafe { libc::killpg(pg, 0) }, -1);
+}
+
+#[test]
+fn when_the_executor_fails_the_script_pipe_is_closed_and_its_writer_is_done() {
+    type Ident = Option<(u64, u64)>;
+    #[allow(clippy::unnecessary_cast)] // the field types differ by platform
+    fn ident(fd: i32) -> Option<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    }
+    struct FailsWithPipe {
+        fd: Mutex<Option<(i32, Ident)>>,
+    }
+    impl StepExecutor for FailsWithPipe {
+        fn run(&self, req: &StepRequest) -> Result<StepExit> {
+            *self.fd.lock().unwrap() = req.script_pipe.map(|p| (p.read_fd, ident(p.read_fd)));
+            Err(anyhow!("refused"))
+        }
+    }
+    let l = lab_for(TOKEN_JOB);
+    let ex = Arc::new(FailsWithPipe {
+        fd: Mutex::new(None),
+    });
+    let r = l.run(Some(ex.clone()));
+    assert!(
+        matches!(&job(&r).outcome, Outcome::Error(e) if e.contains("refused")),
+        "{:?}",
+        job(&r)
+    );
+    let (fd, was) = ex
+        .fd
+        .lock()
+        .unwrap()
+        .expect("a token step has a script pipe");
+    assert!(was.is_some(), "the pipe was open during run");
+    // local-ci closed its read end: the number is either not open any more
+    // (EBADF) or, when another thread has reused it, is no longer that pipe
+    match ident(fd) {
+        None => assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        ),
+        Some(now) => assert_ne!(Some(now), was, "the pipe's read end is still open"),
+    }
+    // the writer thread was joined before the result came back: this thread
+    // would not have returned otherwise, and no thread of ours is left writing
+    assert!(!l.ws.root.join("token.out").exists());
+}
+
+#[test]
+fn the_legs_of_a_matrix_call_the_executor_at_once() {
+    struct Gate {
+        now: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+    impl StepExecutor for Gate {
+        fn run(&self, _: &StepRequest) -> Result<StepExit> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(n, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.now.fetch_sub(1, SeqCst);
+            Ok(StepExit {
+                exit: Exit::Code(0),
+                run_secs: 0.3,
+                queue_wait_secs: None,
+            })
+        }
+    }
+    let l = lab_for(MATRIX);
+    let ex = Arc::new(Gate {
+        now: 0.into(),
+        peak: 0.into(),
+    });
+    let r = l.run_plan(ex.clone(), 3);
+    assert_eq!(r.state, "success", "{}", r.description);
+    assert!(
+        ex.peak.load(std::sync::atomic::Ordering::SeqCst) > 1,
+        "legs ran one after another"
+    );
 }
