@@ -2,8 +2,8 @@
 //! run, on fixture workflows of this file: upload then download across jobs
 //! that `needs` each other, several files and globs, a missing file under each
 //! policy, a second upload of a name, overwrite, matrices, paths that are
-//! refused, receipts that are checked, and options that are errors before the
-//! run.
+//! refused, receipts that are checked, and options that fail their workflow
+//! before the run.
 
 #![allow(clippy::disallowed_methods)] // the test builds the binary's environment
 
@@ -363,9 +363,10 @@ fn a_matrix_uploads_one_artifact_per_variant_and_a_download_merges_them() {
 
     // two variants with one name are refused before the run
     let same = jobs.replace("part-${{ matrix.n }}", "part");
-    let (tmp, dir) = lab(&same);
-    let e = plan(&tmp, &dir).unwrap_err();
-    assert!(e.contains("every variant of the matrix"), "{e}");
+    let (_t, _f, r) = run(&same);
+    assert_eq!(r.state, "error");
+    let e = why(&r, "build");
+    assert!(e.contains("does not tell the variants"), "{e}");
     assert!(e.contains(W1) && e.contains("job `build`"), "{e}");
 }
 
@@ -428,15 +429,17 @@ fn a_download_does_not_leave_the_workspace() {
     assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     // a path that is plainly wrong is refused before the run
     for bad in ["/etc/x", "../x", "a/../../x"] {
-        let (tmp, dir) = lab(&format!("  a:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: d\n          path: {bad}\n"));
-        assert!(plan(&tmp, &dir).is_err(), "{bad}");
-        let (tmp, dir) = lab(&format!("  a:\n    runs-on: x\n    steps:\n      - uses: actions/upload-artifact@v4\n        with:\n          path: {bad}\n"));
-        assert!(plan(&tmp, &dir).is_err(), "{bad}");
+        let (_t, _f, r) = run(&format!("  a:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: d\n          path: {bad}\n"));
+        assert_eq!(r.state, "error", "{bad}");
+        assert!(r.units[0].jobs[0].steps.is_empty(), "{bad}");
+        let (_t, _f, r) = run(&format!("  a:\n    runs-on: x\n    steps:\n      - uses: actions/upload-artifact@v4\n        with:\n          path: {bad}\n"));
+        assert_eq!(r.state, "error", "{bad}");
+        assert!(r.units[0].jobs[0].steps.is_empty(), "{bad}");
     }
 }
 
 #[test]
-fn an_option_local_ci_cannot_honor_is_an_error_before_the_run() {
+fn an_option_local_ci_cannot_honor_fails_its_job_before_the_run() {
     let step = |uses: &str, with: &str| {
         format!("  a:\n    runs-on: x\n    steps:\n      - run: echo before\n      - uses: {uses}\n        with:\n{with}")
     };
@@ -445,38 +448,414 @@ fn an_option_local_ci_cannot_honor_is_an_error_before_the_run() {
         ("actions/download-artifact@v4", "          name: d\n          repository: o/r\n          github-token: ${{ github.token }}\n", "repository"),
         ("actions/download-artifact@v4", "          name: d\n          github-token: ${{ github.token }}\n", "github-token"),
         ("actions/download-artifact@v4", "          artifact-ids: 1\n", "artifact-ids"),
-        ("actions/upload-artifact@v4", "          path: x\n          compression-level: 0\n", "compression-level"),
+        ("actions/upload-artifact@v4", "          path: x\n          compression-level: 10\n", "compression-level"),
         ("actions/upload-artifact@v4", "          path: x\n          retention-days: 0\n", "retention-days"),
         ("actions/upload-artifact@v4", "          name: a/b\n          path: x\n", "not allowed"),
         ("actions/upload-artifact@v3", "          path: x\n", "@v4"),
+        ("actions/upload-artifact@v5", "          path: x\n", "@v4"),
         ("actions/upload-artifact/merge@v4", "          name: x\n", "sub-actions"),
     ] {
+        // the plan is made; the job fails, naming the option, workflow, job and step
         let (tmp, dir) = lab(&step(uses, with));
-        let e = plan(&tmp, &dir).unwrap_err();
-        assert!(e.contains(needle), "{needle}: {e}");
-        assert!(e.contains(W1), "{e}");
-        // and `run` stops before it makes a worktree or a run directory
-        let opts = local_ci::RunOptions {
-            target: target(&dir),
-            parallel: Some(1),
-            no_canirun: true,
-            no_portool: true,
-            containers: 1,
-            keep: false,
-            job_timeout: 5.0,
-            no_cache: true,
-            cache_dir: tmp.path().join("cache2"),
-            source: None,
-        };
-        let e = local_ci::run(&ctx(tmp.path()), opts, &mut Quiet).err().expect("an error");
-        assert!(format!("{e:#}").contains(needle));
-        assert!(!tmp.path().join("cache2/wt").exists());
-        assert!(!tmp.path().join("cache2/runs").exists());
+        plan(&tmp, &dir).unwrap();
+        let (_t, _f, r) = run(&step(uses, with));
+        assert_eq!(r.state, "error", "{needle}");
+        let e = why(&r, "a");
+        for part in [needle, W1, "job `a`", "step `"] {
+            assert!(e.contains(part), "{part}: {e}");
+        }
+        assert!(r.units[0].jobs[0].steps.is_empty(), "nothing of the job ran");
+        // and the JSON result carries it
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(needle) && json.contains("\"result\":\"error\""), "{json}");
     }
     // a third party's action of that name is not ours: it is skipped as before
     let (_t, _f, r) =
         run("  a:\n    runs-on: x\n    steps:\n      - uses: someone/upload-artifact@v4\n");
     assert_eq!(r.state, "incomplete");
+}
+
+/// Options for `local_ci::run` with the results cache on.
+fn cached_opts(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> local_ci::RunOptions {
+    let mut t = target(dir);
+    t.workflows = workflows.iter().map(|w| w.to_string()).collect();
+    local_ci::RunOptions {
+        target: t,
+        parallel: Some(2),
+        no_canirun: true,
+        no_portool: true,
+        containers: 1,
+        keep: false,
+        job_timeout: 5.0,
+        no_cache: false,
+        cache_dir: tmp.path().join("cache3"),
+        source: None,
+    }
+}
+
+fn run_cached(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> RunResult {
+    // a run directory is named by the second it starts in
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    local_ci::run(
+        &ctx(tmp.path()),
+        cached_opts(tmp, dir, workflows),
+        &mut Quiet,
+    )
+    .unwrap()
+    .result
+}
+
+fn is_cached(r: &RunResult, id: &str) -> bool {
+    r.units
+        .iter()
+        .find(|u| u.jobs.iter().any(|j| j.job == id))
+        .unwrap_or_else(|| panic!("no unit of {id}"))
+        .cached
+        .is_some()
+}
+
+#[test]
+fn a_workflow_that_cannot_be_run_fails_alone() {
+    let bad = "  a:\n    runs-on: x\n    steps:\n      - uses: actions/upload-artifact@v4\n        with:\n          path: x\n          github-token: t\n  c:\n    runs-on: x\n    steps:\n      - run: echo fine\n";
+    let (tmp, dir) = lab(bad);
+    std::fs::write(
+        dir.join(".github/workflows/two.yml"),
+        "name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: echo ok\n",
+    )
+    .unwrap();
+    git(&dir, &["add", ".github/workflows/two.yml"]);
+    git(&dir, &["commit", "-qm", "two"]);
+    // planning is not stopped
+    let fp = plan(&tmp, &dir).unwrap();
+    assert_eq!(fp.units.len(), 3);
+    let mut o = cached_opts(&tmp, &dir, &[]);
+    o.no_cache = true;
+    let r = local_ci::run(&ctx(tmp.path()), o.clone(), &mut Quiet)
+        .unwrap()
+        .result;
+    // the workflow with the option fails: every job of it, as an error
+    assert_eq!(r.state, "error");
+    for id in ["a", "c"] {
+        let e = why(&r, id);
+        assert!(e.contains("github-token") && e.contains(W1), "{id}: {e}");
+    }
+    // the other one runs as usual
+    assert_eq!(job(&r, "b").outcome, Outcome::Pass);
+    assert!(!job(&r, "b").steps.is_empty());
+    // jobs a filter leaves out are not looked at
+    o.target.jobs = vec!["c".into()];
+    let r = local_ci::run(&ctx(tmp.path()), o.clone(), &mut Quiet)
+        .unwrap()
+        .result;
+    assert_eq!(job(&r, "c").outcome, Outcome::Pass, "{r:?}");
+    assert!(r
+        .units
+        .iter()
+        .flat_map(|u| &u.jobs)
+        .all(|j| !matches!(j.outcome, Outcome::Error(_))));
+    // but one whose `if:` is decided when it runs is
+    let (_t, _f, r) = run(&bad.replace(
+        "  a:\n    runs-on: x\n",
+        "  a:\n    if: github.event_name == 'nothing'\n    runs-on: x\n",
+    ));
+    assert!(why(&r, "a").contains("github-token"));
+    assert_eq!(r.state, "error");
+}
+
+const SHA: &str = "ea165f8d65b6e75b540449e92b4886f43607fa02";
+
+#[test]
+fn an_action_pinned_to_a_commit_runs_as_v4_with_one_warning() {
+    let jobs = format!(
+        r#"
+  build:
+    runs-on: x
+    steps:
+      - run: mkdir -p out && printf one > out/a.txt
+      - uses: actions/upload-artifact@{SHA} # v4.6.2
+        with:
+          name: bundle
+          path: out
+  test:
+    runs-on: x
+    needs: build
+    steps:
+      - uses: actions/download-artifact@{SHA}
+        with:
+          name: bundle
+          path: got
+      - run: test "$(cat got/a.txt)" = one
+"#
+    );
+    let (_t, _f, r) = run(&jobs);
+    assert_eq!(r.state, "success", "{r:?}");
+    assert!(
+        notes(&r, "build").contains("pinned to a commit"),
+        "{}",
+        notes(&r, "build")
+    );
+    assert_eq!(
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("upload-artifact"))
+            .count(),
+        1,
+        "{:?}",
+        r.warnings
+    );
+    // another major version is still not run, tag or not
+    for v in [
+        "v3",
+        "v5",
+        "ea165f8d65b6e75b540449e92b4886f43607fa0",
+        "ea165f8d65b6e75b540449e92b4886f43607fa02a",
+    ] {
+        let (_t, _f, r) = run(&format!(
+            "  a:\n    runs-on: x\n    steps:\n      - uses: actions/upload-artifact@{v}\n        with:\n          path: x\n"
+        ));
+        assert!(why(&r, "a").contains("only @v4"), "{v}: {}", why(&r, "a"));
+    }
+}
+
+#[test]
+fn compression_level_is_checked_and_recorded_and_changes_nothing() {
+    let jobs = |level: &str| {
+        format!(
+            "  build:\n    runs-on: x\n    steps:\n      - run: mkdir -p out && printf one > out/a.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: bundle\n          path: out\n          compression-level: {level}\n"
+        )
+    };
+    let (_t, _f, plain) = run(&jobs("6").replace("          compression-level: 6\n", ""));
+    let (_t, _f, r) = run(&jobs("6"));
+    assert_eq!(r.state, "success", "{r:?}");
+    let rc = receipt(&r, "bundle", 1);
+    assert_eq!(rc.compression_level, Some(6));
+    assert_eq!(receipt(&plain, "bundle", 1).compression_level, None);
+    assert_eq!(rc.files, receipt(&plain, "bundle", 1).files);
+    let (_t, _f, r) = run(&jobs("0"));
+    assert_eq!(receipt(&r, "bundle", 1).compression_level, Some(0));
+    for bad in ["10", "x", "-1"] {
+        let (_t, _f, r) = run(&jobs(bad));
+        let e = why(&r, "build");
+        assert!(
+            e.contains("compression-level") && e.contains("0 to 9"),
+            "{bad}: {e}"
+        );
+    }
+}
+
+#[test]
+fn an_always_true_condition_keeps_an_upload_required() {
+    for cond in [
+        "always()",
+        "${{ always() }}",
+        "success()",
+        "!cancelled()",
+        "true",
+    ] {
+        let jobs = BUILD.replace(
+            "      - uses: actions/upload-artifact@v4\n",
+            &format!("      - if: {cond}\n        uses: actions/upload-artifact@v4\n"),
+        );
+        let (_t, fp, r) = run(&jobs);
+        assert_eq!(r.state, "success", "{cond}");
+        assert_eq!(fp.tasks[0].verification.artifacts, ["bundle"], "{cond}");
+        std::fs::remove_file(r.run_dir.join("artifacts/bundle/v1/receipt.json")).unwrap();
+        let c = validate_run_result(&fp, &r);
+        assert_eq!(c.verdict, Verdict::Invalid, "{cond}: {c:?}");
+    }
+    // a real condition, or `continue-on-error`, still leaves it optional
+    for step in [
+        "      - if: github.ref == 'refs/heads/main'\n        uses: actions/upload-artifact@v4\n",
+        "      - if: always() && github.ref == 'x'\n        uses: actions/upload-artifact@v4\n",
+        "      - continue-on-error: true\n        uses: actions/upload-artifact@v4\n",
+    ] {
+        let jobs = BUILD.replace("      - uses: actions/upload-artifact@v4\n", step);
+        let (_t, fp, _r) = run(&jobs);
+        assert!(fp.tasks[0].verification.artifacts.is_empty(), "{step}");
+    }
+}
+
+#[test]
+fn a_matrix_upload_name_must_tell_every_variant_apart() {
+    let job = |name: &str, extra: &str| {
+        format!(
+            "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n        node: [1, 2]\n{extra}    steps:\n      - run: mkdir -p out && echo hi > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: {name}\n          path: out\n"
+        )
+    };
+    // one key of two is not enough, with or without overwrite
+    for (name, extra) in [
+        ("r-${{ matrix.os }}", ""),
+        ("r-${{ matrix.node }}", ""),
+        ("r", ""),
+        ("r-${{ matrix.os }}\n          overwrite: true", ""),
+        // a key `include` adds counts too
+        (
+            "r-${{ matrix.os }}-${{ matrix.node }}",
+            "        include:\n          - os: a\n            extra: z\n",
+        ),
+    ] {
+        let (_t, _f, r) = run(&job(name, extra));
+        assert_eq!(r.state, "error", "{name}");
+        let e = why(&r, "m");
+        assert!(e.contains("does not tell the variants"), "{name}: {e}");
+    }
+    let e = {
+        let (_t, _f, r) = run(&job("r-${{ matrix.os }}", ""));
+        why(&r, "m")
+    };
+    assert!(e.contains("matrix.node") && e.contains("m`"), "{e}");
+    // every key or the index of the variant
+    for name in [
+        "r-${{ matrix.os }}-${{ matrix.node }}",
+        "r-${{ strategy.job-index }}",
+    ] {
+        let (_t, _f, r) = run(&job(name, ""));
+        assert_eq!(r.state, "success", "{name}: {r:?}");
+    }
+    // the whole matrix passes the check before the run (what it expands to is
+    // JSON, which a name cannot hold, as on GitHub: that is the run's to say)
+    for name in ["r-${{ matrix }}", "r-${{ toJSON(matrix) }}"] {
+        let (_t, _f, r) = run(&job(name, ""));
+        assert!(
+            !why(&r, "m").contains("does not tell the variants"),
+            "{name}"
+        );
+    }
+}
+
+fn kept_files(cache: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![cache.join("results")];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.to_string_lossy().contains(".artifacts/") && p.ends_with("a.txt") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+const BUILD_ONLY: &str = r#"
+  build:
+    runs-on: x
+    steps:
+      - run: mkdir -p out && printf one > out/a.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: out
+          if-no-files-found: error
+"#;
+
+#[test]
+fn a_unit_that_uploads_is_reused_with_its_artifacts() {
+    let (tmp, dir) = lab(BUILD_ONLY);
+    let first = run_cached(&tmp, &dir, &[]);
+    assert_eq!(first.state, "success", "{first:?}");
+    assert!(!is_cached(&first, "build"));
+    let kept = kept_files(&tmp.path().join("cache3"));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+
+    let second = run_cached(&tmp, &dir, &[]);
+    assert_eq!(second.state, "success", "{second:?}");
+    assert!(is_cached(&second, "build"));
+    // the artifact is in this run's area, under this run's plan and attempt
+    let (a, b) = (receipt(&first, "bundle", 1), receipt(&second, "bundle", 1));
+    assert_eq!(a.restored_from, None);
+    assert_eq!(b.restored_from.as_deref(), Some(a.attempt_id.as_str()));
+    assert_ne!(b.attempt_id, a.attempt_id);
+    assert_eq!(
+        b.attempt_id,
+        second.run_dir.file_name().unwrap().to_string_lossy()
+    );
+    assert_ne!(b.plan_digest, a.plan_digest);
+    assert_eq!(b.files, a.files);
+    assert_eq!(
+        std::fs::read_to_string(second.run_dir.join("artifacts/bundle/v1/files/a.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(artifact_io::published_names(&second.run_dir), ["bundle"]);
+
+    // a file that is not what the receipt says: the unit runs again
+    let f = &kept[0];
+    std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    std::fs::write(f, "tampered").unwrap();
+    let third = run_cached(&tmp, &dir, &[]);
+    assert_eq!(third.state, "success", "{third:?}");
+    assert!(!is_cached(&third, "build"));
+    let c = receipt(&third, "bundle", 1);
+    assert_eq!(c.restored_from, None);
+    assert_eq!(
+        std::fs::read_to_string(third.run_dir.join("artifacts/bundle/v1/files/a.txt")).unwrap(),
+        "one"
+    );
+    // and what that run kept is whole again
+    let fourth = run_cached(&tmp, &dir, &[]);
+    assert!(is_cached(&fourth, "build"));
+}
+
+#[test]
+fn a_unit_that_downloads_is_reused_only_against_the_same_artifact() {
+    let (tmp, dir) = lab(BUILD_ONLY);
+    std::fs::write(
+        dir.join(".github/workflows/two.yml"),
+        "name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  check:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: test \"$(cat got/a.txt)\" = one\n",
+    )
+    .unwrap();
+    git(&dir, &["add", ".github/workflows/two.yml"]);
+    git(&dir, &["commit", "-qm", "two"]);
+    // the uploader first, so the download has its artifact whatever the order
+    let r1 = run_cached(&tmp, &dir, &["one.yml"]);
+    assert_eq!(r1.state, "success", "{r1:?}");
+    // the downloader runs, against the uploader's reused artifact
+    let r2 = run_cached(&tmp, &dir, &[]);
+    assert_eq!(r2.state, "success", "{r2:?}");
+    assert!(is_cached(&r2, "build") && !is_cached(&r2, "check"));
+    // both are reused now
+    let r3 = run_cached(&tmp, &dir, &[]);
+    assert!(is_cached(&r3, "build") && is_cached(&r3, "check"), "{r3:?}");
+    assert_eq!(r3.state, "success", "{r3:?}");
+    // the result of `check` was kept against another artifact: it runs again
+    let cache = tmp.path().join("cache3/results");
+    let mut changed = 0;
+    for e in walk_json(&cache) {
+        let text = std::fs::read_to_string(&e).unwrap();
+        if text.contains("\"downloads\":[[\"bundle\"") {
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["downloads"][0][1] = "0".repeat(64).into();
+            std::fs::write(&e, serde_json::to_string(&v).unwrap()).unwrap();
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1);
+    let r4 = run_cached(&tmp, &dir, &[]);
+    assert!(
+        is_cached(&r4, "build") && !is_cached(&r4, "check"),
+        "{r4:?}"
+    );
+    assert_eq!(r4.state, "success", "{r4:?}");
+}
+
+fn walk_json(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .flat_map(|p| {
+            if p.is_dir() {
+                walk_json(&p)
+            } else if p.extension().is_some_and(|x| x == "json") && !p.ends_with("receipt.json") {
+                vec![p]
+            } else {
+                vec![]
+            }
+        })
+        .collect()
 }
 
 #[test]

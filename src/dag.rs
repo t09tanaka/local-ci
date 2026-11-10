@@ -581,7 +581,8 @@ pub(crate) fn derive_tasks(
                             artifact::required_upload(
                                 s.uses.as_deref()?,
                                 &s.with,
-                                s.cond.is_some() || s.continue_on_error,
+                                s.cond.as_deref().is_some_and(|c| !artifact::always_true(c))
+                                    || s.continue_on_error,
                             )
                         })
                         .collect::<BTreeSet<_>>()

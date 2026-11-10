@@ -266,23 +266,41 @@ each file's relative path, size and SHA-256, the plan digest, the attempt and
 the job) before the step completes. A download reads the receipt, checks every
 file against it and only then places the files, so a job that `needs` the
 uploading job gets exactly what was uploaded. A run is not a `success` while an
-artifact its plan requires (a literal name, a step that always runs, and
-`if-no-files-found: error`) has no receipt. Jobs that use these actions are
-never taken from the results cache.
+artifact its plan requires (a literal name, a step that always runs — no `if:`,
+or one that is only `always()`, `success()`, `!cancelled()` or `true` — and
+`if-no-files-found: error`) has no receipt.
 
-| | Supported | Not supported (an error before the run starts) |
+A step local-ci cannot run (the table below) does not stop planning: the jobs
+of that workflow that the run would start (jobs a `--job` filter leaves out are
+not looked at; jobs whose `if:` is decided when they run are) are not run and
+are reported as an `error`, in the output and in `--json`, naming the option,
+the workflow, the job and the step. The other workflows run as usual.
+
+Units that use these actions are kept in the results cache. A kept result
+carries the artifacts its unit uploaded (receipt and files); reusing it puts
+them into the run's own area, every file checked against its receipt first
+(the receipt then carries this run's plan digest and attempt, and
+`restored_from` says which attempt made it), and a file that does not match
+makes it a miss: the unit runs again. A unit that downloads is reused only when
+each artifact it took (named literally) is, in this run, the same artifact
+(same files, sizes and SHA-256) the result was kept against, which is the case
+when the unit that uploads it is reused too. A download by `pattern`, or by a
+name that is an expression, is never taken from the cache.
+
+| | Supported | Not supported (the workflow's jobs fail before they run) |
 |---|---|---|
-| Action | `actions/upload-artifact@v4`, `actions/download-artifact@v4` | other major versions, sub-actions such as `upload-artifact/merge` |
+| Action | `actions/upload-artifact@v4`, `actions/download-artifact@v4`; a 40-character commit SHA is run as v4 (its version cannot be checked, so the run warns once) | other major versions (`@v3`, `@v5`), sub-actions such as `upload-artifact/merge` |
 | `name` | upload: a name without `/ \ : " < > \| * ?`, default `artifact`; download: one artifact by name | |
 | `path` (upload) | several lines, `*` `?` `**` globs, `!` exclusions, a directory takes what is under it; stored relative to the common ancestor of the lines; hidden files only with `include-hidden-files: true` | an absolute path, `..`, a backslash |
 | Multiple files | yes (sorted, each with its own size and SHA-256) | symlinks are not followed or uploaded |
 | `if-no-files-found` | `warn` (default: the step passes with a warning), `error` (the step fails), `ignore` | other values |
 | `overwrite` | a second upload of a name is a conflict by default; `overwrite: true` records a new version, and a download takes the newest | |
-| Matrix | the name must contain the variant (`name: report-${{ matrix.os }}`) | a name that is the same in every variant |
+| Matrix | the name must read every key of the matrix (`name: report-${{ matrix.os }}-${{ matrix.node }}`; keys that `include` adds count), or the whole matrix (`${{ matrix }}`, `toJSON(matrix)`), or `${{ strategy.job-index }}`; with or without `overwrite` | a name that leaves a key out, so two variants would upload one name |
 | `path` (download) | a directory under the workspace; the default is the workspace itself | an absolute path, `..`, a path through a symlink |
 | `pattern`, `merge-multiple` | yes: without `merge-multiple` each artifact goes to `<path>/<name>/`; two artifacts writing one file is an error | |
 | `retention-days` | 1 to 90, recorded in the receipt (local runs are kept until pruned) | |
-| Across runs, GitHub's side | | `run-id`, `repository`, `github-token`, `artifact-ids`, `skip-decompress`, `compression-level` and any other option |
+| `compression-level` | 0 to 9: accepted, no effect (files are stored as they are); recorded in the receipt | other values |
+| Across runs, GitHub's side | | `run-id`, `repository`, `github-token`, `artifact-ids`, `skip-decompress` and any other option |
 
 A download does not wait for the uploading job to finish: it needs the receipt
 only, so it must run after the job that uploads (`needs:`); a download with no

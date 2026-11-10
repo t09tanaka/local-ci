@@ -72,26 +72,48 @@ pub struct Receipt {
     pub display: String,
     pub task: Option<String>,
     pub retention_days: Option<u32>,
+    /// `compression-level` as written: accepted and recorded, with no effect
+    /// (the files are stored as they are).
+    #[serde(default)]
+    pub compression_level: Option<u32>,
+    /// The attempt this upload was first made in, when the receipt is a
+    /// restore of a kept result (see [`restore_artifacts`]); `attempt_id` and
+    /// `plan_digest` are then the restoring run's.
+    #[serde(default)]
+    pub restored_from: Option<String>,
 }
 
-/// What can be said about the artifact steps of a plan before it runs: every
-/// one is of a supported use with supported options. All problems, one per
-/// step.
-pub fn validate_plan(plan: &Plan) -> Result<(), String> {
+/// What can be said before the run about the artifact steps of the jobs of
+/// workflow `wf` that the plan will run (the jobs a filter left out are not
+/// looked at; a job whose `if:` is decided when it runs is): every step is of
+/// a supported use with supported options. One problem per step, each naming
+/// the workflow, job and step.
+pub fn workflow_problems(plan: &Plan, wf: usize) -> Vec<String> {
+    let w = &plan.selected[wf].wf;
     let mut problems = Vec::new();
-    for sel in &plan.selected {
-        for job in &sel.wf.jobs {
+    for u in plan.units.iter().filter(|u| u.wf == wf) {
+        for id in &u.jobs {
+            let Some(job) = w.jobs.iter().find(|j| &j.id == id) else {
+                continue;
+            };
+            let axes = job
+                .matrix
+                .as_ref()
+                .map(|m| artifact::matrix_axes(&crate::matrix::yaml_to_json(m)));
+            let matrix = match &axes {
+                None => artifact::Matrix::None,
+                Some(None) => artifact::Matrix::Unknown,
+                Some(Some(a)) => artifact::Matrix::Axes(a),
+            };
             for step in &job.steps {
                 let Some(uses) = &step.uses else { continue };
                 let Some(kind) = artifact::parse_uses(uses) else {
                     continue;
                 };
-                let why =
-                    kind.and_then(|k| artifact::validate_with(k, &step.with, job.matrix.is_some()));
-                if let Err(e) = why {
+                if let Err(e) = kind.and_then(|k| artifact::validate_with(k, &step.with, matrix)) {
                     problems.push(format!(
                         "{}: job `{}`, step `{}`: {e}",
-                        sel.wf.file,
+                        w.file,
                         job.id,
                         step.label()
                     ));
@@ -99,14 +121,20 @@ pub fn validate_plan(plan: &Plan) -> Result<(), String> {
             }
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "artifact steps local-ci cannot run:\n  {}",
-            problems.join("\n  ")
-        ))
-    }
+    problems
+}
+
+/// Why the jobs of workflow `wf` are not run, when an artifact step of one of
+/// them cannot be: the same text for each job of the workflow, so a job whose
+/// own steps are fine says what stopped it.
+pub fn workflow_refusal(plan: &Plan, wf: usize) -> Option<String> {
+    let problems = workflow_problems(plan, wf);
+    (!problems.is_empty()).then(|| {
+        format!(
+            "not run: artifact steps local-ci cannot run: {}",
+            problems.join("; ")
+        )
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -222,6 +250,170 @@ pub fn published_by(run_dir: &Path, jobs: &[String]) -> Vec<String> {
                 .any(|r| jobs.contains(&r.job))
         })
         .collect()
+}
+
+/// A kept version of an artifact: its name, version and the digest of its
+/// files ([`artifact::files_digest`]).
+pub type Kept = (String, u32, String);
+
+fn receipt_digest(r: &Receipt) -> String {
+    artifact::files_digest(
+        &r.files
+            .iter()
+            .map(|f| (f.path.clone(), f.size, f.sha256.clone()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The digest of the files of the newest version of `name` in a run, or
+/// `None` when there is none.
+pub fn latest_digest(run_dir: &Path, name: &str) -> Option<String> {
+    latest_receipt(&Area::of_run(run_dir, ""), name).map(|(_, _, r)| receipt_digest(&r))
+}
+
+/// Copy one version (`receipt.json` and `files/`) from `from` to `to`,
+/// checking every file against `receipt` as it is read: what is checked is
+/// what is written. The receipt written is `write` (the same, or the restored
+/// one), last, so a version without it is not a published one.
+fn copy_version(from: &Path, to: &Path, receipt: &Receipt, write: &Receipt) -> Result<()> {
+    for f in &receipt.files {
+        let rel = artifact::stored_rel(&f.path).map_err(|e| anyhow!(e))?;
+        let files = from.join("files");
+        no_symlink_in(&files, &rel)?;
+        let src = files.join(&rel);
+        let meta = fs::symlink_metadata(&src).with_context(|| format!("read {}", src.display()))?;
+        if !meta.is_file() {
+            bail!("`{}` of `{}` is not a file", f.path, receipt.name);
+        }
+        let bytes = fs::read(&src).with_context(|| format!("read {}", src.display()))?;
+        let (size, sha) = digest_of(&bytes);
+        artifact::check_digest(&f.path, &receipt.name, (f.size, &f.sha256), (size, &sha))
+            .map_err(|e| anyhow!(e))?;
+        let dest = to.join("files").join(&rel);
+        fs::create_dir_all(dest.parent().expect("a file has a parent"))?;
+        write_atomic(&dest, &bytes, meta.permissions().mode() & 0o555)?;
+    }
+    fs::create_dir_all(to)?;
+    write_atomic(
+        &to.join("receipt.json"),
+        &serde_json::to_vec_pretty(write)?,
+        0o444,
+    )
+}
+
+/// Keep, in `dest`, every version of an artifact that one of `jobs`
+/// (`<file>::<id>`) uploaded in the run (`<name>/v<N>/` as in the run), each
+/// file checked against its receipt. What is kept, by name, version and
+/// digest. Fails, leaving `dest` to be removed, when a file does not match.
+pub fn save_unit_artifacts(run_dir: &Path, jobs: &[String], dest: &Path) -> Result<Vec<Kept>> {
+    let area = Area::of_run(run_dir, "");
+    let mut kept = Vec::new();
+    for name in published_names(run_dir) {
+        for (n, vdir) in version_dirs(&area.root.join(&name)) {
+            let Some(r) = read_receipt(&vdir) else {
+                continue;
+            };
+            if !jobs.contains(&r.job) {
+                continue;
+            }
+            if r.name != name || r.version != n {
+                bail!(
+                    "the receipt in `{name}/v{n}` is of `{}` v{}",
+                    r.name,
+                    r.version
+                );
+            }
+            copy_version(&vdir, &dest.join(&name).join(format!("v{n}")), &r, &r)?;
+            kept.push((name.clone(), n, receipt_digest(&r)));
+        }
+    }
+    Ok(kept)
+}
+
+/// Put what [`save_unit_artifacts`] kept in `src` into the run's own area, as
+/// if the unit had uploaded it here: every file is checked against its receipt
+/// first, the receipt is rewritten with this run's plan digest and attempt (the
+/// original attempt goes to `restored_from`), and a version is only put where
+/// none is. Nothing is left behind when it fails. `expect` is what the
+/// results cache recorded as kept: anything else in `src` is a failure too.
+pub fn restore_artifacts(
+    src: &Path,
+    run_dir: &Path,
+    plan_digest: &str,
+    expect: &[Kept],
+) -> Result<()> {
+    let area = Area::of_run(run_dir, plan_digest);
+    let mut found: Vec<(String, u32, PathBuf, Receipt)> = Vec::new();
+    for e in fs::read_dir(src)
+        .with_context(|| format!("read {}", src.display()))?
+        .flatten()
+    {
+        if !e.file_type()?.is_dir() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        artifact::runtime_name(&name).map_err(|e| anyhow!(e))?;
+        for (n, vdir) in version_dirs(&e.path()) {
+            let r = read_receipt(&vdir)
+                .ok_or_else(|| anyhow!("`{name}/v{n}` of the kept result has no receipt"))?;
+            if r.name != name || r.version != n {
+                bail!(
+                    "the receipt in `{name}/v{n}` is of `{}` v{}",
+                    r.name,
+                    r.version
+                );
+            }
+            found.push((name.clone(), n, vdir, r));
+        }
+    }
+    let mut got: Vec<Kept> = found
+        .iter()
+        .map(|(n, v, _, r)| (n.clone(), *v, receipt_digest(r)))
+        .collect();
+    got.sort();
+    let mut want = expect.to_vec();
+    want.sort();
+    if got != want {
+        bail!("the kept artifacts are not the ones the result recorded");
+    }
+    let stage = run_dir.join(format!(".restore-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    let mut moved: Vec<PathBuf> = Vec::new();
+    let done = (|| -> Result<()> {
+        let existing: Vec<String> = fs::read_dir(&area.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for (name, n, vdir, r) in &found {
+            artifact::name_collision(&existing, name).map_err(|e| anyhow!(e))?;
+            if area.root.join(name).join(format!("v{n}")).exists() {
+                bail!("`{name}` v{n} is already in this run");
+            }
+            let again = Receipt {
+                plan_digest: area.plan_digest.clone(),
+                attempt_id: area.attempt.clone(),
+                restored_from: Some(r.attempt_id.clone()),
+                ..r.clone()
+            };
+            copy_version(vdir, &stage.join(name).join(format!("v{n}")), r, &again)?;
+        }
+        for (name, n, _, _) in &found {
+            fs::create_dir_all(area.root.join(name))?;
+            let to = area.root.join(name).join(format!("v{n}"));
+            fs::rename(stage.join(name).join(format!("v{n}")), &to)?;
+            moved.push(to);
+        }
+        Ok(())
+    })();
+    if done.is_err() {
+        for m in &moved {
+            let _ = fs::remove_dir_all(m);
+        }
+    }
+    let _ = fs::remove_dir_all(&stage);
+    done
 }
 
 // File work relative to a directory that is held open.
@@ -433,6 +625,8 @@ fn upload_inner(area: &Area, who: &Who, ws: &Path, with: &[(String, String)]) ->
     let hidden = artifact::parse_bool("include-hidden-files", get("include-hidden-files"))
         .map_err(|e| anyhow!(e))?;
     let retention = artifact::parse_retention(get("retention-days")).map_err(|e| anyhow!(e))?;
+    let compression =
+        artifact::parse_compression(get("compression-level")).map_err(|e| anyhow!(e))?;
     let lines = artifact::path_lines(get("path").unwrap_or(""), &ws.to_string_lossy())
         .map_err(|e| anyhow!(e))?;
 
@@ -511,6 +705,8 @@ fn upload_inner(area: &Area, who: &Who, ws: &Path, with: &[(String, String)]) ->
         display: who.display.clone(),
         task: who.task.clone(),
         retention_days: retention,
+        compression_level: compression,
+        restored_from: None,
     };
     // the receipt is written last: a version without one is not published
     write_atomic(

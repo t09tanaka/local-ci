@@ -30,12 +30,31 @@ pub fn parse_uses(uses: &str) -> Option<Result<Kind, String>> {
         }
         _ => return None,
     };
-    let v4 = git_ref == "v4" || git_ref.starts_with("v4.");
+    let v4 = git_ref == "v4" || git_ref.starts_with("v4.") || is_commit_sha(git_ref);
     Some(if v4 {
         Ok(kind)
     } else {
-        Err(format!("`{uses}`: only @v4 is supported"))
+        Err(format!(
+            "`{uses}`: only @v4 (or a commit of it) is supported"
+        ))
     })
+}
+
+/// A full commit SHA: 40 hex digits.
+fn is_commit_sha(git_ref: &str) -> bool {
+    git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The warning for a step pinned to a commit: the version of a commit cannot
+/// be checked here, so it runs as v4. `None` for any other `uses`.
+pub fn pin_warning(uses: &str) -> Option<String> {
+    let (_, git_ref) = uses.split_once('@')?;
+    if !matches!(parse_uses(uses), Some(Ok(_))) || !is_commit_sha(git_ref) {
+        return None;
+    }
+    Some(format!(
+        "warning: `{uses}` is pinned to a commit, so its version cannot be checked here and it runs as v4"
+    ))
 }
 
 fn literal(v: &str) -> bool {
@@ -386,12 +405,28 @@ pub fn parse_retention(v: Option<&str>) -> Result<Option<u32>, String> {
     }
 }
 
+/// `compression-level`: a whole number from 0 to 9. Recorded in the receipt
+/// and otherwise ignored: the files are stored as they are, so it changes
+/// nothing about the result.
+pub fn parse_compression(v: Option<&str>) -> Result<Option<u32>, String> {
+    match v.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(t) => match t.parse::<u32>() {
+            Ok(l) if l <= 9 => Ok(Some(l)),
+            _ => Err(format!(
+                "`compression-level: {t}` is not a number from 0 to 9"
+            )),
+        },
+    }
+}
+
 const UPLOAD_KEYS: &[&str] = &[
     "name",
     "path",
     "if-no-files-found",
     "overwrite",
     "retention-days",
+    "compression-level",
     "include-hidden-files",
 ];
 const DOWNLOAD_KEYS: &[&str] = &["name", "path", "pattern", "merge-multiple"];
@@ -402,8 +437,105 @@ const DOWNLOAD_KEYS: &[&str] = &["name", "path", "pattern", "merge-multiple"];
 /// upload in a matrix job whose name does not hold the variant (two variants
 /// would upload the same name). A value that holds an expression is checked
 /// when it is known, at run time.
-pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> Result<(), String> {
-    validate_inner(kind, with, in_matrix, false)
+pub fn validate_with(kind: Kind, with: &[(String, String)], matrix: Matrix) -> Result<(), String> {
+    validate_inner(kind, with, matrix, false)
+}
+
+/// The matrix of the job a step belongs to, as far as the plan knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Matrix<'a> {
+    /// The job has no matrix.
+    None,
+    /// The keys of a matrix that is written out, `include` entries too.
+    Axes(&'a [String]),
+    /// A matrix that is an expression: its keys are known when it runs.
+    Unknown,
+}
+
+/// The keys of a written-out `strategy.matrix`: its axes and every key an
+/// `include` entry adds. `None` for a matrix (or an `include`) that is an
+/// expression.
+pub fn matrix_axes(m: &serde_json::Value) -> Option<Vec<String>> {
+    let obj = m.as_object()?;
+    let mut keys: Vec<String> = obj
+        .keys()
+        .filter(|k| *k != "include" && *k != "exclude")
+        .cloned()
+        .collect();
+    match obj.get("include") {
+        Some(serde_json::Value::Array(entries)) => {
+            for e in entries.iter().filter_map(|e| e.as_object()) {
+                keys.extend(e.keys().cloned());
+            }
+        }
+        Some(serde_json::Value::String(_)) => return None,
+        _ => {}
+    }
+    keys.sort();
+    keys.dedup();
+    Some(keys)
+}
+
+/// The bodies of the `${{ ... }}` expressions in `text`, spaces trimmed.
+fn expressions(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("${{") {
+        let after = &rest[i + 3..];
+        let Some(j) = after.find("}}") else { break };
+        out.push(after[..j].trim());
+        rest = &after[j + 2..];
+    }
+    out
+}
+
+/// Whether `body` reads `matrix.<key>` (or `matrix['key']`) as a whole word.
+fn reads_key(body: &str, key: &str) -> bool {
+    let dotted = format!("matrix.{key}");
+    let at_word_end = |i: usize| {
+        !body[i..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    for (start, _) in body.match_indices(&dotted) {
+        let end = start + dotted.len();
+        let word_start = !body[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        if word_start && at_word_end(end) {
+            return true;
+        }
+    }
+    body.contains(&format!("matrix['{key}']")) || body.contains(&format!("matrix[\"{key}\"]"))
+}
+
+/// Whether an upload's `name` tells the variants of a matrix apart: it reads
+/// every key of the matrix, the whole matrix (`${{ matrix }}`,
+/// `toJSON(matrix)`) or `strategy.job-index`. For a matrix that is an
+/// expression (`axes` is `None`) it must read the matrix in some way.
+pub fn name_separates_variants(name: &str, axes: Option<&[String]>) -> bool {
+    let bodies = expressions(name);
+    let whole = |b: &&str| {
+        let squashed: String = b
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        squashed == "matrix"
+            || squashed.contains("tojson(matrix)")
+            || squashed.contains("strategy.job-index")
+    };
+    if bodies.iter().any(whole) {
+        return true;
+    }
+    match axes {
+        Some(keys) => keys.iter().all(|k| bodies.iter().any(|b| reads_key(b, k))),
+        None => bodies
+            .iter()
+            .any(|b| b.contains("matrix.") || b.contains("matrix[")),
+    }
 }
 
 /// [`validate_with`] for a step about to run, its values expanded: the name is
@@ -411,13 +543,13 @@ pub fn validate_with(kind: Kind, with: &[(String, String)], in_matrix: bool) -> 
 /// against the workspace (an absolute path inside it is what
 /// `${{ github.workspace }}/x` expands to).
 pub fn validate_run(kind: Kind, with: &[(String, String)]) -> Result<(), String> {
-    validate_inner(kind, with, false, true)
+    validate_inner(kind, with, Matrix::None, true)
 }
 
 fn validate_inner(
     kind: Kind,
     with: &[(String, String)],
-    in_matrix: bool,
+    matrix: Matrix,
     run: bool,
 ) -> Result<(), String> {
     let allowed = match kind {
@@ -454,11 +586,23 @@ fn validate_inner(
             parse_bool("overwrite", get(with, "overwrite"))?;
             parse_bool("include-hidden-files", get(with, "include-hidden-files"))?;
             parse_retention(get(with, "retention-days"))?;
+            parse_compression(get(with, "compression-level"))?;
             let shown = name.unwrap_or("artifact");
-            if !run && in_matrix && !(shown.contains("${{") && shown.contains("matrix.")) {
-                return Err(format!(
-                    "the name `{shown}` is the same in every variant of the matrix; put the variant in it (`name: report-${{{{ matrix.os }}}}`)"
-                ));
+            let axes = match matrix {
+                Matrix::Axes(a) => Some(Some(a)),
+                Matrix::Unknown => Some(None),
+                Matrix::None => None,
+            };
+            if let Some(axes) = axes.filter(|_| !run) {
+                if !name_separates_variants(shown, axes) {
+                    return Err(format!(
+                        "the name `{shown}` does not tell the variants of the matrix apart{}; put every matrix key in it (`name: report-${{{{ matrix.os }}}}`) or use `${{{{ strategy.job-index }}}}`",
+                        match axes {
+                            Some(k) => format!(" (it must read {})", k.iter().map(|k| format!("`matrix.{k}`")).collect::<Vec<_>>().join(", ")),
+                            None => String::new(),
+                        }
+                    ));
+                }
             }
         }
         Kind::Download => {
@@ -474,6 +618,18 @@ fn validate_inner(
     Ok(())
 }
 
+/// Whether an `if:` is true whenever the step is reached, so the step is as
+/// unconditional as one without it: `always()`, `success()`, `!cancelled()` or
+/// `true`, with or without the `${{ }}` wrapper and spaces around.
+pub fn always_true(cond: &str) -> bool {
+    let c = cond.trim();
+    let c = match c.strip_prefix("${{").and_then(|r| r.strip_suffix("}}")) {
+        Some(inner) => inner.trim(),
+        None => c,
+    };
+    matches!(c, "always()" | "success()" | "!cancelled()" | "true")
+}
+
 /// The artifact an upload step must publish for the run to succeed, when that
 /// is known from the plan: a literal name, in a job without a matrix, on a step
 /// that always runs (`optional` is false) and fails without files
@@ -487,6 +643,27 @@ pub fn required_upload(uses: &str, with: &[(String, String)], optional: bool) ->
     }
     let name = get(with, "name").unwrap_or("artifact");
     literal(name).then(|| name.to_string())
+}
+
+/// A digest of what an artifact version holds: one line per file (path, size,
+/// SHA-256) in path order, hashed. Two versions with the same files have the
+/// same digest, whatever run or attempt wrote them.
+pub fn files_digest(files: &[(String, u64, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = files
+        .iter()
+        .map(|(p, n, h)| format!("{p}\t{n}\t{h}\n"))
+        .collect();
+    lines.sort();
+    let mut hasher = Sha256::new();
+    for l in &lines {
+        hasher.update(l.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The artifact a download step takes by name.
@@ -956,8 +1133,8 @@ mod tests {
     fn options_that_are_not_supported_are_errors() {
         use Kind::*;
         let ok = |k, p: &[(&str, &str)], m| validate_with(k, &w(p), m);
-        assert!(ok(Upload, &[("name", "r"), ("path", "dist")], false).is_ok());
-        assert!(ok(Upload, &[("path", "dist")], false).is_ok());
+        assert!(ok(Upload, &[("name", "r"), ("path", "dist")], Matrix::None).is_ok());
+        assert!(ok(Upload, &[("path", "dist")], Matrix::None).is_ok());
         assert!(ok(
             Upload,
             &[
@@ -968,84 +1145,118 @@ mod tests {
                 ("retention-days", "5"),
                 ("include-hidden-files", "true"),
             ],
-            false
+            Matrix::None
         )
         .is_ok());
-        assert!(ok(Download, &[("name", "r"), ("path", "out")], false).is_ok());
-        assert!(ok(Download, &[], false).is_ok());
+        assert!(ok(Download, &[("name", "r"), ("path", "out")], Matrix::None).is_ok());
+        assert!(ok(Download, &[], Matrix::None).is_ok());
         assert!(ok(
             Download,
             &[("pattern", "r-*"), ("merge-multiple", "true")],
-            false
+            Matrix::None
         )
         .is_ok());
         for k in [
             "github-token",
             "run-id",
             "repository",
-            "compression-level",
             "artifact-ids",
             "skip-decompress",
             "unknown",
         ] {
-            let e = ok(Download, &[("name", "r"), (k, "x")], false).unwrap_err();
+            let e = ok(Download, &[("name", "r"), (k, "x")], Matrix::None).unwrap_err();
             assert!(e.contains(k) && e.contains("download-artifact"), "{e}");
-            let e = ok(Upload, &[("path", "d"), (k, "x")], false).unwrap_err();
+            let e = ok(Upload, &[("path", "d"), (k, "x")], Matrix::None).unwrap_err();
             assert!(e.contains(k) && e.contains("upload-artifact"), "{e}");
         }
         // values
-        assert!(ok(Upload, &[], false).unwrap_err().contains("required"));
-        assert!(ok(Upload, &[("path", " ")], false)
+        assert!(ok(Upload, &[], Matrix::None)
             .unwrap_err()
             .contains("required"));
-        assert!(ok(Upload, &[("path", "../x")], false).is_err());
-        assert!(ok(Upload, &[("path", "/x")], false).is_err());
-        assert!(ok(Upload, &[("path", "d"), ("name", "a/b")], false).is_err());
-        assert!(ok(Upload, &[("path", "d"), ("if-no-files-found", "x")], false).is_err());
-        assert!(ok(Upload, &[("path", "d"), ("overwrite", "x")], false).is_err());
+        assert!(ok(Upload, &[("path", " ")], Matrix::None)
+            .unwrap_err()
+            .contains("required"));
+        assert!(ok(Upload, &[("path", "../x")], Matrix::None).is_err());
+        assert!(ok(Upload, &[("path", "/x")], Matrix::None).is_err());
+        assert!(ok(Upload, &[("path", "d"), ("name", "a/b")], Matrix::None).is_err());
+        assert!(ok(
+            Upload,
+            &[("path", "d"), ("if-no-files-found", "x")],
+            Matrix::None
+        )
+        .is_err());
+        assert!(ok(Upload, &[("path", "d"), ("overwrite", "x")], Matrix::None).is_err());
         assert!(ok(
             Upload,
             &[("path", "d"), ("include-hidden-files", "x")],
-            false
+            Matrix::None
         )
         .is_err());
-        assert!(ok(Upload, &[("path", "d"), ("retention-days", "x")], false).is_err());
-        assert!(ok(Download, &[("name", "a"), ("pattern", "b")], false).is_err());
-        assert!(ok(Download, &[("merge-multiple", "x")], false).is_err());
-        assert!(ok(Download, &[("path", "/x")], false).is_err());
-        assert!(ok(Download, &[("path", "../x")], false).is_err());
-        assert!(ok(Download, &[("name", "a:b")], false).is_err());
+        assert!(ok(
+            Upload,
+            &[("path", "d"), ("retention-days", "x")],
+            Matrix::None
+        )
+        .is_err());
+        assert!(ok(Download, &[("name", "a"), ("pattern", "b")], Matrix::None).is_err());
+        assert!(ok(Download, &[("merge-multiple", "x")], Matrix::None).is_err());
+        assert!(ok(Download, &[("path", "/x")], Matrix::None).is_err());
+        assert!(ok(Download, &[("path", "../x")], Matrix::None).is_err());
+        assert!(ok(Download, &[("name", "a:b")], Matrix::None).is_err());
         // an expression is checked when its value is known
         assert!(ok(
             Upload,
             &[("path", "${{ x }}/y"), ("name", "${{ x }}:")],
-            false
+            Matrix::None
         )
         .is_ok());
         assert!(ok(
             Download,
             &[("path", "${{ x }}/../y"), ("name", "${{ x }}:")],
-            false
+            Matrix::None
         )
         .is_ok());
         // a matrix job needs the variant in the name
-        let e = ok(Upload, &[("path", "d"), ("name", "r")], true).unwrap_err();
+        let e = ok(Upload, &[("path", "d"), ("name", "r")], Matrix::Unknown).unwrap_err();
         assert!(e.contains("matrix"), "{e}");
-        assert!(ok(Upload, &[("path", "d")], true).is_err());
+        assert!(ok(Upload, &[("path", "d")], Matrix::Unknown).is_err());
         assert!(ok(
             Upload,
             &[("path", "d"), ("name", "r-${{ github.run_id }}")],
-            true
+            Matrix::Unknown
         )
         .is_err());
-        assert!(ok(Upload, &[("path", "d"), ("name", "matrix.x")], true).is_err());
+        assert!(ok(
+            Upload,
+            &[("path", "d"), ("name", "matrix.x")],
+            Matrix::Unknown
+        )
+        .is_err());
         assert!(ok(
             Upload,
             &[("path", "d"), ("name", "r-${{ matrix.os }}")],
-            true
+            Matrix::Unknown
         )
         .is_ok());
-        assert!(ok(Download, &[("name", "r")], true).is_ok());
+        assert!(ok(Download, &[("name", "r")], Matrix::Unknown).is_ok());
+        // a written-out matrix: every key, with or without `overwrite`
+        let keys = s(&["node", "os"]);
+        let axes = Matrix::Axes(&keys);
+        for extra in [&[][..], &[("overwrite", "true")][..]] {
+            let up = |name: &str| {
+                let mut p = vec![("path", "d"), ("name", name)];
+                p.extend_from_slice(extra);
+                ok(Upload, &p, axes)
+            };
+            let e = up("r-${{ matrix.os }}").unwrap_err();
+            assert!(e.contains("matrix.node") && e.contains("matrix.os"), "{e}");
+            assert!(up("r-${{ matrix.node }}").is_err());
+            assert!(up("r-${{ matrix.os }}-${{ matrix.node }}").is_ok());
+            assert!(up("r-${{ matrix }}").is_ok());
+            assert!(up("r-${{ strategy.job-index }}").is_ok());
+        }
+        // no matrix: nothing to tell apart
+        assert!(ok(Upload, &[("path", "d"), ("name", "r")], Matrix::None).is_ok());
     }
 
     #[test]
@@ -1183,7 +1394,7 @@ mod tests {
         assert!(validate_with(
             Kind::Upload,
             &w(&[("name", "${{ x }}/y"), ("path", "a")]),
-            false
+            Matrix::None
         )
         .is_ok());
         assert!(runtime_name("${{ x }}/y").is_err());
@@ -1257,7 +1468,7 @@ mod tests {
         assert!(run(Kind::Upload, &[("path", "/ws/dist")]).is_ok());
         assert!(run(Kind::Download, &[("name", "n"), ("path", "/ws/x")]).is_ok());
         // an upload in a matrix whose name has no variant is the plan's to refuse
-        assert!(validate_with(Kind::Upload, &w(&[("path", "a")]), true).is_err());
+        assert!(validate_with(Kind::Upload, &w(&[("path", "a")]), Matrix::Unknown).is_err());
         assert!(run(Kind::Upload, &[("path", "a")]).is_ok());
         // the name is checked even holding an expression, and options are
         assert!(run(Kind::Upload, &[("name", "${{ x }}/../y"), ("path", "a")]).is_err());
@@ -1266,5 +1477,207 @@ mod tests {
         assert!(run(Kind::Upload, &[("path", "a"), ("run-id", "1")]).is_err());
         assert!(run(Kind::Upload, &[("path", "a"), ("overwrite", "x")]).is_err());
         assert!(run(Kind::Download, &[("name", "a"), ("pattern", "b")]).is_err());
+    }
+
+    #[test]
+    fn a_commit_pin_runs_as_v4_with_a_warning() {
+        let sha = "ea165f8d65b6e75b540449e92b4886f43607fa02";
+        let uses = format!("actions/upload-artifact@{sha}");
+        assert_eq!(parse_uses(&uses), Some(Ok(Kind::Upload)));
+        assert_eq!(
+            parse_uses(&format!("actions/download-artifact@{}", sha.to_uppercase())),
+            Some(Ok(Kind::Download))
+        );
+        let w = pin_warning(&uses).unwrap();
+        let said = w.starts_with("warning:") && w.contains(sha) && w.contains("v4");
+        assert!(said, "{w}");
+        // not 40 hex digits, or not a commit: still the old errors
+        for bad in [&sha[..39], &format!("{sha}0"), &sha.replace('e', "g")] {
+            let u = format!("actions/upload-artifact@{bad}");
+            assert!(matches!(parse_uses(&u), Some(Err(_))), "{u}");
+            assert_eq!(pin_warning(&u), None, "{u}");
+        }
+        for v in ["v3", "v5", "v5.0.0"] {
+            let u = format!("actions/upload-artifact@{v}");
+            let said = matches!(parse_uses(&u), Some(Err(e)) if e.contains("v4"));
+            assert!(said, "{u}");
+        }
+        // a tag, a third party and no ref at all carry no warning
+        assert_eq!(pin_warning("actions/upload-artifact@v4"), None);
+        assert_eq!(pin_warning("actions/upload-artifact"), None);
+        assert_eq!(pin_warning(&format!("someone/upload-artifact@{sha}")), None);
+        assert_eq!(pin_warning(&format!("actions/checkout@{sha}")), None);
+    }
+
+    #[test]
+    fn compression_level_is_a_number_from_0_to_9() {
+        assert_eq!(parse_compression(None), Ok(None));
+        assert_eq!(parse_compression(Some(" ")), Ok(None));
+        assert_eq!(parse_compression(Some("0")), Ok(Some(0)));
+        assert_eq!(parse_compression(Some(" 9 ")), Ok(Some(9)));
+        for bad in ["10", "-1", "x", "1.5"] {
+            let e = parse_compression(Some(bad)).unwrap_err();
+            assert!(e.contains("compression-level") && e.contains(bad), "{e}");
+        }
+        let up = |v: &str| {
+            validate_with(
+                Kind::Upload,
+                &w(&[("path", "d"), ("compression-level", v)]),
+                Matrix::None,
+            )
+        };
+        assert!(up("6").is_ok());
+        assert!(up("10").is_err());
+        // an upload only: a download has no such option
+        assert!(validate_with(
+            Kind::Download,
+            &w(&[("name", "r"), ("compression-level", "1")]),
+            Matrix::None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_keys_of_a_matrix() {
+        use serde_json::json;
+        assert_eq!(
+            matrix_axes(&json!({"os": ["a"], "node": [1], "exclude": [{"os": "a"}]})),
+            Some(s(&["node", "os"]))
+        );
+        // include adds its keys
+        assert_eq!(
+            matrix_axes(
+                &json!({"os": ["a"], "include": [{"os": "b", "extra": 1}, 3, {"more": 2}]})
+            ),
+            Some(s(&["extra", "more", "os"]))
+        );
+        assert_eq!(
+            matrix_axes(&json!({"include": [{"name": "x", "shard": 1}]})),
+            Some(s(&["name", "shard"]))
+        );
+        assert_eq!(
+            matrix_axes(&json!({"os": ["a"], "include": 7})),
+            Some(s(&["os"]))
+        );
+        // an expression says nothing
+        assert_eq!(matrix_axes(&json!("${{ fromJSON(x) }}")), None);
+        assert_eq!(
+            matrix_axes(&json!({"os": ["a"], "include": "${{ x }}"})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_that_tells_the_variants_apart() {
+        let keys = s(&["node", "os"]);
+        let k = Some(&keys[..]);
+        let sep = |n: &str| name_separates_variants(n, k);
+        assert!(sep("r-${{ matrix.os }}-${{matrix.node}}"));
+        assert!(sep("r-${{ matrix.os }}-${{ matrix['node'] }}"));
+        assert!(sep("r-${{ matrix.os }}-${{ matrix[\"node\"] }}"));
+        assert!(sep("r-${{ format('{0}-{1}', matrix.os, matrix.node) }}"));
+        assert!(!sep("r-${{ matrix.os }}"));
+        assert!(!sep("r-${{ matrix.node }}"));
+        assert!(!sep("r"));
+        assert!(!sep("matrix.os matrix.node"));
+        // a key that only starts like the real one, or belongs to another object
+        assert!(!sep("${{ matrix.os }}-${{ matrix.nodes }}"));
+        assert!(!sep("${{ matrix.os }}-${{ matrix.node-x }}"));
+        assert!(!sep("${{ matrix.os }}-${{ inputs.matrix.node }}"));
+        assert!(!sep("${{ matrix.os }}-${{ xmatrix.node }}"));
+        assert!(sep("${{ matrix.os }}-${{ x.y == 1 && matrix.node }}"));
+        assert!(!sep("${{ matrix.os }}-${{ matrix.node"));
+        // the whole matrix, or the index of the variant
+        for n in [
+            "r-${{ matrix }}",
+            "r-${{matrix}}",
+            "r-${{ toJSON(matrix) }}",
+            "r-${{ toJson( matrix ) }}",
+            "r-${{ hashFiles('x') }}-${{ strategy.job-index }}",
+        ] {
+            assert!(sep(n), "{n}");
+        }
+        assert!(!sep("r-${{ toJSON(matrix.os) }}"));
+        assert!(!sep("r-${{ matrixx }}"));
+        // no key: a literal name is fine for nothing to tell apart
+        assert!(name_separates_variants("r", Some(&[])));
+        // a matrix that is an expression: reading it somehow is enough
+        assert!(name_separates_variants("r-${{ matrix.os }}", None));
+        assert!(name_separates_variants("r-${{ matrix['os'] }}", None));
+        assert!(!name_separates_variants("r-${{ github.run_id }}", None));
+        assert!(!name_separates_variants("matrix.os", None));
+        assert!(!name_separates_variants("r", None));
+    }
+
+    #[test]
+    fn a_condition_that_is_always_true_is_no_condition() {
+        for c in [
+            "always()",
+            "success()",
+            "!cancelled()",
+            "true",
+            "  always()  ",
+            "${{ always() }}",
+            "${{always()}}",
+            " ${{  success()  }} ",
+            "${{ !cancelled() }}",
+            "${{ true }}",
+        ] {
+            assert!(always_true(c), "{c:?}");
+        }
+        for c in [
+            "",
+            "false",
+            "failure()",
+            "cancelled()",
+            "always() && github.ref == 'x'",
+            "github.ref == 'x'",
+            "${{ always() && x }}",
+            "${{ failure() }}",
+            "!always()",
+            "success() || failure()",
+            "${{ always()",
+            "always() }}",
+            "True",
+        ] {
+            assert!(!always_true(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn what_an_artifact_holds_is_a_digest_of_its_files() {
+        let f = |p: &str, n: u64, h: &str| (p.to_string(), n, h.to_string());
+        let a = files_digest(&[f("a", 1, "x"), f("b", 2, "y")]);
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        // the order the files are listed in does not matter
+        assert_eq!(a, files_digest(&[f("b", 2, "y"), f("a", 1, "x")]));
+        // a path, a size, a hash, a file more or fewer does
+        for other in [
+            vec![f("c", 1, "x"), f("b", 2, "y")],
+            vec![f("a", 3, "x"), f("b", 2, "y")],
+            vec![f("a", 1, "z"), f("b", 2, "y")],
+            vec![f("a", 1, "x")],
+            vec![f("a", 1, "x"), f("b", 2, "y"), f("c", 0, "")],
+        ] {
+            assert_ne!(a, files_digest(&other));
+        }
+        // nothing is a digest too, and not the same as an empty file
+        assert_ne!(files_digest(&[]), files_digest(&[f("a", 0, "")]));
+        // fields do not run into each other
+        assert_ne!(
+            files_digest(&[f("a", 1, "2x")]),
+            files_digest(&[f("a1", 2, "x")])
+        );
+    }
+
+    #[test]
+    fn the_expressions_of_a_text() {
+        assert_eq!(expressions("a-${{ x }}-${{y.z}}b"), ["x", "y.z"]);
+        assert_eq!(expressions("none"), Vec::<&str>::new());
+        assert_eq!(expressions("a${{ x ${{ }}"), ["x ${{"]);
+        assert_eq!(expressions("${{ open"), Vec::<&str>::new());
+        assert_eq!(expressions("${{ a }}${{ b }}"), ["a", "b"]);
+        assert_eq!(expressions("${{}}${{a}}"), ["", "a"]);
     }
 }

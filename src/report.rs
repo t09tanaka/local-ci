@@ -229,6 +229,8 @@ pub fn warnings(setup: &[StepResult], units: &[UnitResult]) -> Vec<String> {
                     out.push(format!("{}: {n}", st.label));
                 } else if n.starts_with("job output ") {
                     out.push(format!("{}: {n}", j.job));
+                } else if n.starts_with("warning: ") {
+                    out.push(format!("{}: {n}", st.label));
                 }
             }
         }

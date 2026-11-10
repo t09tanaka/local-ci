@@ -11,11 +11,22 @@
   receipt only, verifies the hashes and then places the files, refusing
   absolute paths, `..` and symlinks. Cross-run options (`run-id`,
   `repository`, `github-token`, ...), another major version and a matrix upload
-  whose name lacks the variant are errors before the run. A task's required
-  artifacts (`verification.artifacts`) and needed ones (`artifacts`) are filled
-  in from the plan, `TaskResult.artifacts` from the receipts, and a run is not
-  a success while a required one has none. Jobs that use them are not reused
-  from the results cache.
+  whose name does not read every key of the matrix (or `${{ matrix }}`, or
+  `strategy.job-index`) are errors of the jobs of their workflow, reported
+  before anything of it runs and only for it: planning and the other
+  workflows go on. Jobs a job filter leaves out are not looked at. A
+  40-character commit SHA runs as v4, with one warning. `compression-level`
+  (0 to 9) is accepted, recorded in the receipt and has no effect. A task's
+  required artifacts (`verification.artifacts`) and needed ones (`artifacts`)
+  are filled in from the plan (an `if:` that is only `always()`, `success()`,
+  `!cancelled()` or `true` does not make an upload optional), `TaskResult.artifacts`
+  from the receipts, and a run is not a success while a required one has none.
+  Units that use them stay in the results cache: a kept result carries the
+  artifacts its unit uploaded and restores them into the run (each file checked
+  against its receipt, which gets the new plan digest and attempt, and
+  `restored_from`; a mismatch is a cache miss), and a unit that downloads is
+  reused only against the same upstream artifact digests. `strategy.job-index`
+  and `strategy.job-total` are set in a matrix job's expressions.
 - Library: `source::capture_source` fixes the input of a run (staged and
   unstaged changes, untracked files, deletions, modes, symlinks, submodules,
   LFS payloads) in a private content-addressed store and describes it in a

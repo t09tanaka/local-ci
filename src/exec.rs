@@ -244,6 +244,9 @@ pub struct Runner<'a> {
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
     docker_ok: OnceLock<Result<(), String>>,
+    /// Why the units of a workflow (by index in the plan) are not run: an
+    /// artifact step of it that cannot be run.
+    refused: HashMap<usize, String>,
 }
 
 /// The descriptor a script holding the token is read from, and how a shell is
@@ -778,9 +781,13 @@ impl<'a> Runner<'a> {
     pub fn new(ctx: &'a ExecContext, fp: &'a FrozenPlan, ws: &Workspace, opts: Opts) -> Self {
         let base_path = ctx.var("PATH").unwrap_or_default().to_string();
         let plan = fp.to_plan();
+        let refused = (0..plan.selected.len())
+            .filter_map(|wf| Some((wf, artifact_io::workflow_refusal(&plan, wf)?)))
+            .collect();
         Runner {
             ctx,
             fp,
+            refused,
             hoisted: plan::hoist(&plan),
             plan,
             receipts: None,
@@ -1453,6 +1460,15 @@ impl<'a> Runner<'a> {
                 let sem = &sem;
                 let results = &results;
                 scope.spawn(move || {
+                    // an artifact step of the workflow that cannot be run
+                    // fails its units here, and only them
+                    if let Some(why) = self.refused.get(&u.wf) {
+                        results
+                            .lock()
+                            .unwrap()
+                            .push((i, self.refused_unit(i, u, why)));
+                        return;
+                    }
                     let t0 = Instant::now();
                     let lock = if self.unit_locked(u) {
                         self.lock().ok()
@@ -1479,6 +1495,34 @@ impl<'a> Runner<'a> {
         let mut r = results.into_inner().unwrap();
         r.sort_by_key(|(i, _)| *i);
         r.into_iter().map(|(_, u)| u).collect()
+    }
+
+    /// The result of a unit that is not run: each of its jobs is an error that
+    /// says why.
+    fn refused_unit(&self, ui: usize, u: &Unit, why: &str) -> UnitResult {
+        let w = &self.plan.selected[u.wf].wf;
+        UnitResult {
+            unit: Some(ui),
+            workflow: w.file.clone(),
+            jobs: u
+                .jobs
+                .iter()
+                .map(|id| JobResult {
+                    workflow: w.file.clone(),
+                    job: id.clone(),
+                    display: self.plan.job(u.wf, id).name.clone().unwrap_or(id.clone()),
+                    outcome: Outcome::Error(why.to_string()),
+                    secs: 0.0,
+                    steps: vec![],
+                    cancelled: false,
+                    time: None,
+                })
+                .collect(),
+            waited_secs: 0.0,
+            copy_secs: None,
+            cached: None,
+            outcomes: vec![],
+        }
     }
 
     pub(crate) fn lock(&self) -> Result<File> {
@@ -2046,9 +2090,14 @@ impl<'a> Runner<'a> {
         let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
         let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let total = combos.len();
         for (idx, combo) in combos.into_iter().enumerate() {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
+            cm.insert(
+                "strategy".into(),
+                json!({"job-index": idx, "job-total": total}),
+            );
             let mut display = {
                 let ctx = Ctx::new(&cm, Status::Success);
                 match &job.name {
@@ -2908,7 +2957,14 @@ impl<'a> Runner<'a> {
             artifact::Kind::Download => artifact_io::download(&area, ws, &with),
         };
         match done {
-            Ok(note) => (Outcome::Pass, Some(note)),
+            Ok(note) => {
+                // a step pinned to a commit runs as v4, and says so
+                let note = match s.uses.as_deref().and_then(artifact::pin_warning) {
+                    Some(w) => format!("{w}; {note}"),
+                    None => note,
+                };
+                (Outcome::Pass, Some(note))
+            }
             Err(e) => (Outcome::Error(e), None),
         }
     }

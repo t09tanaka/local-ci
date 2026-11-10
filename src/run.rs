@@ -403,7 +403,6 @@ pub fn build_frozen_plan_with(
 /// Fix an already resolved plan (what [`build_frozen_plan`] does after
 /// [`resolve`]).
 pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Result<FrozenPlan> {
-    crate::artifact_io::validate_plan(&p).map_err(|e| anyhow::anyhow!(e))?;
     FrozenPlan::new(PlanParts {
         repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {
@@ -524,7 +523,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let full_plan = full.to_plan();
+    let mut full_plan = full.to_plan();
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
     store.prune(stamp);
@@ -555,34 +554,68 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             }
         }
     };
-    let mut p = full_plan;
+    // Units whose kept result still holds: the ones with a fingerprint that
+    // `store` knows. Their artifacts are put into this run's area under the
+    // digest of the plan that is left to run, which depends on which of them
+    // are reused, so a result whose artifacts do not restore (a file that does
+    // not match its receipt) is given up, and the rest settled again.
+    let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));
+    let mut hits: Vec<Option<cache::Hit>> = std::mem::take(&mut full_plan.units)
+        .iter()
+        .zip(&fingerprints)
+        .map(|(u, fp)| {
+            fp.as_deref()
+                .filter(|_| !a.no_cache)
+                .and_then(|f| store.get(f, &full_plan.selected[u.wf].wf.file, stamp))
+        })
+        .collect();
+    let all_units = full.to_plan().units;
+    let (fp, taken) = loop {
+        let taken = cache::settle(&hits);
+        let mut p = full.to_plan();
+        p.units = all_units
+            .iter()
+            .zip(&taken)
+            .filter(|(_, t)| !**t)
+            .map(|(u, _)| u.clone())
+            .collect();
+        let fp = full.with_plan(p)?;
+        if !taken.iter().any(|t| *t) {
+            break (fp, taken);
+        }
+        let _ = std::fs::remove_dir_all(run_dir.join("artifacts"));
+        std::fs::create_dir_all(&run_dir)?;
+        let mut failed = false;
+        for (i, t) in taken.iter().enumerate() {
+            let (Some(h), Some(f)) = (hits[i].as_ref(), fingerprints[i].as_deref()) else {
+                continue;
+            };
+            if *t && store.restore(f, h, &run_dir, &fp.digest).is_err() {
+                hits[i] = None;
+                failed = true;
+            }
+        }
+        if !failed {
+            break (fp, taken);
+        }
+    };
     let mut reused = Vec::new();
-    let mut to_run = Vec::new();
     // where each unit still to run stands in the whole plan
     let mut run_idx = Vec::new();
     let mut run_fps = Vec::new();
-    for (i, (u, fp)) in std::mem::take(&mut p.units)
-        .into_iter()
-        .zip(fingerprints)
-        .enumerate()
-    {
-        let hit = fp
-            .as_deref()
-            .filter(|_| !a.no_cache)
-            .and_then(|f| store.get(f, &p.selected[u.wf].wf.file, stamp));
-        match hit {
-            Some(r) => reused.push(exec::UnitResult { unit: Some(i), ..r }),
-            None => {
-                run_idx.push(i);
-                to_run.push(u);
-                run_fps.push(fp);
+    for (i, (fp_, t)) in fingerprints.into_iter().zip(taken).enumerate() {
+        if t {
+            if let Some(h) = hits[i].take() {
+                reused.push(exec::UnitResult {
+                    unit: Some(i),
+                    ..h.result
+                });
             }
+        } else {
+            run_idx.push(i);
+            run_fps.push(fp_);
         }
     }
-    p.units = to_run;
-    // what is left to run, fixed again
-    let fp = full.with_plan(p)?;
-    let run_dir = runs.join(format!("{stamp}-{}", &sha[..7]));
     std::fs::create_dir_all(&run_dir)?;
     let source_info = a.source.as_ref().map(SourceInfo::of);
     if let Some(info) = &source_info {
@@ -667,7 +700,16 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             .as_secs();
         for (u, fp_) in units.iter().zip(&run_fps) {
             if let Some(f) = fp_ {
-                store.put(f, sha, u, now);
+                // the artifacts it takes from other units of the run
+                let mut downloads: Vec<String> = u
+                    .unit
+                    .into_iter()
+                    .flat_map(|ui| fp.tasks.iter().filter(move |t| t.unit == ui))
+                    .flat_map(|t| t.artifacts.iter().cloned())
+                    .collect();
+                downloads.sort();
+                downloads.dedup();
+                store.put(f, sha, u, now, &run_dir, &downloads);
             }
         }
     }
