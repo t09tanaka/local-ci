@@ -434,7 +434,7 @@ cargo test --features browser-tests   # without the feature, the tests that star
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
 `src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`,
-`src/shard/coverage.rs`, `src/shard/isolation.rs`) are gated on 100% line coverage over the whole test suite.
+`src/shard/coverage.rs`, `src/shard/isolation.rs`, `src/demand.rs`) are gated on 100% line coverage over the whole test suite.
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 
@@ -449,9 +449,10 @@ commands are in `.github/workflows/ci.yml`):
 
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
-cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
 cargo schemata --file src/artifact.rs -- --lib artifact
 cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
+cargo schemata --file src/demand.rs -- --lib demand::tests --test task_demand
 ```
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is

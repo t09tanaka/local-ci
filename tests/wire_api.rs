@@ -165,8 +165,10 @@ fn what_crosses_has_a_digest_of_its_content() {
     assert!(e.contains("does not match"), "{e}");
 
     let recipe = SetupRecipe::default();
-    let mut other = SetupRecipe::default();
-    other.task = "x".into();
+    let other = SetupRecipe {
+        task: "x".into(),
+        ..SetupRecipe::default()
+    };
     assert_ne!(recipe.digest().unwrap(), other.digest().unwrap());
     let r1 = PreparedReceipt::empty("k", "s");
     assert_ne!(

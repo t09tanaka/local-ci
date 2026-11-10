@@ -340,8 +340,10 @@ fn a_task_of_another_wire_version_is_not_started_and_its_result_travels_without_
     .to_string();
     assert!(e.contains("receipt: schema version"), "{e}");
 
-    let mut recipe = local_ci::setup::SetupRecipe::default();
-    recipe.schema_version = bad;
+    let recipe = local_ci::setup::SetupRecipe {
+        schema_version: bad,
+        ..Default::default()
+    };
     let key = recipe.template_key(&tctx);
     let e = local_ci::execute_setup(&l.ctx, &l.fp, &recipe, &key, &l.ws, opts())
         .err()

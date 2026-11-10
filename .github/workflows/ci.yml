@@ -180,7 +180,7 @@ jobs:
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh src/frozen.rs
       - name: zero survivors in frozen
-        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
 
   mutants-shard:
     name: mutation gate (shard)
@@ -195,3 +195,17 @@ jobs:
         run: scripts/mutation-targets-check.sh src/shard.rs
       - name: zero survivors in shard
         run: cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
+
+  mutants-demand:
+    name: mutation gate (demand)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: every target file has mutants
+        run: scripts/mutation-targets-check.sh src/demand.rs
+      - name: zero survivors in demand
+        run: cargo schemata --file src/demand.rs -- --lib demand::tests --test task_demand

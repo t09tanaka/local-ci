@@ -151,6 +151,54 @@
   task says (a listed split for a runner that cannot target tests, a native
   split for one without a shard feature of its own).
 - The plan schema version is 5; a plan of version 4 is refused by name.
+- New `plan_task_demand(&FrozenPlan, task_id)` (`demand` module): the commands
+  a task will start, as plain data that depends on no scheduler: for each
+  `run` step its id, label, working directory (relative to the workspace),
+  `argv`, the key its history is kept under (the `key` a run hands an
+  executor; `None` when the label holds an expression), a weight hint, the
+  node before it, and `conditional: true` where the step may not run (an
+  `if:`, a matrix that is an expression, an install a receipt may have done,
+  an install skipped where its tool is missing). For a shard task the step
+  that runs the tests carries the command the runner's adapter builds, with
+  `{workspace}` where a workspace path would be. It fails for a task that
+  could not run (unknown task, a shell that cannot be run, a shard without a
+  command).
+- `schema_version` (`#[serde(default)]`, reading as 1 when absent) is on
+  `SetupRecipe`, `PreparedReceipt`, `TaskInputs`, `TaskResult`,
+  `ExecutionTask` and `JobGraph`, and `wire::Digested::digest` gives each of
+  them (and the wire results below) a `sha256:` digest of its canonical JSON.
+  The digest is not a field: the sender sends it next to the document and the
+  reader checks it with `verify_digest`. `execute_task`, `execute_setup` and
+  `verify_task_result` refuse a version other than `wire::WIRE_SCHEMA_VERSION`.
+- New `result_wire` module: `WireRunResult` and `WireTaskResult` are
+  `RunResult` and `TaskResult` as they cross between hosts: logs are paths
+  relative to the directory of the run or task, and there is no `run_dir`.
+  They read back (`into_run_result(run_dir)`, `into_task_result(dir)`) with a
+  directory of the receiver's, and refuse a log path that is absolute, holds
+  `..` or leaves it, a version this build does not read, and JSON over 64 MiB.
+  `validate_wire_run_result` is `validate_run_result` for such a result.
+  `complete::Verdict` and `Completeness` now also derive `Deserialize`. The
+  JSON `local-ci run` and `local-ci status` write is unchanged (pinned
+  byte for byte by a test).
+- `source::export_objects` also puts the index tree (what is staged) in the
+  bundle, as a commit of its own under `refs/local-ci/index/<source id>`, and
+  `import_objects` takes that ref and refuses a bundle that lacks it or
+  carries another tree than the manifest names, so a worker can tell what was
+  staged (`git diff --cached`). A bundle made by the previous build has no
+  such ref and is refused.
+- `.local-ci.toml`: a `secret_files` entry written as a table refuses a key it
+  does not know (`requird = true` was read as `required = false`).
+- Breaking changes for external code:
+  - The plan schema version is 6 (a plan of version 5 is refused by name):
+    `ExecutionTask` and `JobGraph` carry `schema_version`, so every digest
+    changed.
+  - `SetupRecipe`, `PreparedReceipt`, `TaskInputs`, `TaskResult`,
+    `ExecutionTask` and `JobGraph` have the new field `schema_version: u32`.
+    A struct literal outside this crate adds it
+    (`schema_version: local_ci::wire::WIRE_SCHEMA_VERSION`, or
+    `..Default::default()` for the types that have a `Default`).
+  - `SetupRecipe`, `TaskInputs` and `JobGraph` no longer derive `Default`;
+    they implement it by hand (the current version, nothing else).
 
 ## [0.9.0] - 2026-11-10
 
