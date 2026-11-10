@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-11-10
 
 - CLI behaviour change: a run that has skipped work now ends `incomplete`,
   exits 3 and has the commit status `error`, where it used to be `success`
