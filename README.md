@@ -452,7 +452,7 @@ cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.
 cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
 cargo schemata --file src/artifact.rs -- --lib artifact
 cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
-cargo schemata --file src/demand.rs -- --lib demand::tests --test task_demand
+cargo schemata --file src/demand.rs -- --lib --test task_demand
 ```
 
 `cargo schemata` copies the sources into `target/schemata/` and points `TMPDIR` there, which is
