@@ -199,6 +199,7 @@ fn a_request_makes_one_task_per_shard() {
     let again = sp.with_plan(sp.to_plan()).unwrap();
     assert_eq!(again, sp);
     assert_eq!(sp.shard_requests().len(), 1);
+    assert!(sp.shard_requests()[0].discovered.complete);
 }
 
 #[test]
@@ -217,6 +218,7 @@ fn a_native_split_lists_no_tests() {
     assert!(g.split && g.manifest.is_empty());
     assert_eq!(g.shards.len(), 3);
     assert_eq!(sp.with_plan(sp.to_plan()).unwrap(), sp);
+    assert!(!sp.shard_requests()[0].discovered.complete);
 }
 
 #[test]
