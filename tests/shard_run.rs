@@ -12,7 +12,9 @@ mod common;
 use local_ci::complete::aggregate_shard_group;
 use local_ci::dag::{NotSplit, ShardRequest};
 use local_ci::exec::{Opts, Outcome, Workspace};
-use local_ci::shard::adapters::{run_invocation, CargoTest, Jest, Playwright, Safety, Vitest};
+#[cfg(feature = "browser-tests")]
+use local_ci::shard::adapters::Playwright;
+use local_ci::shard::adapters::{run_invocation, CargoTest, Jest, Safety, Vitest};
 use local_ci::shard::{
     partition_tests, Discovered, History, PartitionOpts, RunnerAdapter, ShardOutcome, SplitMode,
     TestStatus,
@@ -368,13 +370,19 @@ fn vitest_shards_run_their_own_files_and_all_of_them_once() {
 }
 
 // A41: an end-to-end suite runs as shards the same way: each shard names its
-// tests in a test list, and the shards together run every test of every project once.
+// files in a test list, and the shards together run every test of every project
+// once. Runs a browser, so it is a test of the `browser-tests` feature.
+#[cfg(feature = "browser-tests")]
 #[test]
 fn playwright_shards_run_their_own_tests_and_all_of_them_once() {
+    use local_ci::shard::adapters::Isolation;
     let l = lab("playwright", "npx playwright test", "");
-    let a = Playwright::from_command("1.63.0", "npx playwright test", Safety::default()).unwrap();
+    let isolation = Isolation::Declared {
+        evidence: "the example starts nothing the shards share".into(),
+    };
+    let a = Playwright::from_command("1.63.0", "npx playwright test", isolation).unwrap();
     let (d, fp) = split(&l, &a, "playwright", 3);
-    assert_eq!(d.tests.len(), 12);
+    assert_eq!(d.tests.len(), 6);
     let outcomes = run_shards(&l, &fp);
     assert_covers(&fp, &d, &outcomes);
     assert!(
@@ -502,6 +510,7 @@ fn split_unfiltered(l: &Lab) -> ((), FrozenPlan) {
     let d = Discovered {
         tests: vec!["a".into(), "b".into()],
         complete: true,
+        ..Default::default()
     };
     let p = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
     let fp =

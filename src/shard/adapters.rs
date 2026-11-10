@@ -30,7 +30,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// What the caller knows about the job that the runner cannot tell.
+/// What the caller knows about a job of *unit* tests that the runner cannot
+/// tell. Only the unit test runners (`cargo test`, Vitest, Jest) take it: their
+/// tests touch nothing outside the checkout, so [`Safety::default`] says so.
+/// An end-to-end runner (Playwright, Cypress) does not take a `Safety`; it takes
+/// an [`Isolation`], which is nothing until the caller declares it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Safety {
     /// The tests of different shards update state they share.
@@ -41,7 +45,8 @@ pub struct Safety {
 }
 
 impl Default for Safety {
-    /// Unit tests that touch nothing outside their checkout.
+    /// Unit tests that touch nothing outside their checkout. Not for an
+    /// end-to-end suite: that takes an [`Isolation`].
     fn default() -> Self {
         Safety {
             shared_state: false,
@@ -50,16 +55,28 @@ impl Default for Safety {
     }
 }
 
-impl Safety {
-    /// What an end-to-end suite is until the caller says otherwise: its tests
-    /// reach a server, a database or a browser profile the workflow starts, and
-    /// nothing says each shard gets its own. Such a job is not split
-    /// ([`NotSplit::NoIsolation`]); a caller that has isolated them uses
-    /// [`Safety::default`] or its own value.
-    pub fn e2e() -> Self {
+/// Whether the shards of an end-to-end suite each get the servers, databases
+/// and browser profiles its tests use. The type is the main defence: the
+/// workflow scan of [`super::isolation`] sees only what the workflow says, so
+/// an end-to-end adapter does not split until the caller names what isolates
+/// its shards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Isolation {
+    /// Nothing says each shard has what it uses: the job is not split
+    /// ([`NotSplit::NoIsolation`]).
+    #[default]
+    None,
+    /// The caller knows each shard has its own, and says how (a port per
+    /// shard from the caller's own allocator, a database per run, ...). A blank
+    /// `evidence` is no declaration.
+    Declared { evidence: String },
+}
+
+impl Isolation {
+    fn safety(&self) -> Safety {
         Safety {
             shared_state: false,
-            isolated_fixtures: false,
+            isolated_fixtures: matches!(self, Isolation::Declared { evidence } if !evidence.trim().is_empty()),
         }
     }
 }
@@ -102,6 +119,10 @@ struct Known {
     filters: &'static [&'static str],
     /// The same, with a value.
     filters_valued: &'static [&'static str],
+    /// Arguments with a value that change where the tests are (another
+    /// configuration file, another project directory): the listing would be of
+    /// other tests than the shards run.
+    unreadable_valued: &'static [&'static str],
 }
 
 const CARGO: Known = Known {
@@ -136,6 +157,7 @@ const CARGO: Known = Known {
     ],
     filters: &[],
     filters_valued: &[],
+    unreadable_valued: &[],
 };
 
 const VITEST: Known = Known {
@@ -143,6 +165,7 @@ const VITEST: Known = Known {
     valued: &["--config", "-c", "--project"],
     filters: &["--changed"],
     filters_valued: &["-t", "--testNamePattern", "--exclude", "--shard", "--dir"],
+    unreadable_valued: &[],
 };
 
 const JEST: Known = Known {
@@ -161,6 +184,7 @@ const JEST: Known = Known {
         "--findRelatedTests",
         "--shard",
     ],
+    unreadable_valued: &[],
 };
 
 const PLAYWRIGHT: Known = Known {
@@ -186,23 +210,15 @@ const PLAYWRIGHT: Known = Known {
         "--test-list",
         "--test-list-invert",
     ],
+    unreadable_valued: &[],
 };
 
 const CYPRESS: Known = Known {
     flags: &["--headless", "--headed", "--e2e"],
-    valued: &[
-        "--browser",
-        "-b",
-        "--config",
-        "-c",
-        "--config-file",
-        "--project",
-        "-P",
-        "--env",
-        "-e",
-    ],
+    valued: &["--browser", "-b", "--config", "-c", "--env", "-e"],
     filters: &[],
     filters_valued: &["--spec", "-s", "--tag"],
+    unreadable_valued: &["--config-file", "--project", "-P"],
 };
 
 /// Words of an argument that choose which spec files Cypress runs.
@@ -281,7 +297,12 @@ pub fn parse_command(run: &str) -> Option<Parsed> {
         let takes_value = !inline;
         // a job that collects coverage has reports that only a merge of its
         // shards' could give; nothing here collects them from the shards
-        if a.starts_with("--coverage") || a.starts_with("--collectCoverage") {
+        if a.starts_with("--coverage")
+            || a.starts_with("--collectCoverage")
+            || a == "--cov"
+            || a.starts_with("--cov=")
+            || a.starts_with("--cov-")
+        {
             block(NotSplit::CoverageNotMerged);
             if takes_value && args.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
                 i += 1;
@@ -303,6 +324,11 @@ pub fn parse_command(run: &str) -> Option<Parsed> {
             block(NotSplit::JobFilter);
         } else if known.filters_valued.contains(&name) {
             block(NotSplit::JobFilter);
+            if takes_value {
+                i += 1;
+            }
+        } else if known.unreadable_valued.contains(&name) {
+            block(NotSplit::UnreadableArgs);
             if takes_value {
                 i += 1;
             }
@@ -351,17 +377,17 @@ pub fn from_info(info: &RunnerInfo, root: &str) -> Option<Box<dyn RunnerAdapter>
             command: argv(&["npx", "jest"]),
             blocked: vec![],
         }),
+        // where the shards run, whether they are isolated is not asked again
+        // (the plan was made with it); an adapter made here claims none
         "playwright" => Box::new(Playwright {
             info: info.clone(),
-            safety,
+            isolation: Isolation::None,
             command: argv(&["npx", "playwright", "test"]),
             blocked: vec![],
         }),
         "cypress" => Box::new(Cypress {
             info: info.clone(),
-            safety,
-            root: root.into(),
-            command: argv(&["npx", "cypress", "run"]),
+            isolation: Isolation::None,
             blocked: vec![],
         }),
         _ => return None,
@@ -568,7 +594,11 @@ impl RunnerAdapter for CargoTest {
         }
         tests.sort();
         tests.dedup();
-        Ok(Discovered { tests, complete })
+        Ok(Discovered {
+            tests,
+            complete,
+            ..Default::default()
+        })
     }
 
     fn invoke(&self, shard: &Shard, _count: usize, mode: SplitMode) -> Invocation {
@@ -715,16 +745,45 @@ fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> 
     }
 }
 
+/// The line a listing prints for a configuration file that turns coverage on.
+const COVERAGE_LINE: &str = "local-ci:coverage ";
+
+/// A script that runs the command it is given after saying which
+/// configuration files of the project turn coverage on (`collectCoverage`,
+/// `coverageThreshold`, `coverage: { enabled: true }`): such a job collects
+/// coverage whatever its command says. The files are looked at by text, so
+/// this is a guess that errs towards not splitting.
+const COVERAGE_PROBE: &str = "for f in vitest.config.* vitest.workspace.* vite.config.* jest.config.* package.json; do \
+[ -f \"$f\" ] || continue; \
+if tr '\\n' ' ' < \"$f\" | grep -Eq 'collectCoverage|coverageThreshold|coverage[^;]{0,200}enabled[[:space:]]*:[[:space:]]*true'; then \
+echo \"local-ci:coverage $f\"; fi; done; exec \"$@\"";
+
+/// `command` run after [`COVERAGE_PROBE`].
+fn probed(command: Vec<String>) -> Invocation {
+    let mut v = argv(&["sh", "-c", COVERAGE_PROBE, "sh"]);
+    v.extend(command);
+    invocation(v)
+}
+
 /// The files a listing prints, one per line, by the name they are listed by.
 fn listed_files(root: &str, out: &CommandOutput) -> Result<Discovered, String> {
     if !out.success {
         return Err(failed_listing(out));
     }
-    let mut tests: Vec<String> = out
+    let lines: Vec<&str> = out
         .stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .collect();
+    let blocked = if lines.iter().any(|l| l.starts_with(COVERAGE_LINE)) {
+        vec![NotSplit::CoverageNotMerged]
+    } else {
+        vec![]
+    };
+    let mut tests: Vec<String> = lines
+        .iter()
+        .filter(|l| !l.starts_with(COVERAGE_LINE))
         .map(|l| relative(root, l))
         .collect();
     tests.sort();
@@ -732,6 +791,7 @@ fn listed_files(root: &str, out: &CommandOutput) -> Result<Discovered, String> {
     Ok(Discovered {
         tests,
         complete: true,
+        blocked,
     })
 }
 
@@ -788,7 +848,7 @@ impl RunnerAdapter for Vitest {
         let mut v = self.command.clone();
         v.extend(argv(&["list", "--filesOnly"]));
         v.extend(self.info.config.iter().cloned());
-        invocation(v)
+        probed(v)
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
@@ -862,7 +922,7 @@ impl RunnerAdapter for Jest {
         let mut v = self.command.clone();
         v.push("--listTests".into());
         v.extend(self.info.config.iter().cloned());
-        invocation(v)
+        probed(v)
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
@@ -895,6 +955,13 @@ impl RunnerAdapter for Jest {
 /// which is also how `--test-list` reads a line.
 const PW_SEP: &str = " › ";
 
+/// The script that lists a Playwright suite and what a listing cannot show
+/// (see the file).
+const PW_LIST: &str = include_str!("js/playwright_list.js");
+
+/// The oldest Playwright with `--test-list` (1.56.0).
+const PW_TEST_LIST_SINCE: (u64, u64) = (1, 56);
+
 /// A test of a Playwright JSON report.
 struct PwTest {
     /// The project, the file (relative to the test directory), the titles of
@@ -905,17 +972,19 @@ struct PwTest {
     ran: bool,
 }
 
+/// `[project] › file › title`
+fn pw_name(parts: &[String]) -> String {
+    format!("[{}]{PW_SEP}{}", parts[0], parts[1..].join(PW_SEP))
+}
+
 impl PwTest {
     fn identity(&self) -> String {
-        format!(
-            "[{}]{PW_SEP}{}",
-            self.parts[0],
-            self.parts[1..].join(PW_SEP)
-        )
+        pw_name(&self.parts)
     }
 
-    fn result(&self) -> TestResult {
+    fn result(&self, fail_on_flaky: bool) -> TestResult {
         let status = match self.status.as_str() {
+            "flaky" if fail_on_flaky => TestStatus::Failed,
             "expected" | "flaky" => TestStatus::Passed,
             // a test that was meant to run and has no result was cut short
             // (a failure limit, a timeout of the run)
@@ -973,6 +1042,53 @@ fn pw_tests(report: &Value) -> Vec<PwTest> {
     out
 }
 
+/// What the listing script found out besides the listing.
+struct PwFacts {
+    version: Option<String>,
+    /// Projects whose tests differ with and without their dependencies.
+    dependencies: Vec<String>,
+    /// Words of the configuration file that matter (`dependencies`,
+    /// `teardown`, `globalSetup`, `fullyParallel:false`).
+    mentions: Vec<String>,
+    /// Spec files that declare serial tests.
+    serial: BTreeSet<String>,
+}
+
+fn pw_facts(report: &Value) -> Option<PwFacts> {
+    let facts = report.get("localCi")?;
+    let strings = |k: &str| -> Vec<String> {
+        facts
+            .get(k)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    };
+    Some(PwFacts {
+        version: facts
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        dependencies: strings("dependencies"),
+        mentions: strings("config_mentions"),
+        serial: strings("serial_files").into_iter().collect(),
+    })
+}
+
+/// `--test-list` exists from 1.56.0; a version that cannot be read is not
+/// known to have it.
+fn pw_has_test_list(version: Option<&str>) -> bool {
+    let at_least = || {
+        let mut n = version?.trim().split('.');
+        let major: u64 = n.next()?.parse().ok()?;
+        let minor: u64 = n.next()?.parse().ok()?;
+        Some((major, minor) >= PW_TEST_LIST_SINCE)
+    };
+    at_least().unwrap_or(false)
+}
+
 /// Something in the configuration that a shard run on its own cannot be given
 /// a copy of, or that changes what a run reports.
 fn pw_config_reason(report: &Value) -> Option<String> {
@@ -1010,16 +1126,35 @@ fn pw_config_reason(report: &Value) -> Option<String> {
     repeats.then(|| "a project repeats its tests".into())
 }
 
-/// The names of the tests of a listing, or why they cannot be told apart by a
+/// The units a listing is divided into. Playwright runs the tests of a file
+/// one after the other in one worker unless the suite is fully parallel, so a
+/// file of such a suite is one unit (`[project] › file`; a `--test-list` line
+/// with no title selects the whole file). A fully parallel suite is divided by
+/// test, except the files that declare serial tests, which stay whole.
+fn pw_units(tests: &[PwTest], fully_parallel: bool, serial: &BTreeSet<String>) -> Vec<Vec<String>> {
+    let mut files: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut units = Vec::new();
+    for t in tests {
+        if !fully_parallel || serial.contains(&t.parts[1]) {
+            files.insert(t.parts[..2].to_vec());
+        } else {
+            units.push(t.parts.clone());
+        }
+    }
+    units.extend(files);
+    units
+}
+
+/// The names of the units of a listing, or why they cannot be told apart by a
 /// test list: a part that is empty, has a blank at its ends, holds the
 /// separator or a line break; two tests with one name; a test named like a
 /// group that holds others (the test list would select both).
-fn pw_identities(tests: &[PwTest]) -> Result<Vec<String>, String> {
-    if tests.is_empty() {
+fn pw_identities(units: &[Vec<String>]) -> Result<Vec<String>, String> {
+    if units.is_empty() {
         return Err("the listing holds no test".into());
     }
-    for t in tests {
-        if let Some(bad) = t.parts.iter().enumerate().find(|(i, p)| {
+    for parts in units {
+        if let Some(bad) = parts.iter().enumerate().find(|(i, p)| {
             (*i > 0 && p.is_empty())
                 || p.trim() != p.as_str()
                 || p.contains('›')
@@ -1027,12 +1162,12 @@ fn pw_identities(tests: &[PwTest]) -> Result<Vec<String>, String> {
         }) {
             return Err(format!(
                 "`{}` cannot be named in a test list (its part `{}` is empty, padded, or has a `›` or a line break)",
-                t.identity(),
+                pw_name(parts),
                 bad.1
             ));
         }
     }
-    let mut sorted: Vec<&Vec<String>> = tests.iter().map(|t| &t.parts).collect();
+    let mut sorted: Vec<&Vec<String>> = units.iter().collect();
     sorted.sort();
     for w in sorted.windows(2) {
         if w[0] == w[1] {
@@ -1045,9 +1180,39 @@ fn pw_identities(tests: &[PwTest]) -> Result<Vec<String>, String> {
             ));
         }
     }
-    let mut ids: Vec<String> = tests.iter().map(PwTest::identity).collect();
+    let mut ids: Vec<String> = units.iter().map(|u| pw_name(u)).collect();
     ids.sort();
     Ok(ids)
+}
+
+/// The results of a shard, one per unit it was given: a unit that names a file
+/// stands for all its tests (failed if one failed, skipped if all were).
+fn pw_fold(results: Vec<TestResult>, given: &[String]) -> Vec<TestResult> {
+    let mut units: Vec<(String, Vec<TestStatus>)> = Vec::new();
+    for r in results {
+        let unit = given
+            .iter()
+            .find(|g| r.identity == **g || r.identity.starts_with(&format!("{g}{PW_SEP}")))
+            .cloned()
+            .unwrap_or(r.identity);
+        match units.iter_mut().find(|(u, _)| *u == unit) {
+            Some((_, statuses)) => statuses.push(r.status),
+            None => units.push((unit, vec![r.status])),
+        }
+    }
+    units
+        .into_iter()
+        .map(|(identity, statuses)| {
+            let status = if statuses.contains(&TestStatus::Failed) {
+                TestStatus::Failed
+            } else if statuses.iter().all(|s| *s == TestStatus::Skipped) {
+                TestStatus::Skipped
+            } else {
+                TestStatus::Passed
+            };
+            TestResult { identity, status }
+        })
+        .collect()
 }
 
 /// A shell script that writes the tests it is given (one per line) to a file
@@ -1065,28 +1230,31 @@ fn pw_script(command: &[String]) -> String {
     )
 }
 
-/// Playwright, split by test: a shard names its tests in a test list
-/// (`--test-list`), each as `[project] › file › title`, so a test of each
-/// project is a test of its own.
+/// Playwright, split by file, or by test where the suite is fully parallel: a
+/// shard names its units in a test list (`--test-list`, Playwright 1.56 and
+/// later), each as `[project] › file` or `[project] › file › title`.
 ///
 /// The runner's `--shard` is not used: it divides whole test groups, so
 /// a shard can be left with no test, and a run with no test succeeds. A project
-/// with `dependencies` (a setup project) is not visible in the listing; the
-/// tests of the setup run in every shard that needs them, which the merge
-/// reports as a test no shard was given.
+/// that depends on another (or has a teardown) is not split: `--list --project
+/// P` shows the other project's tests, and a shard that runs a test of `P`
+/// runs them again.
+///
+/// It does not split until the caller declares what isolates its shards
+/// ([`Isolation`]), and a shard's report is read with
+/// [`RunnerAdapter::collect_given`].
 #[derive(Debug, Clone)]
 pub struct Playwright {
     info: RunnerInfo,
-    safety: Safety,
+    isolation: Isolation,
     command: Vec<String>,
     blocked: Vec<NotSplit>,
 }
 
 impl Playwright {
     /// `config` are the arguments of the job's own command that leave the tests
-    /// alone (`--config x`, `--project y`). An end-to-end suite starts with
-    /// [`Safety::e2e`] unless the caller knows each shard has what it uses.
-    pub fn new(version: &str, config: &[&str], safety: Safety) -> Self {
+    /// alone (`--config x`, `--project y`).
+    pub fn new(version: &str, config: &[&str], isolation: Isolation) -> Self {
         Playwright {
             info: RunnerInfo {
                 runner: "playwright".into(),
@@ -1094,19 +1262,19 @@ impl Playwright {
                 config: config.iter().map(|s| s.to_string()).collect(),
                 filters: vec![],
             },
-            safety,
+            isolation,
             command: argv(&["npx", "playwright", "test"]),
             blocked: vec![],
         }
     }
 
     /// The runner of a job's `run` text; `None` when it is not `playwright test`.
-    pub fn from_command(version: &str, run: &str, safety: Safety) -> Option<Self> {
+    pub fn from_command(version: &str, run: &str, isolation: Isolation) -> Option<Self> {
         let p = parse_command(run).filter(|p| p.runner == "playwright")?;
         let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
         Some(Playwright {
             blocked: p.blocked,
-            ..Playwright::new(version, &args, safety)
+            ..Playwright::new(version, &args, isolation)
         })
     }
 
@@ -1124,11 +1292,15 @@ impl RunnerAdapter for Playwright {
     }
 
     fn capabilities(&self) -> Capabilities {
-        caps(false, self.safety, &self.blocked, false)
+        caps(false, self.isolation.safety(), &self.blocked, false)
     }
 
     fn discover_command(&self) -> Invocation {
-        invocation(self.base(&["--list", "--reporter=json"]))
+        let json = |v: &[String]| serde_json::to_string(v).expect("strings are JSON");
+        let mut v = argv(&["node", "-e", PW_LIST, "--"]);
+        v.push(json(&self.command));
+        v.push(json(&self.info.config));
+        invocation(v)
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
@@ -1137,12 +1309,32 @@ impl RunnerAdapter for Playwright {
         }
         let report = json_with(&out.stdout, "suites")
             .ok_or_else(|| "the listing holds no JSON report".to_string())?;
+        let facts = pw_facts(&report)
+            .ok_or_else(|| "the listing was not made by the command of this adapter".to_string())?;
         if let Some(why) = pw_config_reason(&report) {
             return Err(why);
         }
+        let mut blocked = Vec::new();
+        if !pw_has_test_list(facts.version.as_deref()) {
+            blocked.push(NotSplit::RunnerTooOld);
+        }
+        let depends = ["dependencies", "teardown"]
+            .iter()
+            .any(|w| facts.mentions.iter().any(|m| m == w));
+        if !facts.dependencies.is_empty() || depends {
+            blocked.push(NotSplit::ProjectDependencies);
+        }
+        let parallel = report
+            .get("config")
+            .and_then(|c| c.get("fullyParallel"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            && !facts.mentions.iter().any(|m| m == "fullyParallel:false");
+        let units = pw_units(&pw_tests(&report), parallel, &facts.serial);
         Ok(Discovered {
-            tests: pw_identities(&pw_tests(&report))?,
+            tests: pw_identities(&units)?,
             complete: true,
+            blocked,
         })
     }
 
@@ -1167,16 +1359,37 @@ impl RunnerAdapter for Playwright {
 
     fn collect(&self, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome {
         let report = json_with(&out.stdout, "suites");
+        let fail_on_flaky = report
+            .as_ref()
+            .and_then(|r| r.get("config")?.get("failOnFlakyTests")?.as_bool())
+            == Some(true);
         ShardOutcome {
             job_id: job_id.into(),
             shard_id: shard_id.into(),
             tests: report
                 .as_ref()
-                .map(|r| pw_tests(r).iter().map(PwTest::result).collect())
+                .map(|r| {
+                    pw_tests(r)
+                        .iter()
+                        .map(|t| t.result(fail_on_flaky))
+                        .collect()
+                })
                 .unwrap_or_default(),
             exit_ok: out.success,
             parsed: report.is_some(),
         }
+    }
+
+    fn collect_given(
+        &self,
+        job_id: &str,
+        shard_id: &str,
+        out: &CommandOutput,
+        given: &[String],
+    ) -> ShardOutcome {
+        let mut o = self.collect(job_id, shard_id, out);
+        o.tests = pw_fold(o.tests, given);
+        o
     }
 }
 
@@ -1197,46 +1410,38 @@ if [ -f \"$c\" ] && grep -Eq 'specPattern|excludeSpecPattern|integrationFolder|t
 echo \"$c chooses which files are specs; list them in a plan of your own\" >&2; exit 3; fi; done; \
 find cypress/e2e -type f \\( -name '*.cy.js' -o -name '*.cy.jsx' -o -name '*.cy.ts' -o -name '*.cy.tsx' \\) | LC_ALL=C sort";
 
-/// A line of the table Cypress prints when a run ends:
-/// `✔  path  00:02  tests passing failing pending skipped`.
-fn cypress_row(root: &str, line: &str) -> Option<TestResult> {
-    let t: Vec<&str> = line
-        .trim_matches(|c: char| c == '│' || c.is_whitespace())
-        .split_whitespace()
-        .collect();
-    let [mark, path, time, counts @ ..] = t.as_slice() else {
-        return None;
-    };
-    let clock = time.len() == 5
-        && time
-            .char_indices()
-            .all(|(i, c)| if i == 2 { c == ':' } else { c.is_ascii_digit() });
-    let n = |s: &str| {
-        if s == "-" {
-            Some(0)
-        } else {
-            s.parse::<u64>().ok()
-        }
-    };
-    let counts: Option<Vec<u64>> = counts.iter().map(|c| n(c)).collect();
-    let (true, true, Some([_, passing, failing, ..])) = (
-        matches!(*mark, "✔" | "✖" | "-"),
-        clock && counts.as_ref().is_some_and(|c| c.len() == 5),
-        counts.as_deref(),
-    ) else {
-        return None;
-    };
-    let status = if *mark == "✖" || *failing > 0 {
-        TestStatus::Failed
-    } else if *passing > 0 {
-        TestStatus::Passed
-    } else {
-        TestStatus::Skipped
-    };
-    Some(TestResult {
-        identity: relative(root, path),
-        status,
-    })
+/// The script that runs Cypress through its module API and prints the line a
+/// shard's report is read from (see the file).
+const CYPRESS_RUN: &str = include_str!("js/cypress_run.js");
+
+/// The line [`CYPRESS_RUN`] prints before its JSON.
+const CYPRESS_MARK: &str = "LOCAL_CI_CYPRESS ";
+
+/// The report of the line [`CYPRESS_RUN`] printed: a result per spec file, and
+/// whether the run could not be made at all.
+fn cypress_report(stdout: &str) -> Option<Vec<TestResult>> {
+    let line = without_ansi(stdout)
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(CYPRESS_MARK).map(str::to_string))?;
+    let report: Value = serde_json::from_str(&line).ok()?;
+    let runs = report.get("runs")?.as_array()?;
+    runs.iter()
+        .map(|r| {
+            let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let status = if n("failures") > 0 || r.get("error")?.as_bool()? {
+                TestStatus::Failed
+            } else if n("passes") > 0 {
+                TestStatus::Passed
+            } else {
+                TestStatus::Skipped
+            };
+            Some(TestResult {
+                identity: r.get("spec")?.as_str()?.to_string(),
+                status,
+            })
+        })
+        .collect()
 }
 
 /// Cypress, split by spec file.
@@ -1244,21 +1449,24 @@ fn cypress_row(root: &str, line: &str) -> Option<TestResult> {
 /// Cypress has no command that lists its specs. The listing is the files of
 /// the default layout (`cypress/e2e/**/*.cy.{js,jsx,ts,tsx}`); a configuration
 /// that says which files are specs makes the listing fail rather than be
-/// guessed. A shard runs its files with `--spec`, and what it reports is the
-/// table Cypress prints at the end of a run, one row per spec file.
+/// guessed. A shard runs its files through Cypress's module API (a small
+/// script, since `cypress run` prints a table with shortened names, and the
+/// module API resolves whatever the tests did), which prints one JSON line
+/// with a result per spec file and exits with the verdict.
+///
+/// It does not split until the caller declares what isolates its shards
+/// ([`Isolation`]).
 #[derive(Debug, Clone)]
 pub struct Cypress {
     info: RunnerInfo,
-    safety: Safety,
-    root: String,
-    command: Vec<String>,
+    isolation: Isolation,
     blocked: Vec<NotSplit>,
 }
 
 impl Cypress {
     /// `config` are the arguments of the job's own command that leave the specs
-    /// alone. See [`Safety::e2e`] for `safety`.
-    pub fn new(version: &str, root: &str, config: &[&str], safety: Safety) -> Self {
+    /// alone.
+    pub fn new(version: &str, config: &[&str], isolation: Isolation) -> Self {
         Cypress {
             info: RunnerInfo {
                 runner: "cypress".into(),
@@ -1266,20 +1474,18 @@ impl Cypress {
                 config: config.iter().map(|s| s.to_string()).collect(),
                 filters: vec![],
             },
-            safety,
-            root: root.into(),
-            command: argv(&["npx", "cypress", "run"]),
+            isolation,
             blocked: vec![],
         }
     }
 
     /// The runner of a job's `run` text; `None` when it is not `cypress run`.
-    pub fn from_command(version: &str, root: &str, run: &str, safety: Safety) -> Option<Self> {
+    pub fn from_command(version: &str, run: &str, isolation: Isolation) -> Option<Self> {
         let p = parse_command(run).filter(|p| p.runner == "cypress")?;
         let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
         Some(Cypress {
             blocked: p.blocked,
-            ..Cypress::new(version, root, &args, safety)
+            ..Cypress::new(version, &args, isolation)
         })
     }
 }
@@ -1290,7 +1496,7 @@ impl RunnerAdapter for Cypress {
     }
 
     fn capabilities(&self) -> Capabilities {
-        caps(false, self.safety, &self.blocked, false)
+        caps(false, self.isolation.safety(), &self.blocked, false)
     }
 
     fn discover_command(&self) -> Invocation {
@@ -1324,30 +1530,30 @@ impl RunnerAdapter for Cypress {
         Ok(Discovered {
             tests,
             complete: true,
+            ..Default::default()
         })
     }
 
     fn invoke(&self, shard: &Shard, _count: usize, mode: SplitMode) -> Invocation {
-        let mut v = self.command.clone();
-        v.extend(self.info.config.iter().cloned());
-        if mode == SplitMode::Listed {
-            v.push("--spec".into());
-            v.push(shard.tests.join(","));
-        }
+        let json = |v: &[String]| serde_json::to_string(v).expect("strings are JSON");
+        let specs: &[String] = if mode == SplitMode::Listed {
+            &shard.tests
+        } else {
+            &[]
+        };
+        let mut v = argv(&["node", "-e", CYPRESS_RUN, "--"]);
+        v.push(json(&self.info.config));
+        v.push(json(specs));
         invocation(v)
     }
 
     fn collect(&self, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome {
-        let text = without_ansi(&out.stdout);
-        let tests: Vec<TestResult> = text
-            .lines()
-            .filter_map(|l| cypress_row(&self.root, l))
-            .collect();
+        let tests = cypress_report(&out.stdout);
         ShardOutcome {
             job_id: job_id.into(),
             shard_id: shard_id.into(),
-            parsed: !tests.is_empty(),
-            tests,
+            parsed: tests.is_some(),
+            tests: tests.unwrap_or_default(),
             exit_ok: out.success,
         }
     }
@@ -1484,7 +1690,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let v = Vitest::new("2.1.9", "/p", &["--config=v.js"], Safety::default());
         assert_eq!(v.info().runner, "vitest");
         assert_eq!(
-            v.discover_command().argv,
+            v.discover_command().argv[4..],
             ["npx", "vitest", "list", "--filesOnly", "--config=v.js"]
         );
         let d = v
@@ -1522,7 +1728,10 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
     fn jest_lists_files_and_runs_them_by_path() {
         let j = Jest::new("29", "/p", &[], Safety::default());
         assert_eq!(j.info().runner, "jest");
-        assert_eq!(j.discover_command().argv, ["npx", "jest", "--listTests"]);
+        assert_eq!(
+            j.discover_command().argv[4..],
+            ["npx", "jest", "--listTests"]
+        );
         let d = j
             .discover(&out("/p/z.test.js\n/p/a.test.js\n", true))
             .unwrap();
@@ -1736,6 +1945,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let d = Discovered {
             tests: vec!["a".into(), "b".into()],
             complete: true,
+            ..Default::default()
         };
         let p = c.partition(
             &d,
@@ -1904,7 +2114,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let j = Jest::new("29", "/p", &["--config=j.js"], Safety::default());
         assert_eq!(j.info().config, ["--config=j.js"]);
         assert_eq!(
-            j.discover_command().argv,
+            j.discover_command().argv[4..],
             ["npx", "jest", "--listTests", "--config=j.js"]
         );
         assert_eq!(
@@ -1963,14 +2173,37 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
 
     // ---- Playwright and Cypress ----
 
+    fn declared() -> Isolation {
+        Isolation::Declared {
+            evidence: "each shard starts its own server on a port of its own".into(),
+        }
+    }
+
     /// A Playwright JSON report: `(file, [(group, [(title, project, status, expected, ran)])])`
     /// shaped like the real one (a file suite, groups under it, specs with one test per project).
     fn pw_report(files: serde_json::Value, config: serde_json::Value) -> String {
-        serde_json::json!({ "config": config, "suites": files, "errors": [] }).to_string()
+        pw_report_with(files, config, pw_facts_ok())
+    }
+
+    /// What the listing script adds to the report.
+    fn pw_facts_ok() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.63.0", "dependencies": [], "config_mentions": [], "serial_files": []
+        })
+    }
+
+    fn pw_report_with(
+        files: serde_json::Value,
+        config: serde_json::Value,
+        facts: serde_json::Value,
+    ) -> String {
+        serde_json::json!({ "config": config, "suites": files, "errors": [], "localCi": facts })
+            .to_string()
     }
 
     fn pw_config() -> serde_json::Value {
         serde_json::json!({
+            "fullyParallel": true,
             "webServer": null,
             "globalSetup": null,
             "globalTeardown": null,
@@ -2014,20 +2247,13 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
 
     #[test]
     fn playwright_lists_a_test_per_project_and_names_it_as_a_test_list_does() {
-        let a = Playwright::new("1.63.0", &["--config", "pw.js"], Safety::default());
+        let a = Playwright::new("1.63.0", &["--config", "pw.js"], declared());
         let inv = a.discover_command();
-        assert_eq!(
-            inv.argv,
-            [
-                "npx",
-                "playwright",
-                "test",
-                "--list",
-                "--reporter=json",
-                "--config",
-                "pw.js"
-            ]
-        );
+        assert_eq!(&inv.argv[..2], ["node", "-e"]);
+        assert!(inv.argv[2].contains("--no-deps") && inv.argv[2].contains("describe"));
+        assert_eq!(inv.argv[3], "--");
+        assert_eq!(inv.argv[4], r#"["npx","playwright","test"]"#);
+        assert_eq!(inv.argv[5], r#"["--config","pw.js"]"#);
         let d = a.discover(&out(&pw_listing(), true)).unwrap();
         assert!(d.complete);
         assert_eq!(
@@ -2052,14 +2278,17 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
             .contains("no JSON report"));
         // a report that is not Playwright's holds no test
         assert!(a
-            .discover(&out(r#"{"suites": []}"#, true))
+            .discover(&out(
+                r#"{"suites": [], "localCi": {"version": "1.63.0"}}"#,
+                true
+            ))
             .unwrap_err()
             .contains("holds no test"));
     }
 
     #[test]
     fn a_playwright_listing_that_shows_what_shards_would_share_is_not_split() {
-        let a = Playwright::new("1", &[], Safety::default());
+        let a = Playwright::new("1", &[], declared());
         let files = serde_json::json!([{
             "title": "a.spec.js", "file": "a.spec.js",
             "specs": [pw_spec("one", &[("desktop", "skipped", "passed", false)])],
@@ -2083,7 +2312,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
                 "repeats",
             ),
             (
-                serde_json::json!({"config": pw_config(), "suites": files, "errors": [{"message": "x"}]})
+                serde_json::json!({"config": pw_config(), "suites": files, "errors": [{"message": "x"}], "localCi": pw_facts_ok()})
                     .to_string(),
                 "has errors",
             ),
@@ -2094,13 +2323,19 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         // empty lists and a missing config are not a reason
         let ok = with("webServer", serde_json::json!([]));
         assert!(a.discover(&out(&ok, true)).is_ok());
-        let bare = serde_json::json!({"suites": files}).to_string();
+        let bare = serde_json::json!({"suites": files, "localCi": pw_facts_ok()}).to_string();
         assert!(a.discover(&out(&bare, true)).is_ok());
+        // a listing that the command of the adapter did not make is not read
+        let plain = serde_json::json!({"suites": files}).to_string();
+        assert!(a
+            .discover(&out(&plain, true))
+            .unwrap_err()
+            .contains("not made by the command"));
     }
 
     #[test]
     fn playwright_tests_that_a_test_list_cannot_tell_apart_are_not_listed() {
-        let a = Playwright::new("1", &[], Safety::default());
+        let a = Playwright::new("1", &[], declared());
         let listing = |specs: Vec<serde_json::Value>, group: &str| {
             pw_report(
                 serde_json::json!([{
@@ -2148,7 +2383,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let a = Playwright::new(
             "1",
             &["--config", "my pw.js", "--project", "it's"],
-            Safety::default(),
+            declared(),
         );
         let s = Shard {
             index: 1,
@@ -2191,7 +2426,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
 
     #[test]
     fn a_playwright_report_gives_one_result_per_test_and_project() {
-        let a = Playwright::new("1", &[], Safety::default());
+        let a = Playwright::new("1", &[], declared());
         let report = pw_report(
             serde_json::json!([{
                 "title": "a.spec.js", "file": "a.spec.js",
@@ -2324,25 +2559,9 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         assert_eq!(parsed("jest --coverage").args, Vec::<String>::new());
     }
 
-    fn cypress_table(rows: &[&str]) -> String {
-        let mut t = String::from(
-            "\n  (Run Finished)\n\n\n       Spec                                              Tests  Passing  Failing  Pending  Skipped  \n  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐\n",
-        );
-        for r in rows {
-            t.push_str(&format!("  │ {r} │\n"));
-        }
-        t.push_str("  └────────────────────────────────────────────────────────────────────────────────────────────────┘\n    ✖  1 of 3 failed (33%)                     00:06        5        4        1        -        -  \n");
-        t
-    }
-
     #[test]
-    fn cypress_lists_the_files_of_its_default_layout_and_reads_the_summary_table() {
-        let a = Cypress::new(
-            "13.0.0",
-            "/w/app",
-            &["--browser", "chrome"],
-            Safety::default(),
-        );
+    fn cypress_lists_the_files_of_its_default_layout_and_runs_them_through_its_module_api() {
+        let a = Cypress::new("13.0.0", &["--browser", "chrome"], declared());
         let inv = a.discover_command();
         assert_eq!(&inv.argv[..2], ["sh", "-c"]);
         assert!(inv.argv[2].contains("cypress/e2e") && inv.argv[2].contains("exit 3"));
@@ -2373,31 +2592,50 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         }
 
         let s = shard(&["cypress/e2e/a.cy.ts", "cypress/e2e/b.cy.js"]);
+        let listed = a.invoke(&s, 2, SplitMode::Listed).argv;
+        assert_eq!(&listed[..2], ["node", "-e"]);
+        assert!(listed[2].contains("cypress.run") && listed[2].contains("process.exit"));
+        assert_eq!(listed[3], "--");
+        assert_eq!(listed[4], r#"["--browser","chrome"]"#);
         assert_eq!(
-            a.invoke(&s, 2, SplitMode::Listed).argv,
-            [
-                "npx",
-                "cypress",
-                "run",
-                "--browser",
-                "chrome",
-                "--spec",
-                "cypress/e2e/a.cy.ts,cypress/e2e/b.cy.js"
-            ]
+            listed[5],
+            r#"["cypress/e2e/a.cy.ts","cypress/e2e/b.cy.js"]"#
         );
-        assert_eq!(
-            a.invoke(&s, 2, SplitMode::Single).argv,
-            ["npx", "cypress", "run", "--browser", "chrome"]
-        );
+        // a whole run names no spec
+        assert_eq!(a.invoke(&s, 2, SplitMode::Single).argv[5], "[]");
+        assert!(script_of(&a.invoke(&s, 2, SplitMode::Listed)).is_some());
+    }
 
-        let table = cypress_table(&[
-            "✔  cypress/e2e/a.cy.ts                      00:01        2        2        -        -        -",
-            "✖  /w/app/cypress/e2e/b.cy.js               00:04        2        1        1        -        -",
-            "-  cypress/e2e/c.cy.js                      00:00        1        -        -        1        -",
-            "✔  cypress/e2e/d.cy.js                      00:00        -        -        -        -        -",
-        ]);
-        let colour = table.replace("(Run Finished)", "\u{1b}[90m(Run Finished)\u{1b}[0m");
-        let o = a.collect("e2e", "e2e@0", &out(&colour, false));
+    fn cypress_line(runs: &[(&str, u64, u64, u64, bool)], failed: bool) -> String {
+        let runs: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|(spec, passes, failures, pending, error)| {
+                serde_json::json!({
+                    "spec": spec, "tests": passes + failures + pending, "passes": passes,
+                    "failures": failures, "pending": pending, "skipped": 0, "error": error,
+                })
+            })
+            .collect();
+        format!(
+            "Run Finished\n\n\u{1b}[90mLOCAL_CI_CYPRESS {}\u{1b}[0m\n",
+            serde_json::json!({"failed": failed, "message": null, "total_failed": 1, "runs": runs})
+        )
+    }
+
+    #[test]
+    fn a_cypress_shard_reports_the_line_its_script_printed() {
+        let a = Cypress::new("13.0.0", &[], declared());
+        let text = cypress_line(
+            &[
+                ("cypress/e2e/a.cy.ts", 2, 0, 0, false),
+                ("cypress/e2e/b.cy.js", 1, 1, 0, false),
+                ("cypress/e2e/c.cy.js", 0, 0, 1, false),
+                ("cypress/e2e/d.cy.js", 0, 0, 0, false),
+                ("cypress/e2e/e.cy.js", 3, 0, 0, true),
+            ],
+            false,
+        );
+        let o = a.collect("e2e", "e2e@0", &out(&text, false));
         use TestStatus::*;
         assert!(o.parsed && !o.exit_ok);
         let got: Vec<(&str, TestStatus)> = o
@@ -2412,35 +2650,27 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
                 ("cypress/e2e/b.cy.js", Failed),
                 ("cypress/e2e/c.cy.js", Skipped),
                 ("cypress/e2e/d.cy.js", Skipped),
+                ("cypress/e2e/e.cy.js", Failed),
             ]
         );
-        // no table, no report
-        let none = a.collect("e2e", "e2e@0", &out("Cypress could not start", false));
-        assert!(!none.parsed && none.tests.is_empty());
-    }
-
-    #[test]
-    fn only_a_row_of_the_table_is_a_spec() {
-        let row = |l: &str| cypress_row("", l);
-        let good = "│ ✔  cypress/e2e/a.cy.js   00:01   2   2   -   -   - │";
-        assert_eq!(row(good).unwrap().identity, "cypress/e2e/a.cy.js");
-        for l in [
-            "",
-            "Spec  Tests  Passing  Failing  Pending  Skipped",
-            "│ ✔  All specs passed!   00:06   5   5   -   -   - │",
-            "│ ✓  cypress/e2e/a.cy.js   00:01   2   2   -   -   - │",
-            "│ ✔  cypress/e2e/a.cy.js   0:01   2   2   -   -   - │",
-            "│ ✔  cypress/e2e/a.cy.js   00;01   2   2   -   -   - │",
-            "│ ✔  cypress/e2e/a.cy.js   00:01   2   2   -   - │",
-            "│ ✔  cypress/e2e/a.cy.js   00:01   2   x   -   -   - │",
-            "✔  1 of 1 failed (33%)   00:06   5   4   1   -   -",
+        // a run that could not be made reports no spec, and the exit code says it
+        let o = a.collect("e2e", "e2e@0", &out(&cypress_line(&[], true), false));
+        assert!(o.parsed && o.tests.is_empty() && !o.exit_ok);
+        // no line, no report; a line that is not a report is none either
+        for text in [
+            "Cypress could not start",
+            "LOCAL_CI_CYPRESS not json",
+            "LOCAL_CI_CYPRESS {\"runs\": 1}",
+            "LOCAL_CI_CYPRESS {\"runs\": [{\"spec\": \"a\"}]}",
+            "LOCAL_CI_CYPRESS {\"runs\": [{\"error\": false}]}",
         ] {
-            assert_eq!(row(l), None, "{l}");
+            let none = a.collect("e2e", "e2e@0", &out(text, false));
+            assert!(!none.parsed && none.tests.is_empty(), "{text}");
         }
     }
 
     #[test]
-    fn end_to_end_adapters_are_not_split_until_the_caller_says_each_shard_has_its_own() {
+    fn end_to_end_adapters_are_not_split_until_the_caller_declares_what_isolates_the_shards() {
         use crate::shard::{partition_tests, History, PartitionOpts};
         let d = Discovered {
             tests: vec![
@@ -2448,41 +2678,51 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
                 "[p] › b.spec.js › one".into(),
             ],
             complete: true,
+            ..Default::default()
         };
-        let split = |safety: Safety| {
-            let a = Playwright::new("1", &[], safety);
+        let split = |isolation: Isolation| {
+            let a = Playwright::new("1.63.0", &[], isolation);
             partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default())
         };
-        assert_eq!(split(Safety::e2e()).not_split, [NotSplit::NoIsolation]);
-        let p = split(Safety::default());
+        // the default, and a declaration that says nothing, are no declaration
+        assert_eq!(
+            split(Isolation::default()).not_split,
+            [NotSplit::NoIsolation]
+        );
+        for blank in ["", "  \n"] {
+            let none = Isolation::Declared {
+                evidence: blank.into(),
+            };
+            assert_eq!(split(none).not_split, [NotSplit::NoIsolation]);
+        }
+        let p = split(declared());
         assert_eq!(p.mode, SplitMode::Listed);
         assert_eq!(p.shards.len(), 2);
         let files = Discovered {
             tests: vec!["cypress/e2e/a.cy.js".into(), "cypress/e2e/b.cy.js".into()],
             complete: true,
+            ..Default::default()
         };
-        let c = Cypress::new("13", "/w", &[], Safety::e2e());
-        let p = partition_tests(
-            &c,
-            &files,
-            &History::default(),
-            2,
-            &PartitionOpts::default(),
+        let plan = |c: &Cypress| {
+            partition_tests(c, &files, &History::default(), 2, &PartitionOpts::default())
+        };
+        let c = Cypress::new("13", &[], Isolation::None);
+        assert_eq!(plan(&c).not_split, [NotSplit::NoIsolation]);
+        assert_eq!(
+            plan(&Cypress::new("13", &[], declared())).mode,
+            SplitMode::Listed
         );
-        assert_eq!(p.not_split, [NotSplit::NoIsolation]);
         // the job's own filters and coverage show through the adapters
-        let p =
-            Playwright::from_command("1", "playwright test --grep x", Safety::default()).unwrap();
+        let p = Playwright::from_command("1.63.0", "playwright test --grep x", declared()).unwrap();
         assert!(p.capabilities().job_filtered);
-        assert!(Playwright::from_command("1", "cypress run", Safety::default()).is_none());
-        let c =
-            Cypress::from_command("1", "/w", "cypress run --spec a", Safety::default()).unwrap();
+        assert!(Playwright::from_command("1", "cypress run", declared()).is_none());
+        let c = Cypress::from_command("1", "cypress run --spec a", declared()).unwrap();
         assert!(c.capabilities().job_filtered);
-        assert!(Cypress::from_command("1", "/w", "playwright test", Safety::default()).is_none());
+        assert!(Cypress::from_command("1", "playwright test", declared()).is_none());
     }
 
     #[test]
-    fn the_playwright_and_cypress_adapters_of_a_plan_are_made_again() {
+    fn the_playwright_and_cypress_adapters_of_a_plan_are_made_again_and_claim_no_isolation() {
         let info = |runner: &str| RunnerInfo {
             runner: runner.into(),
             version: "1".into(),
@@ -2492,29 +2732,331 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let s = shard(&["[p] › a.spec.js › one"]);
         let p = from_info(&info("playwright"), "/w").unwrap();
         assert!(p.capabilities().targets && !p.capabilities().native_shard);
+        // a plan made again does not make an unisolated suite look isolated
+        assert!(!p.capabilities().isolated_fixtures);
         assert!(p.invoke(&s, 2, SplitMode::Listed).argv[2].contains("'--config' 'c.js'"));
         let c = from_info(&info("cypress"), "/w").unwrap();
-        assert_eq!(
-            c.invoke(&shard(&["cypress/e2e/a.cy.js"]), 2, SplitMode::Listed)
-                .argv,
-            [
-                "npx",
-                "cypress",
-                "run",
-                "--config",
-                "c.js",
-                "--spec",
-                "cypress/e2e/a.cy.js"
-            ]
-        );
+        assert!(!c.capabilities().isolated_fixtures);
+        let argv = c
+            .invoke(&shard(&["cypress/e2e/a.cy.js"]), 2, SplitMode::Listed)
+            .argv;
+        assert_eq!(argv[4], r#"["--config","c.js"]"#);
+        assert_eq!(argv[5], r#"["cypress/e2e/a.cy.js"]"#);
         let o = c.collect(
             "j",
             "j@0",
             &out(
-                "│ ✔  /w/cypress/e2e/a.cy.js   00:01   1   1   -   -   - │",
+                &cypress_line(&[("cypress/e2e/a.cy.js", 1, 0, 0, false)], false),
                 true,
             ),
         );
         assert_eq!(o.tests[0].identity, "cypress/e2e/a.cy.js");
+    }
+
+    fn pw_files(files: &[&str]) -> serde_json::Value {
+        let suites: Vec<serde_json::Value> = files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "title": f, "file": f,
+                    "specs": [
+                        pw_spec("one", &[("desktop", "skipped", "passed", false)]),
+                        pw_spec("two", &[("desktop", "skipped", "passed", false)]),
+                    ],
+                })
+            })
+            .collect();
+        serde_json::json!(suites)
+    }
+
+    #[test]
+    fn a_playwright_suite_that_is_not_fully_parallel_is_divided_by_file() {
+        use crate::shard::{partition_tests, History, PartitionOpts};
+        let a = Playwright::new("1.63.0", &[], declared());
+        let config = |parallel: bool| {
+            let mut c = pw_config();
+            c["fullyParallel"] = serde_json::json!(parallel);
+            c
+        };
+        let listing =
+            |config, facts| pw_report_with(pw_files(&["a.spec.js", "b.spec.js"]), config, facts);
+        // not fully parallel: the tests of a file run one after the other in one
+        // worker, so a file is a unit and never lands in two shards
+        let d = a
+            .discover(&out(&listing(config(false), pw_facts_ok()), true))
+            .unwrap();
+        assert_eq!(d.tests, ["[desktop] › a.spec.js", "[desktop] › b.spec.js"]);
+        let p = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
+        assert_eq!(p.shards.len(), 2);
+        assert!(p.shards.iter().all(|s| s.tests.len() == 1));
+        // fully parallel: a test is a unit
+        let d = a
+            .discover(&out(&listing(config(true), pw_facts_ok()), true))
+            .unwrap();
+        assert_eq!(d.tests.len(), 4);
+        // a missing value is not true
+        let mut none = config(true);
+        none.as_object_mut().unwrap().remove("fullyParallel");
+        let d = a
+            .discover(&out(&listing(none, pw_facts_ok()), true))
+            .unwrap();
+        assert_eq!(d.tests.len(), 2);
+        // the configuration file says a project is not fully parallel
+        let mut facts = pw_facts_ok();
+        facts["config_mentions"] = serde_json::json!(["fullyParallel:false"]);
+        let d = a
+            .discover(&out(&listing(config(true), facts), true))
+            .unwrap();
+        assert_eq!(d.tests.len(), 2);
+        // a file that declares serial tests stays whole in a fully parallel suite
+        let mut facts = pw_facts_ok();
+        facts["serial_files"] = serde_json::json!(["b.spec.js"]);
+        let d = a
+            .discover(&out(&listing(config(true), facts), true))
+            .unwrap();
+        assert_eq!(
+            d.tests,
+            [
+                "[desktop] › a.spec.js › one",
+                "[desktop] › a.spec.js › two",
+                "[desktop] › b.spec.js"
+            ]
+        );
+        assert!(d.blocked.is_empty());
+    }
+
+    #[test]
+    fn a_shard_of_whole_files_reports_one_result_per_file_it_was_given() {
+        use TestStatus::*;
+        let a = Playwright::new("1.63.0", &[], declared());
+        let report = pw_report(
+            serde_json::json!([
+                {
+                    "title": "a.spec.js", "file": "a.spec.js",
+                    "specs": [
+                        pw_spec("ok", &[("desktop", "expected", "passed", true)]),
+                        pw_spec("bad", &[("desktop", "unexpected", "passed", true)]),
+                    ],
+                },
+                {
+                    "title": "b.spec.js", "file": "b.spec.js",
+                    "specs": [
+                        pw_spec("skip", &[("desktop", "skipped", "skipped", true)]),
+                        pw_spec("skip too", &[("desktop", "skipped", "skipped", true)]),
+                    ],
+                },
+                {
+                    "title": "c.spec.js", "file": "c.spec.js",
+                    "specs": [
+                        pw_spec("skip", &[("desktop", "skipped", "skipped", true)]),
+                        pw_spec("ok", &[("desktop", "expected", "passed", true)]),
+                    ],
+                },
+                {
+                    "title": "d.spec.js", "file": "d.spec.js",
+                    "specs": [pw_spec("whole", &[("desktop", "expected", "passed", true)])],
+                },
+                {
+                    "title": "e.spec.js", "file": "e.spec.js",
+                    "specs": [pw_spec("not given", &[("desktop", "expected", "passed", true)])],
+                },
+            ]),
+            pw_config(),
+        );
+        let given: Vec<String> = [
+            "[desktop] › a.spec.js",
+            "[desktop] › b.spec.js",
+            "[desktop] › c.spec.js",
+            "[desktop] › d.spec.js › whole",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let o = a.collect_given("e2e", "e2e@0", &out(&report, false), &given);
+        assert!(o.parsed && !o.exit_ok);
+        let got: Vec<(&str, TestStatus)> = o
+            .tests
+            .iter()
+            .map(|t| (t.identity.as_str(), t.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("[desktop] › a.spec.js", Failed),
+                ("[desktop] › b.spec.js", Skipped),
+                ("[desktop] › c.spec.js", Passed),
+                ("[desktop] › d.spec.js › whole", Passed),
+                // what the shard was not given is reported as it is
+                ("[desktop] › e.spec.js › not given", Passed),
+            ]
+        );
+        // a file whose name starts like a given file is not part of it
+        let r = pw_fold(
+            vec![TestResult {
+                identity: "[d] › a.spec.jsx › t".into(),
+                status: Passed,
+            }],
+            &["[d] › a.spec.js".to_string()],
+        );
+        assert_eq!(r[0].identity, "[d] › a.spec.jsx › t");
+    }
+
+    #[test]
+    fn a_flaky_test_fails_the_shard_where_the_runner_fails_on_flaky_tests() {
+        let a = Playwright::new("1.63.0", &[], declared());
+        let listing = |fail: bool| {
+            let mut c = pw_config();
+            c["failOnFlakyTests"] = serde_json::json!(fail);
+            pw_report(
+                serde_json::json!([{
+                    "title": "a.spec.js", "file": "a.spec.js",
+                    "specs": [pw_spec("flaky", &[("desktop", "flaky", "passed", true)])],
+                }]),
+                c,
+            )
+        };
+        let status = |fail| a.collect("j", "s", &out(&listing(fail), false)).tests[0].status;
+        assert_eq!(status(false), TestStatus::Passed);
+        assert_eq!(status(true), TestStatus::Failed);
+    }
+
+    #[test]
+    fn a_listing_that_shows_dependencies_or_an_old_runner_says_why_it_is_not_split() {
+        use crate::shard::{partition_tests, History, PartitionOpts};
+        let a = Playwright::new("1.63.0", &[], declared());
+        let files = pw_files(&["a.spec.js", "b.spec.js"]);
+        let facts = |k: &str, v: serde_json::Value| {
+            let mut f = pw_facts_ok();
+            f[k] = v;
+            pw_report_with(files.clone(), pw_config(), f)
+        };
+        let blocked = |listing: String| a.discover(&out(&listing, true)).unwrap().blocked;
+        assert!(blocked(pw_report(files.clone(), pw_config())).is_empty());
+        // a project whose tests differ with and without its dependencies, or a
+        // configuration that has dependencies or a teardown
+        assert_eq!(
+            blocked(facts("dependencies", serde_json::json!(["desktop"]))),
+            [NotSplit::ProjectDependencies]
+        );
+        for word in ["dependencies", "teardown"] {
+            assert_eq!(
+                blocked(facts("config_mentions", serde_json::json!([word]))),
+                [NotSplit::ProjectDependencies]
+            );
+        }
+        // no reason in a mention of something else
+        assert!(blocked(facts("config_mentions", serde_json::json!(["globalSetup"]))).is_empty());
+        // `--test-list` is Playwright 1.56 and later
+        for (version, ok) in [
+            (serde_json::json!("1.56.0"), true),
+            (serde_json::json!("1.63.0"), true),
+            (serde_json::json!("2.0.0"), true),
+            (serde_json::json!("1.55.9"), false),
+            (serde_json::json!("0.99.0"), false),
+            (serde_json::json!("x.y"), false),
+            (serde_json::json!("1"), false),
+            (serde_json::json!(null), false),
+        ] {
+            let got = blocked(facts("version", version.clone()));
+            let want: Vec<NotSplit> = if ok {
+                vec![]
+            } else {
+                vec![NotSplit::RunnerTooOld]
+            };
+            assert_eq!(got, want, "{version}");
+        }
+        // the reasons reach the plan
+        let d = a
+            .discover(&out(
+                &facts("dependencies", serde_json::json!(["desktop"])),
+                true,
+            ))
+            .unwrap();
+        let p = partition_tests(&a, &d, &History::default(), 2, &PartitionOpts::default());
+        assert_eq!(p.not_split, [NotSplit::ProjectDependencies]);
+    }
+
+    #[test]
+    fn a_listing_with_a_coverage_configuration_is_not_split() {
+        let a = Vitest::new("2", "/p", &[], Safety::default());
+        let inv = a.discover_command();
+        assert_eq!(&inv.argv[..2], ["sh", "-c"]);
+        assert!(inv.argv[2].contains("collectCoverage") && inv.argv[2].contains("exec \"$@\""));
+        assert_eq!(inv.argv[3], "sh");
+        assert_eq!(&inv.argv[4..6], ["npx", "vitest"]);
+        let j = Jest::new("29", "/p", &[], Safety::default());
+        assert_eq!(
+            &j.discover_command().argv[4..],
+            ["npx", "jest", "--listTests"]
+        );
+        let listing = "local-ci:coverage vitest.config.ts\n/p/a.test.js\n";
+        let d = a.discover(&out(listing, true)).unwrap();
+        assert_eq!(d.tests, ["a.test.js"]);
+        assert_eq!(d.blocked, [NotSplit::CoverageNotMerged]);
+        assert!(a
+            .discover(&out("/p/a.test.js\n", true))
+            .unwrap()
+            .blocked
+            .is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a test of a shell script
+    fn the_probe_of_a_listing_finds_a_coverage_configuration() {
+        let dir = std::env::temp_dir().join(format!("l3-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |cwd: &Path| {
+            let inv = probed(argv(&["echo", "listed"]));
+            let o = std::process::Command::new(&inv.argv[0])
+                .args(&inv.argv[1..])
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(o.status.success());
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(run(&dir), "listed\n");
+        std::fs::write(
+            dir.join("package.json"),
+            "{\"scripts\": {\"test\": \"vitest\"}}",
+        )
+        .unwrap();
+        assert_eq!(run(&dir), "listed\n");
+        for (file, text) in [
+            ("package.json", "{\"jest\": {\"collectCoverage\": true}}"),
+            (
+                "jest.config.js",
+                "module.exports = { coverageThreshold: {} };",
+            ),
+            (
+                "vitest.config.ts",
+                "test: {\n coverage: {\n  enabled: true,\n }\n}",
+            ),
+        ] {
+            let d = dir.join(file.replace('.', "_"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), text).unwrap();
+            let want = format!("local-ci:coverage {file}\nlisted\n");
+            assert_eq!(run(&d), want);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cypress_command_that_names_another_configuration_or_project_is_not_split() {
+        let unread = vec![NotSplit::UnreadableArgs];
+        for run in [
+            "cypress run --config-file other.js",
+            "cypress run --project web",
+            "cypress run -P web",
+            "cypress run --project=web",
+        ] {
+            assert_eq!(parsed(run).blocked, unread, "{run}");
+        }
+        // the value is not read as a filter
+        assert_eq!(
+            parsed("cypress run --project web").args,
+            Vec::<String>::new()
+        );
     }
 }

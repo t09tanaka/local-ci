@@ -2378,8 +2378,11 @@ impl<'a> Runner<'a> {
         {
             return bad("it is not the command the shards were made from");
         }
-        if crate::shard::isolation::reason(job).is_some() {
+        if crate::shard::isolation::reason_in(&w.env, job).is_some() {
             return bad("the job starts a container, a server or a service its shards would share");
+        }
+        if crate::shard::isolation::coverage_reason(&w.env, job).is_some() {
+            return bad("the job collects coverage, which its shards would each measure in part");
         }
         let caps = adapters::from_info(&ts.runner, "").map(|a| a.capabilities());
         let Some(caps) = caps else {
@@ -2437,7 +2440,7 @@ impl<'a> Runner<'a> {
             stderr: String::new(),
             success: ran.outcome == Outcome::Pass && ran.exit == Some(0),
         };
-        let mut o = adapter.collect(&job.id, &task.id, &out);
+        let mut o = adapter.collect_given(&job.id, &task.id, &out, &ts.tests);
         o.parsed &= log.is_some();
         o
     }

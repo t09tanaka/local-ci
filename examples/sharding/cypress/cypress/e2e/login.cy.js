@@ -1,5 +1,5 @@
-describe("page", () => {
-  it("loads", () => {
-    cy.visit("about:blank");
+describe("login", () => {
+  it("adds", () => {
+    expect(1 + 1).to.eq(2);
   });
 });

@@ -45,7 +45,8 @@
     (`NotRequested`, `NoEnumeration`, `DiscoveryFailed`, `IncompleteDiscovery`,
     `NoShardTarget`, `SharedState`, `NoIsolation`, `InexactAggregation`,
     `TooSmall`, `ManifestMismatch`, `JobFilter`, `UnreadableArgs`,
-    `NotConnectable`, `PathOverlap`, `ArgvTooLarge`, `CoverageNotMerged`) and derives `Eq`; an
+    `NotConnectable`, `PathOverlap`, `ArgvTooLarge`, `CoverageNotMerged`,
+    `ProjectDependencies`, `RunnerTooOld`) and derives `Eq`; an
     exhaustive `match` adds arms. `dag::OutputAggregation` has the new variant
     `TestIdentity`.
   - New and required: `dag::ShardRequest` (the request to split a job) has the
@@ -72,35 +73,80 @@
     not given, or when the shards gave different values for an output. With
     `fail-fast`, the shards after a failed one end `cancelled`.
 - End-to-end suites can be split. New adapters `shard::adapters::Playwright`
-  (a test per project, named `[project] › file › title`; a shard names its
-  tests in a `--test-list` file, the runner's own `--shard` is not used because
-  it can leave a shard with no test) and `shard::adapters::Cypress` (a spec
-  file per test; the listing is the files of the default layout, and a
-  configuration that says which files are specs makes the listing fail rather
-  than be guessed; a shard's report is the summary table at the end of a
-  `cypress run`). `parse_command` reads `playwright test` and `cypress run`.
-  `Safety::e2e()` is what an end-to-end suite is until the caller says each
-  shard has its own fixtures: such a job is not split (`NoIsolation`).
-  Playwright's listing also stops a split when the configuration has a
-  `webServer`, a global setup or teardown, `repeatEach` or a `shard`, when the
-  listing has errors, and when two tests cannot be told apart by a test list.
-  A project with `dependencies` is not visible in the listing; the setup runs
-  in every shard that needs it and the merge reports it as a problem.
+  and `shard::adapters::Cypress`, and `parse_command` reads `playwright test`
+  and `cypress run`.
+  - Playwright is divided by file (`[project] › file`) unless the suite is
+    fully parallel (`fullyParallel` in the listing's config), where a test is
+    the unit (`[project] › file › title`); a spec file that declares serial
+    tests (`describe.serial`, `mode: 'serial'`, found by text) stays whole.
+    A shard names its units in a `--test-list` file (Playwright 1.56 and later;
+    an older or unreadable version is `NotSplit::RunnerTooOld`); the runner's
+    own `--shard` is not used because it can leave a shard with no test.
+    Because a unit can be a file, read a shard's report with the new
+    `RunnerAdapter::collect_given` (`exec` does), which reports one result per
+    unit the shard was given; `collect` still reports per test.
+  - `Playwright::discover_command` is a small `node` script, not the bare
+    `playwright test --list`: it lists every project with and without its
+    dependencies (`--project P` against `--project P --no-deps`) and reads the
+    configuration file and the spec files by text. A difference, or a
+    `dependencies` or `teardown` in the configuration, is
+    `NotSplit::ProjectDependencies`. A listing the script did not make is
+    refused. The listing also stops a split when the configuration has a
+    `webServer`, a global setup or teardown, `repeatEach` or a `shard`, when the
+    listing has errors, and when two units cannot be told apart by a test list.
+    A flaky test is a failed one where the runner has `failOnFlakyTests`.
+  - Cypress is divided by spec file. A shard runs Cypress through its module
+    API with a small `node` script (`require('cypress').run`), which prints
+    one JSON line with a result per spec file and exits non-zero when a test
+    failed (the module API itself resolves whatever the tests did). The table
+    `cypress run` prints is no longer read (it cuts long spec paths).
+    `--config-file`, `--project` and `-P` make the job `UnreadableArgs`.
+  - Breaking: `Playwright::new` and `Cypress::new` (and `from_command`) take an
+    `Isolation` instead of a `Safety`, and `Cypress` no longer takes a root.
+    `Isolation::None` (the default) means nothing says each shard has its own
+    server, database and browser profile: the job is not split
+    (`NoIsolation`). `Isolation::Declared { evidence }` is the caller's
+    declaration; a blank `evidence` is none. `Safety::e2e()` is gone and
+    `Safety::default()` is for the unit test runners only. An adapter made by
+    `from_info` claims no isolation.
+  - Breaking: `shard::Discovered` has a new field `blocked: Vec<NotSplit>`
+    (`#[serde(default)]`, not written when empty): reasons the listing itself
+    gave, which `not_split_reasons` adds to the plan's. A struct literal adds
+    `..Default::default()`. `NotSplit` has the new variants
+    `ProjectDependencies` and `RunnerTooOld`. The `Vitest` and `Jest` listing
+    commands now run a small `sh` wrapper around the runner's own.
+  - The problem the merge reports for a shard that failed with no failed test
+    says what else can fail a run.
 - Jobs that start something their shards would share are not split:
-  `shard::isolation::reason` reads the steps and env of a job for containers
-  (`docker`, `podman`, `kubectl`, ...), servers and ports (`npm start`,
-  `next dev`, `localhost:3000`, `PORT=`, a command sent to the background) and
-  service actions, and `connection_reason` and `exec` refuse such a job
-  (`NoIsolation`). It sees only what the workflow says; a suite that reaches a
-  shared database through its own configuration is not detected.
-- A job that collects coverage (`--coverage`, `--collectCoverage`, ...) is not
-  split (`NotSplit::CoverageNotMerged`; it used to be `UnreadableArgs`): each
-  shard would measure only its own tests and `exec` does not collect the
-  reports. New `shard::coverage` merges the reports a caller collects from the
-  shards, Istanbul `coverage-final.json` and LCOV, adding hit counts only for
-  files whose statements, functions, branches and lines are the same in every
-  shard; other formats (`cargo llvm-cov` profile data, Cobertura, ...) are
-  `CoverageError::Unsupported`.
+  `shard::isolation::reason_in` reads the steps and env of a job and of its
+  workflow for containers (`docker`, `podman`, `kubectl`, ...), servers and
+  ports (`npm start`, `pnpm dev`, `npx serve`, `pm2`, `next dev`,
+  `localhost:3000`, a `PORT` variable, `cypress-io/github-action` with
+  `start`, a command sent to the background), databases (`psql`, `createdb`,
+  `prisma migrate`, `supabase start`, `firebase emulators`, `brew services`)
+  and service actions, and `connection_reason` and `exec` refuse such a job
+  (`NoIsolation`). It is a list of words and sees only what the workflow says;
+  the main defence is the `Isolation` type of the end-to-end adapters.
+- A job that collects coverage is not split (`NotSplit::CoverageNotMerged`; it
+  used to be `UnreadableArgs`): each shard would measure only its own tests
+  and `exec` does not collect the reports. It is read from `--coverage`,
+  `--collectCoverage`, `--cov`, `nyc`, `c8`, a `COVERAGE=1` kind of variable
+  in the workflow, job, step or command, and, for Vitest and Jest, from the
+  configuration files and `package.json` by text (`collectCoverage`,
+  `coverageThreshold`, `coverage: { enabled: true }`).
+- New `shard::coverage`, a library function that nothing in this crate calls:
+  `exec` does not collect the shards' reports, so a coverage job is never split
+  here, and the caller that collects them (remote-task-runner) wires the merge.
+  It merges Istanbul `coverage-final.json` (including `bT`) and LCOV, adding hit
+  counts (saturating) only for files whose statements, functions, branches and
+  lines are the same in every shard; duplicate `FN`, `FNDA`, `DA` and `BRDA`
+  lines in a record add up (a generic function is emitted once per
+  instantiation) and a function on two lines is malformed. Paths are resolved
+  (root and file) and an absolute path outside the root is
+  `CoverageError::Malformed`. Input is bounded (`MAX_SHARDS`, `MAX_BYTES`,
+  `MAX_FILES`; `CoverageError::TooLarge`). Vitest's `v8` provider stops at
+  `Mismatch` (it maps each shard's file differently); other formats
+  (`cargo llvm-cov` profile data, Cobertura, ...) are `Unsupported`.
 - `exec` refuses a shard task whose runner cannot divide its tests the way the
   task says (a listed split for a runner that cannot target tests, a native
   split for one without a shard feature of its own).

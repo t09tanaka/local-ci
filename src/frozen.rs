@@ -431,6 +431,7 @@ impl FrozenPlan {
                     discovered: Discovered {
                         tests: g.manifest.clone(),
                         complete: g.manifest_exact,
+                        ..Default::default()
                     },
                     fail_fast: g.fail_fast,
                 })

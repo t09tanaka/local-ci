@@ -147,6 +147,7 @@ fn listing(names: &[&str]) -> Discovered {
     Discovered {
         tests: names.iter().map(|s| s.to_string()).collect(),
         complete: true,
+        ..Default::default()
     }
 }
 
@@ -246,6 +247,7 @@ fn a_native_split_lists_no_tests() {
     let d = Discovered {
         tests: vec![],
         complete: false,
+        ..Default::default()
     };
     let a = local_ci::shard::adapters::Vitest::new("2", "/p", &[], Safety::default());
     let p = partition_tests(&a, &d, &History::default(), 3, &PartitionOpts::default());
@@ -519,6 +521,7 @@ fn a_native_split_that_knows_its_tests_checks_them() {
         let d = Discovered {
             tests: vec!["a.js".into(), "b.js".into(), "c.js".into()],
             complete,
+            ..Default::default()
         };
         let a = local_ci::shard::adapters::Vitest::new("2", "/p", &[], Safety::default());
         let mut p = partition_tests(&a, &d, &History::default(), 3, &PartitionOpts::default());

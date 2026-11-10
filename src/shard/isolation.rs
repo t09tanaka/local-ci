@@ -9,8 +9,11 @@
 //! It sees only what the workflow says. A suite that reaches a shared
 //! database through its own configuration (a `.env` file, a hard-coded URL, a
 //! test helper that starts a server) is invisible here: the caller who knows
-//! the fixtures are isolated says so with [`super::adapters::Safety`], and an
-//! end-to-end adapter assumes they are not until it is told.
+//! the fixtures are isolated says so, and an end-to-end adapter takes an
+//! [`super::adapters::Isolation`] that is `None` until the caller declares one.
+//! That type is the main defence; this scan is a second one for the jobs that
+//! show a service in plain sight, and it is a list of words, so it misses what
+//! it does not know.
 
 use crate::workflow::{Job, Step};
 
@@ -34,6 +37,19 @@ const SERVERS: &[&str] = &[
     "webpack-dev-server",
     "uvicorn",
     "gunicorn",
+    "pm2",
+    "forever",
+    "json-server",
+];
+
+/// Programs that use a database the shards would share.
+const DATABASE_TOOLS: &[&str] = &[
+    "psql",
+    "createdb",
+    "dropdb",
+    "mysql",
+    "mongosh",
+    "redis-cli",
 ];
 
 /// A program and the word after it that starts a server (`next dev`).
@@ -52,9 +68,17 @@ const SERVER_COMMANDS: &[(&str, &str)] = &[
     ("rails", "server"),
     ("rails", "s"),
     ("php", "-s"),
+    ("npx", "serve"),
+    ("supabase", "start"),
+    ("firebase", "emulators:start"),
+    ("firebase", "emulators:exec"),
+    ("brew", "services"),
 ];
 
-/// Package managers: `npm start`, `npm run dev`.
+/// A program and the word after it that uses a database (`prisma migrate`).
+const DATABASE_COMMANDS: &[(&str, &str)] = &[("prisma", "migrate")];
+
+/// Package managers: `npm start`, `npm run dev`, `pnpm dev`.
 const PACKAGE_MANAGERS: &[&str] = &["npm", "yarn", "pnpm", "bun"];
 const SERVER_SCRIPTS: &[&str] = &["start", "dev", "serve", "preview"];
 
@@ -75,16 +99,60 @@ const SERVICE_ACTIONS: &[&str] = &[
 /// Why the tests of `job` cannot be given resources of their own, or `None`
 /// when the steps show nothing of the kind.
 pub fn reason(job: &Job) -> Option<String> {
-    if let Some(k) = env_reason(&job.env) {
+    reason_in(&[], job)
+}
+
+/// [`reason`] for a job of a workflow whose own `env` is `workflow_env`.
+pub fn reason_in(workflow_env: &[(String, String)], job: &Job) -> Option<String> {
+    if let Some(k) = env_reason(workflow_env).or_else(|| env_reason(&job.env)) {
         return Some(k);
     }
     job.steps.iter().find_map(step_reason)
 }
 
+/// A name of a variable that holds a port: `PORT`, `API_PORT`, `PORT_API`,
+/// `WEBPORT`. A word that only ends in the letters (`REPORT`, `SUPPORT`) is not.
+fn is_port_name(name: &str) -> bool {
+    const NOT_PORTS: &[&str] = &["REPORT", "SUPPORT", "IMPORT", "EXPORT", "TRANSPORT"];
+    name.to_uppercase()
+        .split('_')
+        .any(|w| w == "PORT" || (w.ends_with("PORT") && !NOT_PORTS.contains(&w)))
+}
+
 fn env_reason(env: &[(String, String)]) -> Option<String> {
     env.iter()
-        .find(|(k, _)| k == "PORT" || k.ends_with("_PORT"))
+        .find(|(k, _)| is_port_name(k))
         .map(|(k, _)| format!("it sets the port `{k}`"))
+}
+
+/// Why the job collects coverage, which only a merge of its shards' reports
+/// could give (and nothing wires such a merge here): a `COVERAGE=1` kind of
+/// variable, `nyc`, `c8`, or a `--coverage` / `--cov` flag in any step.
+pub fn coverage_reason(workflow_env: &[(String, String)], job: &Job) -> Option<String> {
+    let on = |v: &str| !matches!(v.trim().to_lowercase().as_str(), "" | "0" | "false" | "off");
+    let var = |k: &str, v: &str| k.to_uppercase().contains("COVERAGE") && on(v);
+    let envs = workflow_env
+        .iter()
+        .chain(&job.env)
+        .chain(job.steps.iter().flat_map(|s| &s.env));
+    if let Some((k, _)) = envs.into_iter().find(|(k, v)| var(k, v)) {
+        return Some(format!("it sets `{k}`"));
+    }
+    job.steps
+        .iter()
+        .filter_map(|s| s.run.as_deref())
+        .find_map(|run| {
+            words(run).into_iter().find_map(|w| {
+                let flag = w.starts_with("--coverage")
+                    || w.starts_with("--collectcoverage")
+                    || w == "--cov"
+                    || w.starts_with("--cov=")
+                    || w.starts_with("--cov-");
+                let assigned = w.split_once('=').is_some_and(|(k, v)| var(k, v));
+                (flag || assigned || w == "nyc" || w == "c8")
+                    .then(|| format!("it collects coverage (`{w}`)"))
+            })
+        })
 }
 
 fn step_reason(step: &Step) -> Option<String> {
@@ -93,6 +161,10 @@ fn step_reason(step: &Step) -> Option<String> {
     }
     if let Some(u) = &step.uses {
         let u = u.to_lowercase();
+        if u.starts_with("cypress-io/github-action") && step.with.iter().any(|(k, _)| k == "start")
+        {
+            return Some(format!("it uses `{u}` with `start`, which starts a server"));
+        }
         if let Some(w) = SERVICE_ACTIONS.iter().find(|w| u.contains(**w)) {
             return Some(format!("it uses `{u}`, which starts a `{w}`"));
         }
@@ -135,12 +207,20 @@ fn run_reason(run: &str) -> Option<String> {
     if let Some(t) = w.iter().find(|w| CONTAINER_TOOLS.contains(&w.as_str())) {
         return Some(format!("it runs `{t}`"));
     }
+    if let Some(t) = w.iter().find(|w| DATABASE_TOOLS.contains(&w.as_str())) {
+        return Some(format!("it runs `{t}`, which uses a database"));
+    }
     if let Some(t) = w.iter().find(|w| SERVERS.contains(&w.as_str())) {
         return Some(format!("it runs `{t}`, which serves on a port"));
     }
     for pair in w.windows(2) {
         let (a, b) = (pair[0].as_str(), pair[1].as_str());
-        if SERVER_COMMANDS.contains(&(a, b)) || (PACKAGE_MANAGERS.contains(&a) && b == "start") {
+        if DATABASE_COMMANDS.contains(&(a, b)) {
+            return Some(format!("it runs `{a} {b}`, which uses a database"));
+        }
+        if SERVER_COMMANDS.contains(&(a, b))
+            || (PACKAGE_MANAGERS.contains(&a) && SERVER_SCRIPTS.contains(&b))
+        {
             return Some(format!("it runs `{a} {b}`, which serves on a port"));
         }
     }
@@ -304,5 +384,110 @@ mod tests {
             ("npx playwright test", None),
         ]);
         assert!(reason(&j).unwrap().contains("docker"));
+    }
+
+    #[test]
+    fn more_servers_databases_and_services_are_seen() {
+        for (run, what) in [
+            ("npm run dev", "`npm run dev`"),
+            ("pnpm dev", "`pnpm dev`"),
+            ("yarn serve", "`yarn serve`"),
+            ("bun preview", "`bun preview`"),
+            ("npx serve dist", "`npx serve`"),
+            ("pm2 start app.js", "`pm2`"),
+            ("npx forever start x.js", "`forever`"),
+            ("json-server db.json", "`json-server`"),
+            ("psql -c 'select 1'", "`psql`"),
+            ("createdb test", "`createdb`"),
+            ("npx prisma migrate deploy", "`prisma migrate`"),
+            ("supabase start", "`supabase start`"),
+            ("firebase emulators:start", "`firebase emulators:start`"),
+            (
+                "firebase emulators:exec 'npm test'",
+                "`firebase emulators:exec`",
+            ),
+            ("brew services start postgresql", "`brew services`"),
+        ] {
+            let got = why(run).unwrap_or_default();
+            assert!(got.contains(what), "{run}: {got}");
+        }
+        // `npm test` and a build do not start anything
+        for run in ["npm test", "npm run build", "pnpm install", "yarn lint"] {
+            assert_eq!(why(run), None, "{run}");
+        }
+        let mut j = job(&[("", Some("cypress-io/github-action@v6"))]);
+        assert_eq!(reason(&j), None);
+        j.steps[0].with = vec![("start".into(), "npm start".into())];
+        assert!(reason(&j).unwrap().contains("with `start`"));
+        j.steps[0].with = vec![("browser".into(), "chrome".into())];
+        assert_eq!(reason(&j), None);
+    }
+
+    #[test]
+    fn a_port_in_the_environment_of_the_workflow_is_seen() {
+        let j = job(&[("npx playwright test", None)]);
+        let env = |k: &str| vec![(k.to_string(), "1".to_string())];
+        for k in ["PORT", "API_PORT", "PORT_API", "web_port", "APIPORT"] {
+            assert!(reason_in(&env(k), &j).unwrap().contains(k), "{k}");
+        }
+        for k in [
+            "REPORT",
+            "SUPPORT_URL",
+            "IMPORT_MAP",
+            "PORTAL",
+            "EXPORT_DIR",
+        ] {
+            assert_eq!(reason_in(&env(k), &j), None, "{k}");
+        }
+        assert_eq!(reason_in(&[], &j), None);
+    }
+
+    fn cov(env: &[(&str, &str)], run: &str) -> Option<String> {
+        let mut j = job(&[(run, None)]);
+        j.steps[0].env = vec![];
+        coverage_reason(
+            &env.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>(),
+            &j,
+        )
+    }
+
+    #[test]
+    fn a_job_that_collects_coverage_is_seen_in_its_environment_and_commands() {
+        assert_eq!(cov(&[], "npm test"), None);
+        assert_eq!(cov(&[("COVERAGE", "0")], "npm test"), None);
+        assert_eq!(cov(&[("COVERAGE", "false")], "npm test"), None);
+        assert_eq!(cov(&[("COVERAGE", "")], "npm test"), None);
+        assert!(cov(&[("COVERAGE", "1")], "npm test")
+            .unwrap()
+            .contains("COVERAGE"));
+        assert!(cov(&[("NODE_V8_COVERAGE", "/tmp/x")], "npm test").is_some());
+        assert!(cov(&[("collect_coverage", "true")], "npm test").is_some());
+        for run in [
+            "npx vitest run --coverage",
+            "pytest --cov=src",
+            "pytest --cov",
+            "pytest --cov-report=xml",
+            "nyc npm test",
+            "npx c8 node test.js",
+            "COVERAGE=1 npm test",
+            "jest --collectCoverageFrom=src",
+        ] {
+            assert!(cov(&[], run).is_some(), "{run}");
+        }
+        assert_eq!(cov(&[], "COVERAGE=0 npm test"), None);
+        assert_eq!(cov(&[], "npm run covering"), None);
+        // the job's own and a step's environment count too
+        let mut j = job(&[("npm test", None)]);
+        j.env = vec![("COVERAGE".into(), "1".into())];
+        assert!(coverage_reason(&[], &j).is_some());
+        let mut j = job(&[("npm test", None)]);
+        j.steps[0].env = vec![("VITEST_COVERAGE".into(), "yes".into())];
+        assert!(coverage_reason(&[], &j).is_some());
+        assert_eq!(
+            coverage_reason(&[], &job(&[("", Some("actions/checkout@v4"))])),
+            None
+        );
     }
 }

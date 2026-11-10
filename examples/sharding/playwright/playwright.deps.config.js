@@ -1,7 +1,7 @@
 // @ts-check
-// A project that depends on a setup project. The listing does not show the
-// dependency, so local-ci splits it; the setup then runs in every shard that
-// has a test of `desktop`, and the merge reports that as a problem.
+// A project that depends on a setup project. `--list --project desktop` shows the
+// setup's test as well, and `--no-deps` does not, which is how local-ci sees that
+// a shard running a test of `desktop` would run the setup too.
 const { defineConfig } = require("@playwright/test");
 
 module.exports = defineConfig({

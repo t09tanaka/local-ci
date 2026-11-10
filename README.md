@@ -344,8 +344,8 @@ into a prefix of the run, so neither changes your machine.
 side; nothing is split unless the caller asks (`FrozenPlan::with_shards`), and
 the CLI never does. A runner adapter lists the tests, names each shard's tests in
 a command and reads what a shard reported: `cargo test`, Vitest and Jest (by
-file or test name), Playwright (by test, one per project) and Cypress (by spec
-file). The shards must cover the listed tests exactly once, each shard may report
+file or test name), Playwright (by file, or by test where the suite is fully parallel)
+and Cypress (by spec file). The shards must cover the listed tests exactly once, each shard may report
 only what it was given, a report that cannot be read or holds no test is a
 problem, and a job that cannot be split safely stays one job with the reasons
 (`NotSplit`).
@@ -356,26 +356,30 @@ A job is not split when:
   leave the tests alone, when a test path is part of another, or when its step is
   not one plain command in the directory the tests were listed in (`continue-on-error`
   included);
-- it collects coverage (`--coverage`): `exec` does not collect the shards' reports.
-  `shard::coverage::merge` puts together reports a caller collects (Istanbul
-  `coverage-final.json`, LCOV), only for the same code in every shard; `cargo llvm-cov`
-  profile data and other formats are an `Unsupported` error;
+- it collects coverage (`--coverage`, `--cov`, `nyc`, `COVERAGE=1`, a coverage setting in the Vitest
+  or Jest configuration or `package.json`): `exec` does not collect the shards' reports.
+  `shard::coverage::merge` is a library function that nothing here calls; the caller that
+  collects the reports wires it. It puts together Istanbul `coverage-final.json` and LCOV
+  reports, only for the same code in every shard (Vitest's `v8` provider maps each shard's
+  files differently, so it stops at `Mismatch`); `cargo llvm-cov` profile data and other formats
+  are an `Unsupported` error;
 - it starts something the shards would share: job `services`, a container tool
-  (`docker`, `podman`, `kubectl`), a server or a fixed port (`npm start`, `next dev`,
-  `localhost:3000`, `PORT=`, a command sent to the background), or a service action.
-  That is what the workflow says. A suite that reaches a shared database through its own
-  configuration is invisible, so an end-to-end adapter starts with `Safety::e2e()` (not
-  isolated) and splits only when the caller passes `Safety::default()` after making sure
-  each shard has its own database, port and browser profile;
-- (Playwright) the configuration has a `webServer`, a global setup or teardown, `repeatEach`
-  or a `shard`. A `dependencies` project (a setup project) cannot be seen in the listing: the
-  setup runs in every shard that needs it, and the merge reports that;
-- (Cypress) the configuration says which files are specs (`specPattern` and friends): the
-  adapter lists `cypress/e2e/**/*.cy.{js,jsx,ts,tsx}` and does not evaluate the configuration.
-  What a shard reports is the table `cypress run` prints at the end (the path of a long spec
-  can be cut there, which shows as a spec nobody reported).
-
-[`examples/sharding`](examples/sharding) has small suites for each runner.
+  (`docker`, `podman`, `kubectl`), a server or a port (`npm start`, `pnpm dev`, `next dev`,
+  `localhost:3000`, a `PORT` variable, a command sent to the background), a database tool
+  (`psql`, `prisma migrate`) or a service action. That is a list of words over what the workflow
+  says. The main defence is the type of the end-to-end adapters: they take an `Isolation`, which
+  is `None` until the caller declares (`Isolation::Declared { evidence }`) that each shard has its
+  own database, port and browser profile;
+- (Playwright) the configuration has a `webServer`, a global setup or teardown, `repeatEach` or a
+  `shard`; a project depends on another or has a teardown (the listing script compares `--list
+  --project P` with and without `--no-deps`, and reads the configuration file by text); or the
+  runner is older than 1.56 (no `--test-list`). Unless the suite is fully parallel, the tests of
+  a file are one unit, and so are those of a file that declares serial tests; read a shard's
+  report with `collect_given` so that each unit is reported once;
+- (Cypress) the configuration says which files are specs (`specPattern` and friends), or the
+  command has `--config-file` or `--project`: the adapter lists `cypress/e2e/**/*.cy.{js,jsx,ts,tsx}`
+  and does not evaluate the configuration. A shard runs Cypress through its module API in a small
+  script, which prints one JSON line with a result per spec file and exits non-zero when a test failed.
 
 ## Capturing a working directory (library)
 
@@ -423,8 +427,9 @@ most), and the locks.
 ```sh
 (cd examples/sharding/node && npm ci)   # the shard adapter tests run real Vitest and Jest
 (cd examples/sharding/playwright && npm ci && npx playwright install chromium)   # and real Playwright
-cargo test
-./scripts/coverage-gate.sh   # 100% line coverage on the pure modules
+(cd examples/sharding/cypress && npm ci && npx cypress install)   # and real Cypress (its test is ignored off Linux)
+cargo test --features browser-tests   # without the feature, the tests that start a browser are left out
+./scripts/coverage-gate.sh   # 100% line coverage on the pure modules (no browser tests)
 ```
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,

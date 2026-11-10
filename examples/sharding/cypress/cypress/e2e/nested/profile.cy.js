@@ -1,5 +1,3 @@
-describe("page", () => {
-  it("loads", () => {
-    cy.visit("about:blank");
-  });
+describe("profile", () => {
+  it("is pending");
 });

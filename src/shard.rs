@@ -62,6 +62,11 @@ pub struct Discovered {
     pub tests: Vec<String>,
     /// The list is all there is. `false` when tests are generated at run time.
     pub complete: bool,
+    /// Reasons the listing itself gave for not splitting the job (a project
+    /// that depends on another, a runner too old to name its tests). They are
+    /// facts of the listing, which the capabilities of an adapter cannot see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<NotSplit>,
 }
 
 /// How long tests took before: identity to milliseconds.
@@ -242,6 +247,19 @@ pub trait RunnerAdapter {
     fn invoke(&self, shard: &Shard, count: usize, mode: SplitMode) -> Invocation;
     /// What a shard reported, from what its command printed.
     fn collect(&self, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome;
+    /// [`RunnerAdapter::collect`], for a shard that was given `given` (its
+    /// tests, as the listing names them). A runner whose listing names a group
+    /// of tests as one unit (a Playwright file) reports each unit once, under
+    /// the name it was given.
+    fn collect_given(
+        &self,
+        job_id: &str,
+        shard_id: &str,
+        out: &CommandOutput,
+        _given: &[String],
+    ) -> ShardOutcome {
+        self.collect(job_id, shard_id, out)
+    }
     /// The shards of a job together, checked against the listed tests (`None`
     /// for a native split, which lists none).
     fn merge(&self, manifest: Option<&[String]>, outcomes: &[ShardOutcome]) -> Merged {
@@ -285,6 +303,11 @@ pub fn not_split_reasons(caps: &Capabilities, discovered: &Discovered) -> Vec<No
     }
     if caps.substring_targets && has_overlap(&discovered.tests) {
         out.push(NotSplit::PathOverlap);
+    }
+    for why in &discovered.blocked {
+        if !out.contains(why) {
+            out.push(why.clone());
+        }
     }
     out
 }
@@ -613,7 +636,7 @@ pub fn merge_with(
         }
         if !o.exit_ok && !o.tests.iter().any(|t| t.status == TestStatus::Failed) {
             m.problems.push(format!(
-                "shard {} of {} failed without a failed test",
+                "shard {} of {} exited with an error, but none of its tests failed (a crash, a timeout, an error outside the tests, or flaky tests where the runner fails on them)",
                 o.shard_id, o.job_id
             ));
         }
@@ -688,6 +711,7 @@ mod tests {
         Discovered {
             tests: names.iter().map(|s| s.to_string()).collect(),
             complete: true,
+            ..Default::default()
         }
     }
 
@@ -702,6 +726,58 @@ mod tests {
             .iter()
             .map(|s| s.tests.iter().map(String::as_str).collect())
             .collect()
+    }
+
+    #[test]
+    fn the_reasons_a_listing_gives_reach_the_plan_once() {
+        let mut d = found(&["a", "b"]);
+        assert!(not_split_reasons(&OK, &d).is_empty());
+        d.blocked = vec![NotSplit::ProjectDependencies, NotSplit::ProjectDependencies];
+        assert_eq!(not_split_reasons(&OK, &d), [NotSplit::ProjectDependencies]);
+        // next to the reasons of the capabilities, and not twice
+        let caps = Capabilities {
+            shared_state: true,
+            ..OK
+        };
+        d.blocked = vec![NotSplit::SharedState, NotSplit::RunnerTooOld];
+        assert_eq!(
+            not_split_reasons(&caps, &d),
+            [NotSplit::SharedState, NotSplit::RunnerTooOld]
+        );
+        let p = Fake::partition(
+            &fake(OK),
+            &d,
+            &History::default(),
+            2,
+            &PartitionOpts::default(),
+        );
+        assert_eq!(p.not_split, [NotSplit::SharedState, NotSplit::RunnerTooOld]);
+        assert_eq!(p.mode, SplitMode::Single);
+        // a plan that was written before a listing could give reasons has none
+        let old: Discovered =
+            serde_json::from_str(r#"{"tests": ["a"], "complete": true}"#).unwrap();
+        assert!(old.blocked.is_empty());
+        let json = serde_json::to_string(&found(&["a"])).unwrap();
+        assert!(!json.contains("blocked"), "{json}");
+        assert!(serde_json::to_string(&d)
+            .unwrap()
+            .contains("runner_too_old"));
+    }
+
+    #[test]
+    fn a_runner_that_does_not_fold_its_report_reports_what_it_collects() {
+        let f = fake(OK);
+        let out = CommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+        };
+        let a = f.collect_given("j", "s", &out, &["a".to_string()]);
+        let b = f.collect("j", "s", &out);
+        assert_eq!(
+            (a.job_id, a.shard_id, a.exit_ok),
+            (b.job_id, b.shard_id, b.exit_ok)
+        );
     }
 
     #[test]
@@ -949,6 +1025,7 @@ mod tests {
         let partial = Discovered {
             tests: vec![],
             complete: false,
+            ..Default::default()
         };
         assert_eq!(
             not_split_reasons(&OK, &partial),
@@ -1009,6 +1086,7 @@ mod tests {
         let partial = Discovered {
             tests: vec!["a".into()],
             complete: false,
+            ..Default::default()
         };
         let c = Capabilities {
             native_shard: true,
@@ -1208,7 +1286,7 @@ mod tests {
         let m = merge_outcomes(None, &[outcome("s0", false, &[("q", Passed)])]);
         assert_eq!(
             m.problems,
-            vec!["shard s0 of j failed without a failed test"]
+            vec!["shard s0 of j exited with an error, but none of its tests failed (a crash, a timeout, an error outside the tests, or flaky tests where the runner fails on them)"]
         );
         let m = merge_outcomes(None, &[outcome("s0", true, &[("q", Failed)])]);
         assert!(m.problems.is_empty());
@@ -1409,6 +1487,7 @@ mod tests {
         let d = Discovered {
             tests: names,
             complete: true,
+            ..Default::default()
         };
         let p = partition_tests(&c, &d, &History::default(), 2, &PartitionOpts::default());
         assert_eq!(p.not_split, vec![NotSplit::ArgvTooLarge]);
@@ -1454,6 +1533,7 @@ mod tests {
             let d = Discovered {
                 tests: names,
                 complete: true,
+                ..Default::default()
             };
             let p = partition_tests(&c, &d, &History::default(), 2, &PartitionOpts::default());
             assert_eq!(p.is_split(), split, "{len}");
@@ -1497,7 +1577,7 @@ mod tests {
         let m = merge_outcomes(None, &[outcome("s0", false, &[])]);
         assert_eq!(
             m.problems,
-            vec!["shard s0 of j failed without a failed test"]
+            vec!["shard s0 of j exited with an error, but none of its tests failed (a crash, a timeout, an error outside the tests, or flaky tests where the runner fails on them)"]
         );
         assert!(merge_outcomes(None, &[outcome("s0", true, &[("a", Passed)])]).ok());
     }
