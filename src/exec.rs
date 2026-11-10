@@ -256,6 +256,29 @@ pub struct Runner<'a> {
     refused: HashMap<usize, String>,
 }
 
+/// What [`Runner::run_unit`] keeps of the shards of one split job until the job
+/// has its outcome.
+#[derive(Default)]
+struct ShardHold {
+    /// the job, as the plan names it
+    job: String,
+    /// what the shards that ran reported
+    reports: Vec<crate::shard::ShardOutcome>,
+    /// how the jobs of the shards ended (an error that kept a shard from
+    /// running is a failed one)
+    outcomes: Vec<JobOutcome>,
+    /// the shards (task ids) done with: run, failed to run, or cancelled
+    handled: BTreeSet<String>,
+    /// the shards not to run
+    cancel: BTreeSet<String>,
+    /// a shard could not be run at all
+    errored: bool,
+    /// where the last result of the shards is in the unit's jobs
+    last: Option<usize>,
+    /// the job has its outcome
+    done: bool,
+}
+
 /// The script of the step that runs the tests of the shard `ts`: its command,
 /// built where the tests are (`root` is the working directory of the step).
 fn shard_script(ts: &dag::TaskShard, root: &Path) -> Result<String, String> {
@@ -1890,6 +1913,16 @@ impl<'a> Runner<'a> {
         }
     }
 
+    /// Run the tasks of one unit, one after the other, in `ws`.
+    ///
+    /// The shards of a split job are tasks like the others, so here they run
+    /// one after the other too: a local run of a split plan takes the sum of
+    /// the shards' times, not the longest of them. What the division by load
+    /// (`shard::partition_tests`) improves, the time of the slowest shard, is
+    /// the time of the job only where the shards run side by side, on separate
+    /// workers (`run_task` per shard, results put together by
+    /// `complete::aggregate_shard_group`). With `fail-fast`, the shards after a
+    /// failed one are not run (they end `cancelled`).
     fn run_unit(&self, ui: usize, u: &Unit, waited: UnitWait, ws: &Path) -> UnitResult {
         let w = &self.plan.selected[u.wf].wf;
         let locked = self.unit_locked(u);
@@ -1900,14 +1933,8 @@ impl<'a> Runner<'a> {
         let mut inputs = TaskInputs::default();
         let mut jobs = Vec::new();
         let mut outcomes: Vec<JobOutcome> = Vec::new();
-        // the shards of each split job that ran so far: what they reported,
-        // how their jobs ended, and where the last one is in `jobs`
-        type Held = (
-            Vec<crate::shard::ShardOutcome>,
-            Vec<JobOutcome>,
-            Option<usize>,
-        );
-        let mut shards: HashMap<String, Held> = HashMap::new();
+        // the shards of each split job that were handled so far
+        let mut shards: HashMap<String, ShardHold> = HashMap::new();
         // A copy of the setup workspace is another workspace: it gets an id of
         // its own, and the receipts of the setup are bound to it, as the copy
         // holds what the setup made.
@@ -1946,6 +1973,38 @@ impl<'a> Runner<'a> {
                 })
             });
             let verify = copy_id.is_some() && !copy_checked.get(&task.id).copied().unwrap_or(false);
+            // With `fail-fast`, the shards that come after a failed one are not
+            // run: the job has failed whatever they report.
+            if let Some(ts) = &task.shard {
+                let hold = shards.entry(ts.group.clone()).or_default();
+                if hold.cancel.contains(&task.id) {
+                    let why = "cancelled: another shard of the job failed (fail-fast)";
+                    for id in &task.jobs {
+                        let job = self.plan.job(u.wf, id);
+                        let r = JobResult {
+                            workflow: w.file.clone(),
+                            job: id.clone(),
+                            display: format!(
+                                "{} (shard {}/{})",
+                                job.name.clone().unwrap_or_else(|| id.clone()),
+                                ts.index + 1,
+                                ts.count
+                            ),
+                            outcome: Outcome::Skip(why.into()),
+                            secs: 0.0,
+                            steps: vec![],
+                            cancelled: true,
+                            time: None,
+                        };
+                        hold.outcomes.push(outcome_of(id, None, &r, &Map::new()));
+                        jobs.push(r);
+                    }
+                    hold.last = jobs.len().checked_sub(1);
+                    hold.handled.insert(task.id.clone());
+                    self.settle_shards(task, hold, &mut jobs, &mut outcomes, &mut inputs);
+                    continue;
+                }
+            }
             match self.run_task(
                 ws,
                 task,
@@ -1958,31 +2017,17 @@ impl<'a> Runner<'a> {
                 Ok(r) => {
                     // A shard is not the job: the job is its shards together,
                     // checked against the tests they were to run.
-                    if let (Some(ts), Some(so)) = (&task.shard, r.shard.clone()) {
+                    if let Some(ts) = &task.shard {
                         for o in &r.outcomes {
                             inputs.run_cancelled |= o.status == JobStatus::Cancelled;
                         }
                         jobs.extend(r.jobs);
-                        let held = shards.entry(ts.group.clone()).or_default();
-                        held.0.push(so);
-                        held.1.extend(r.outcomes);
-                        held.2 = Some(jobs.len().saturating_sub(1));
-                        let group = self.fp.shard_groups.iter().find(|g| g.id == ts.group);
-                        if let Some(g) = group.filter(|g| g.shards.len() == held.0.len()) {
-                            let agg = crate::complete::aggregate_shard_group(g, &held.0);
-                            let mut o =
-                                combine(&g.source_jobs.join("+"), std::mem::take(&mut held.1));
-                            if !agg.ok() && o.status == JobStatus::Success {
-                                let why = agg.problems().join("; ");
-                                o.status = JobStatus::Failure;
-                                o.skipped = Some(why.clone());
-                                if let Some(last) = held.2.and_then(|i| jobs.get_mut(i)) {
-                                    last.outcome = Outcome::Error(why);
-                                }
-                            }
-                            outcomes.push(o.clone());
-                            inputs.needs.insert(o.job.clone(), o);
-                        }
+                        let hold = shards.entry(ts.group.clone()).or_default();
+                        hold.last = jobs.len().checked_sub(1);
+                        hold.outcomes.extend(r.outcomes);
+                        hold.reports.extend(r.shard);
+                        hold.handled.insert(task.id.clone());
+                        self.settle_shards(task, hold, &mut jobs, &mut outcomes, &mut inputs);
                         continue;
                     }
                     for o in r.outcomes {
@@ -1996,6 +2041,8 @@ impl<'a> Runner<'a> {
                     let reason = format!("{e:#}");
                     // The jobs of a task that could not be run failed: the
                     // jobs that need them must see that, not a missing need.
+                    // A shard that could not be run is a shard the job is
+                    // missing: the job fails once, when its shards are done.
                     for id in &task.jobs {
                         let o = JobOutcome {
                             job: id.clone(),
@@ -2005,8 +2052,12 @@ impl<'a> Runner<'a> {
                             skipped: Some(reason.clone()),
                             ancestor_failed: false,
                         };
-                        outcomes.push(o.clone());
-                        inputs.needs.insert(id.clone(), o);
+                        if let Some(ts) = &task.shard {
+                            shards.entry(ts.group.clone()).or_default().outcomes.push(o);
+                        } else {
+                            outcomes.push(o.clone());
+                            inputs.needs.insert(id.clone(), o);
+                        }
                     }
                     // every entry of a matrix job failed, not one in its place
                     for id in &task.jobs {
@@ -2033,8 +2084,20 @@ impl<'a> Runner<'a> {
                             });
                         }
                     }
+                    if let Some(ts) = &task.shard {
+                        let hold = shards.entry(ts.group.clone()).or_default();
+                        hold.last = jobs.len().checked_sub(1);
+                        hold.errored = true;
+                        hold.handled.insert(task.id.clone());
+                        self.settle_shards(task, hold, &mut jobs, &mut outcomes, &mut inputs);
+                    }
                 }
             }
+        }
+        // A split job whose shards did not all come: it has failed, and it
+        // has its one outcome now.
+        for (group, hold) in shards.iter_mut().filter(|(_, h)| !h.done) {
+            self.finish_shards(group, hold, &mut jobs, &mut outcomes, &mut inputs);
         }
         charge(&mut jobs, waited);
         UnitResult {
@@ -2046,6 +2109,70 @@ impl<'a> Runner<'a> {
             cached: None,
             outcomes,
         }
+    }
+
+    /// A shard is handled: with `fail-fast` the shards that have not run are
+    /// to be cancelled once one failed, and when all are handled the job has
+    /// its outcome.
+    fn settle_shards(
+        &self,
+        task: &ExecutionTask,
+        hold: &mut ShardHold,
+        jobs: &mut [JobResult],
+        outcomes: &mut Vec<JobOutcome>,
+        inputs: &mut TaskInputs,
+    ) {
+        let Some(ts) = &task.shard else { return };
+        hold.job = task.jobs.join("+");
+        let group = self.fp.shard_groups.iter().find(|g| g.id == ts.group);
+        if let Some(g) = group {
+            let agg = crate::complete::aggregate_shard_group(g, &hold.reports);
+            hold.cancel.extend(agg.cancel);
+            if g.fail_fast && hold.errored {
+                hold.cancel.extend(
+                    g.shards
+                        .iter()
+                        .filter(|s| !hold.handled.contains(*s))
+                        .cloned(),
+                );
+            }
+            if hold.handled.len() < g.shards.len() {
+                return;
+            }
+        }
+        self.finish_shards(&ts.group, hold, jobs, outcomes, inputs);
+    }
+
+    /// The one outcome of a split job: its shards together, checked against the
+    /// tests they were to run, with every shard there and no output on which
+    /// they differ. Whatever is wrong makes the job fail.
+    fn finish_shards(
+        &self,
+        group: &str,
+        hold: &mut ShardHold,
+        jobs: &mut [JobResult],
+        outcomes: &mut Vec<JobOutcome>,
+        inputs: &mut TaskInputs,
+    ) {
+        if std::mem::replace(&mut hold.done, true) {
+            return;
+        }
+        let mut problems = match self.fp.shard_groups.iter().find(|g| g.id == group) {
+            Some(g) => crate::complete::aggregate_shard_group(g, &hold.reports).problems(),
+            None => vec![format!("the plan has no shard group `{group}`")],
+        };
+        problems.extend(task::conflicting_outputs(&hold.outcomes));
+        let mut o = combine(&hold.job, std::mem::take(&mut hold.outcomes));
+        if !problems.is_empty() && o.status == JobStatus::Success {
+            let why = problems.join("; ");
+            o.status = JobStatus::Failure;
+            o.skipped = Some(why.clone());
+            if let Some(last) = hold.last.and_then(|i| jobs.get_mut(i)) {
+                last.outcome = Outcome::Error(why);
+            }
+        }
+        outcomes.push(o.clone());
+        inputs.needs.insert(o.job.clone(), o);
     }
 
     /// Whether a task holds the per-repository lock while it runs (see
@@ -2086,21 +2213,8 @@ impl<'a> Runner<'a> {
         // would run every test once per shard, and its result would stand for
         // the whole job.
         if let Some(ts) = &task.shard {
-            let step = (task.jobs.len() == 1)
-                .then(|| self.plan.job(wi, &task.jobs[0]).steps.get(ts.step))
-                .flatten()
-                .filter(|s| s.run.is_some() && s.uses.is_none());
-            if step.is_none()
-                || ts.mode == crate::shard::SplitMode::Single
-                || (ts.mode == crate::shard::SplitMode::Listed && ts.tests.is_empty())
-                || crate::shard::adapters::from_info(&ts.runner, "").is_none()
-            {
-                bail!(
-                    "task {} is a shard of a split job, but step {} of its job is not a command of runner `{}` that can be given the shard's tests",
-                    task.id,
-                    ts.step,
-                    ts.runner.runner
-                );
+            if let Err(why) = self.check_shard_task(wi, task, ts) {
+                bail!("task {} is a shard of a split job, but {why}", task.id);
             }
         }
         for id in &task.jobs {
@@ -2214,6 +2328,63 @@ impl<'a> Runner<'a> {
                     .collect::<Vec<_>>(),
             ),
         })
+    }
+
+    /// Whether the step a shard's command replaces is what the plan says it
+    /// is: one plain command of the runner the shard was made for, run by a
+    /// shell that reads it as one, in the directory the tests were listed in,
+    /// and not allowed to fail without failing the job. The plan is read again
+    /// here, not believed: a plan that was changed after the split must not
+    /// run every test once per shard.
+    fn check_shard_task(
+        &self,
+        wi: usize,
+        task: &ExecutionTask,
+        ts: &dag::TaskShard,
+    ) -> Result<(), String> {
+        use crate::shard::{adapters, SplitMode};
+        let w = &self.plan.selected[wi].wf;
+        let bad = |what: &str| {
+            Err(format!(
+                "step {} of its job is not a command of runner `{}` that can be given the shard's tests ({what})",
+                ts.step, ts.runner.runner
+            ))
+        };
+        let job = (task.jobs.len() == 1).then(|| self.plan.job(wi, &task.jobs[0]));
+        let Some((job, step)) = job.and_then(|j| Some((j, j.steps.get(ts.step)?))) else {
+            return bad("there is no such step");
+        };
+        let Some(run) = step.run.as_ref().filter(|_| step.uses.is_none()) else {
+            return bad("it is not a `run` step");
+        };
+        if step.continue_on_error {
+            return bad("it may fail without failing the job");
+        }
+        if !matches!(
+            plan::resolved_shell(w, job, step).as_deref().map(str::trim),
+            None | Some("bash") | Some("sh")
+        ) {
+            return bad("its shell does not read one command");
+        }
+        if plan::step_dir(w, job, step) != ts.dir {
+            return bad("its working directory is not where the tests were listed");
+        }
+        let Some(parsed) = adapters::parse_command(run) else {
+            return bad("it is not one plain command");
+        };
+        if parsed.runner != ts.runner.runner
+            || parsed.args != ts.runner.config
+            || !parsed.blocked.is_empty()
+        {
+            return bad("it is not the command the shards were made from");
+        }
+        if ts.mode == SplitMode::Single
+            || (ts.mode == SplitMode::Listed && ts.tests.is_empty())
+            || adapters::from_info(&ts.runner, "").is_none()
+        {
+            return bad("the shard has no tests to run");
+        }
+        Ok(())
     }
 
     /// What the shard `ts` of `task` reported, from the log of the step that

@@ -383,6 +383,11 @@ pub struct TaskShard {
     /// command in its place.
     #[serde(default)]
     pub step: usize,
+    /// The working directory (relative to the plan root, `""` for the root)
+    /// the runner's tests were listed in: the step runs the shard's command
+    /// there, so it must be the step's own directory.
+    #[serde(default)]
+    pub dir: String,
 }
 
 /// `<workflow file>::<job id>@<index>`: the task of one shard of a split job.
@@ -402,6 +407,11 @@ pub struct ShardRequest {
     /// plan's runner was made from, with its working directory as the project
     /// root. A shard's task runs its own command in place of that step.
     pub step: usize,
+    /// The directory the runner listed its tests in, relative to the plan root
+    /// (`""` for the root). The step must run there: with another
+    /// `working-directory` the shards would run other tests than the ones
+    /// listed.
+    pub dir: String,
     /// What the runner listed; the shards are checked against it.
     pub discovered: Discovered,
     /// A failed shard cancels the shards that have not finished.
@@ -762,6 +772,7 @@ pub(crate) fn derive_tasks(
                                     tests: s.tests.clone(),
                                     runner: r.plan.runner.clone(),
                                     step: r.step,
+                                    dir: r.dir.clone(),
                                 }),
                                 ..base.clone()
                             });
@@ -911,9 +922,12 @@ fn connection_reason(
     let (Some(job), Some(step)) = (job, step) else {
         return Some(NotSplit::NotConnectable);
     };
-    // one plain command, run by a shell that reads it as one
+    // one plain command, run by a shell that reads it as one; a step that may
+    // fail without failing the job would hide a failed shard
     let run = step.run.as_ref().filter(|_| {
         step.uses.is_none()
+            && !step.continue_on_error
+            && plan::step_dir(w, job, step) == r.dir
             && matches!(
                 plan::resolved_shell(w, job, step).as_deref().map(str::trim),
                 None | Some("bash") | Some("sh")

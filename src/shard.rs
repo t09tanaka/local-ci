@@ -1285,6 +1285,57 @@ mod tests {
         assert!(lpt < by_name);
     }
 
+    // A40: the longest tests first keep the slowest shard from being slower
+    // than dividing the tests by name order. That is not a law for one input
+    // (longest-first is a heuristic: a lucky split by name can beat it by a
+    // hair), so it is pinned as what does hold: never more than 4/3 of the
+    // best split there is (and so of the name split), within the bound of any
+    // list schedule, and no slower than the name split in nearly every case
+    // and in the sum. Many inputs from a fixed generator, so a failure repeats.
+    #[test]
+    fn longest_first_is_not_slower_than_name_order_for_any_weights() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut not_slower, mut lpt_total, mut name_total) = (0, 0, 0);
+        const CASES: u64 = 80;
+        for case in 0..CASES {
+            let n = 4 + next(21) as usize;
+            let k = 2 + next(4) as usize;
+            // names that sort in the order of the index
+            let all: Vec<String> = (0..n).map(|i| format!("t{i:02}")).collect();
+            let weights: Vec<u64> = (0..n).map(|_| 1 + next(500)).collect();
+            let h = History {
+                millis: all.iter().cloned().zip(weights.iter().copied()).collect(),
+            };
+            let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+            let p = partition_tests(&fake(OK), &found(&refs), &h, k, &PartitionOpts::default());
+            assert_eq!(p.mode, SplitMode::Listed, "case {case}");
+            let lpt = makespan(&names(&p), &h.millis);
+            let naive: Vec<Vec<&str>> = refs.chunks(n.div_ceil(k)).map(<[&str]>::to_vec).collect();
+            let by_name = makespan(&naive, &h.millis);
+            assert!(
+                lpt * 3 <= by_name * 4,
+                "case {case}: {n} tests over {k}: {lpt} vs {by_name}"
+            );
+            not_slower += u64::from(lpt <= by_name);
+            lpt_total += lpt;
+            name_total += by_name;
+            // the bound of any list schedule: the even share plus the last,
+            // longest-possible test
+            let sum: u64 = weights.iter().sum();
+            let heaviest = *weights.iter().max().unwrap();
+            let k = p.shards.len() as u64;
+            assert!(lpt * k <= sum + heaviest * (k - 1), "case {case}");
+        }
+        assert!(not_slower * 10 >= CASES * 9, "{not_slower} of {CASES}");
+        assert!(lpt_total < name_total, "{lpt_total} vs {name_total}");
+    }
+
     #[test]
     fn a_native_split_has_no_more_shards_than_listed_tests() {
         let native = Capabilities {

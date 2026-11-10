@@ -427,6 +427,7 @@ impl FrozenPlan {
                         not_split: vec![],
                     },
                     step: ts.step,
+                    dir: ts.dir.clone(),
                     discovered: Discovered {
                         tests: g.manifest.clone(),
                         complete: g.manifest_exact,

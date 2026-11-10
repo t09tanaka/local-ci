@@ -25,6 +25,52 @@
   carries the runner, the listed tests and `fail_fast`, and
   `complete::aggregate_shard_group` puts the shard results together by job,
   shard and test. `NotSplit` has more reasons, and `ExecutionTask` a `shard`.
+- Breaking changes for external code that builds or matches on the plan and
+  task types (all fields are public; the `shard` module itself is new, so its
+  types are new and break nothing):
+  - `task::TaskResult` has a new field `shard: Option<ShardOutcome>` (what the
+    shard's tests reported, read from the log of the step that ran them; `None`
+    for any other task). It is `#[serde(default)]`, so older results still
+    read, but every struct literal of `TaskResult` outside this crate must add
+    `shard: None`.
+  - `dag::ExecutionTask` has a new field `shard: Option<dag::TaskShard>`; a
+    struct literal adds `shard: None`.
+  - `dag::ShardGroup` (it existed in 0.9.0) has the new fields `runner`,
+    `manifest`, `fail_fast`, `assignments` and `manifest_exact`; a struct
+    literal adds them (`runner: None`, `manifest: vec![]`, `fail_fast: false`,
+    `assignments: vec![]`, `manifest_exact: false`). `manifest_exact` says the
+    manifest is all the tests there are (false for a native split whose
+    listing may be partial: every listed test must be reported, others may be).
+  - `dag::NotSplit` (it existed in 0.9.0, with four variants) has new variants
+    (`NotRequested`, `NoEnumeration`, `DiscoveryFailed`, `IncompleteDiscovery`,
+    `NoShardTarget`, `SharedState`, `NoIsolation`, `InexactAggregation`,
+    `TooSmall`, `ManifestMismatch`, `JobFilter`, `UnreadableArgs`,
+    `NotConnectable`, `PathOverlap`, `ArgvTooLarge`) and derives `Eq`; an
+    exhaustive `match` adds arms. `dag::OutputAggregation` has the new variant
+    `TestIdentity`.
+  - New and required: `dag::ShardRequest` (the request to split a job) has the
+    required fields `step` (the index of the step whose `run` the plan's runner
+    was made from; the shard's command replaces that step) and `dir` (the
+    directory, relative to the plan root, the tests were listed in; it must be
+    the step's own `working-directory`, otherwise the job is not split,
+    `NotConnectable`). `dag::TaskShard` (a task's part of a split job) carries
+    the `runner` and `step` its command is built from, and `dir`. A task whose
+    step no longer is that command (changed runner or arguments, a filter, a
+    shell that does not read one command, `continue-on-error`, another
+    directory) is refused when it is run.
+  - `shard::Discovered.complete` means the listing is every test there is. For
+    `cargo test` it is false when a target prints what it likes
+    (`harness = false`), when a doctest or a name listed twice is there, when
+    the listing shows no target (a quiet cargo) or the number of targets and
+    summaries differ; the listing is made with `--color never` and
+    `CARGO_TERM_QUIET=false` so that a user's cargo settings do not decide it.
+    Escape codes are removed before it is read.
+  - A job split into shards is run by `exec` (one task per shard, one after
+    the other: a local run takes the sum of the shards' times, the load
+    balancing pays where shards run side by side) and has one outcome: it
+    fails when a shard could not be run, did not report, reported tests it was
+    not given, or when the shards gave different values for an output. With
+    `fail-fast`, the shards after a failed one end `cancelled`.
 - The plan schema version is 5; a plan of version 4 is refused by name.
 
 ## [0.9.0] - 2026-11-10

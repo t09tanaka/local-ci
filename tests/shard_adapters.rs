@@ -113,6 +113,33 @@ fn cargo_test_shards_cover_every_test_once() {
     assert!(m.problems.is_empty(), "{m:?}");
 }
 
+// A cargo that is set to colour its output, or to print little, lists the same
+// tests and is still known to have listed them all.
+#[test]
+fn cargo_lists_the_same_tests_whatever_its_colour_and_quiet_settings() {
+    let tmp = common::tempdir().unwrap();
+    let dir = tmp.path().join("rust");
+    copy_dir(&example("rust"), &dir);
+    let target = tmp.path().join("target");
+    let target = target.to_str().unwrap();
+    let a = CargoTest::new("test", &[], Safety::default());
+    let listed = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CARGO_TARGET_DIR", target)];
+        env.extend_from_slice(extra);
+        let out = run_invocation(&ctx(&env), &a.discover_command(), &dir).unwrap();
+        a.discover(&out).unwrap()
+    };
+    let plain = listed(&[]);
+    assert!(plain.complete, "{plain:?}");
+    for extra in [
+        [("CARGO_TERM_COLOR", "always")],
+        [("CARGO_TERM_QUIET", "true")],
+        [("CARGO_TERM_VERBOSE", "true")],
+    ] {
+        assert_eq!(listed(&extra), plain, "{extra:?}");
+    }
+}
+
 #[test]
 fn vitest_shards_cover_every_file_once() {
     let dir = example("node");

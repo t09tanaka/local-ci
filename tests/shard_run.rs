@@ -170,6 +170,16 @@ fn split<A: RunnerAdapter>(
     example_dir: &str,
     n: usize,
 ) -> (Discovered, FrozenPlan) {
+    split_with(lab, a, example_dir, n, false)
+}
+
+fn split_with<A: RunnerAdapter>(
+    lab: &Lab,
+    a: &A,
+    example_dir: &str,
+    n: usize,
+    fail_fast: bool,
+) -> (Discovered, FrozenPlan) {
     let listing = run_invocation(&lab.ctx, &a.discover_command(), &example(example_dir)).unwrap();
     let d = a.discover(&listing).unwrap();
     assert!(d.complete, "{d:?}");
@@ -183,8 +193,9 @@ fn split<A: RunnerAdapter>(
             job: "test".into(),
             plan: p,
             step: 0,
+            dir: example_dir.into(),
             discovered: d.clone(),
-            fail_fast: false,
+            fail_fast,
         }])
         .unwrap();
     assert!(
@@ -261,7 +272,7 @@ fn cargo_shards_run_their_own_tests_and_all_of_them_once() {
     assert_eq!(agg.merged.skipped, ["tests::slow_one"]);
 }
 
-// A40: the job a split plan is run as is its shards together: a failing test of one shard
+// The job a split plan is run as is its shards together: a failing test of one shard
 // fails the job, and what needs the job sees that.
 #[test]
 fn a_failing_test_in_one_shard_fails_the_job() {
@@ -424,11 +435,33 @@ fn a_shard_task_that_cannot_run_its_command_is_refused() {
         f(t.shard.as_mut().unwrap());
         p
     };
+    // the step of the job, as the plan holds it
+    let step_of = |f: &dyn Fn(&mut local_ci::wire::StepSpec)| {
+        let mut p = fp.clone();
+        let job = p.workflows[0]
+            .jobs
+            .iter_mut()
+            .find(|j| j.id == "test")
+            .unwrap();
+        f(&mut job.steps[0]);
+        p
+    };
     for p in [
         edit(&|s| s.step = 7),
         edit(&|s| s.runner.runner = "mocha".into()),
+        edit(&|s| s.runner.config = vec!["--release".into()]),
         edit(&|s| s.tests.clear()),
         edit(&|s| s.mode = SplitMode::Single),
+        // the listing was made somewhere else than the step runs
+        edit(&|s| s.dir = "elsewhere".into()),
+        step_of(&|st| st.working_directory = Some("elsewhere".into())),
+        // a step that is not the command the shards were made from
+        step_of(&|st| st.run = Some("cargo test --lib".into())),
+        step_of(&|st| st.run = Some("cargo test adds".into())),
+        step_of(&|st| st.run = Some("echo cargo test".into())),
+        step_of(&|st| st.continue_on_error = true),
+        step_of(&|st| st.shell = Some("python".into())),
+        step_of(&|st| st.run = None),
     ] {
         assert!(run(&p).contains("shard of a split job"), "{}", run(&p));
     }
@@ -458,9 +491,172 @@ fn split_unfiltered(l: &Lab) -> ((), FrozenPlan) {
             job: "test".into(),
             plan: p,
             step: 0,
+            dir: "rust".into(),
             discovered: d,
             fail_fast: false,
         }])
         .unwrap();
     ((), fp)
+}
+
+/// How a run of `fp` ended: the outcomes of the job `test` (there must be one)
+/// and the results of its shards as `(display, outcome, cancelled)`.
+fn run_plan(
+    l: &Lab,
+    fp: &FrozenPlan,
+) -> (local_ci::task::JobOutcome, Vec<(String, Outcome, bool)>) {
+    let r = local_ci::execute_plan(&l.ctx, fp, &l.ws, l.opts()).unwrap();
+    let mut mine = r
+        .units
+        .iter()
+        .flat_map(|u| u.outcomes.iter())
+        .filter(|o| o.job == "test");
+    let outcome = mine.next().expect("the job has an outcome").clone();
+    assert!(mine.next().is_none(), "the job has more than one outcome");
+    let shards = r
+        .units
+        .iter()
+        .flat_map(|u| u.jobs.iter())
+        .filter(|j| j.job == "test")
+        .map(|j| (j.display.clone(), j.outcome.clone(), j.cancelled))
+        .collect();
+    // what needs the job saw it as it is
+    let after = r
+        .units
+        .iter()
+        .flat_map(|u| u.outcomes.iter())
+        .find(|o| o.job == "after");
+    assert!(
+        after.is_none_or(|o| o.status != local_ci::task::JobStatus::Success)
+            || outcome.status == local_ci::task::JobStatus::Success
+    );
+    (outcome, shards)
+}
+
+// A shard task that cannot be run is a shard the job is missing: the job fails,
+// with one outcome, however many shards could not be run and in whatever order.
+#[test]
+fn a_shard_that_cannot_run_fails_the_job_once() {
+    use local_ci::task::JobStatus;
+    let l = lab("rust", "cargo test", "");
+    let a = CargoTest::from_command("test", "cargo test", Safety::default()).unwrap();
+    let (_, fp) = split(&l, &a, "rust", 3);
+    let ids: Vec<String> = fp
+        .shard_groups
+        .iter()
+        .find(|g| g.split)
+        .unwrap()
+        .shards
+        .clone();
+    let broken = |which: &[usize]| {
+        let mut p = fp.clone();
+        for t in p
+            .tasks
+            .iter_mut()
+            .filter(|t| which.iter().any(|i| ids[*i] == t.id))
+        {
+            t.shard.as_mut().unwrap().step = 7;
+        }
+        p
+    };
+    for which in [vec![0], vec![1], vec![2], vec![0, 1, 2]] {
+        let (o, shards) = run_plan(&l, &broken(&which));
+        assert_eq!(o.status, JobStatus::Failure, "{which:?}");
+        let why = o.skipped.as_deref().unwrap();
+        assert!(why.contains("shard of a split job"), "{why}");
+        assert_eq!(shards.len(), 3, "{which:?}: {shards:?}");
+        let errors = shards
+            .iter()
+            .filter(|(_, o, _)| matches!(o, Outcome::Error(_)))
+            .count();
+        assert!(errors >= which.len(), "{which:?}: {shards:?}");
+    }
+    // when only the shards that ran are missing a test, the job says which shard
+    let (o, _) = run_plan(&l, &broken(&[1]));
+    assert!(o.skipped.unwrap().contains("shard of a split job"));
+}
+
+// The shards of one job run the same job: an output they do not agree on has no
+// value to publish, and the job fails.
+#[test]
+fn shards_that_disagree_on_an_output_fail_the_job() {
+    use local_ci::task::JobStatus;
+    // the second step counts the shards that ran before it in this workspace
+    let counter = "      - id: o\n        run: |\n          n=$(cat count 2>/dev/null || echo 0)\n          echo $((n + 1)) > count\n          echo \"v=$n\" >> \"$GITHUB_OUTPUT\"\n    outputs:\n      v: ${{ steps.o.outputs.v }}\n";
+    let l = lab("rust", "cargo test", counter);
+    let a = CargoTest::from_command("test", "cargo test", Safety::default()).unwrap();
+    let (_, fp) = split(&l, &a, "rust", 2);
+    let (o, _) = run_plan(&l, &fp);
+    assert_eq!(o.status, JobStatus::Failure, "{o:?}");
+    assert!(
+        o.skipped
+            .as_deref()
+            .unwrap()
+            .contains("different values for the output `v`"),
+        "{o:?}"
+    );
+    // the same value from every shard is published
+    let same = "      - id: o\n        run: echo \"v=1\" >> \"$GITHUB_OUTPUT\"\n    outputs:\n      v: ${{ steps.o.outputs.v }}\n";
+    let l = lab("rust", "cargo test", same);
+    let (_, fp) = split(&l, &a, "rust", 2);
+    let (o, _) = run_plan(&l, &fp);
+    assert_eq!(o.status, JobStatus::Success, "{o:?}");
+    assert_eq!(o.outputs["v"], "1");
+}
+
+// With `fail-fast`, the shards after a failed one are not run: they end
+// cancelled and the job fails. Without it, every shard runs.
+#[test]
+fn a_failed_shard_cancels_the_shards_after_it_with_fail_fast() {
+    use local_ci::task::JobStatus;
+    let l = lab("rust", "cargo test", "");
+    let a = CargoTest::from_command("test", "cargo test", Safety::default()).unwrap();
+    let (_, fp) = split_with(&l, &a, "rust", 3, true);
+    // the first shard cannot be run
+    let first = fp.shard_groups.iter().find(|g| g.split).unwrap().shards[0].clone();
+    let mut broken = fp.clone();
+    broken
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == first)
+        .unwrap()
+        .shard
+        .as_mut()
+        .unwrap()
+        .step = 7;
+    let (o, shards) = run_plan(&l, &broken);
+    assert_eq!(o.status, JobStatus::Failure);
+    assert_eq!(shards.len(), 3);
+    assert!(matches!(shards[0].1, Outcome::Error(_)), "{shards:?}");
+    for (display, outcome, cancelled) in &shards[1..] {
+        assert!(
+            matches!(outcome, Outcome::Skip(why) if why.contains("fail-fast")),
+            "{display}: {outcome:?}"
+        );
+        assert!(cancelled, "{display}");
+    }
+    // a shard whose tests fail does the same
+    let l = lab(
+        "rust",
+        "cargo test",
+        "        env:\n          SHARD_EXAMPLE_FAIL: '1'\n",
+    );
+    let (_, fp) = split_with(&l, &a, "rust", 3, true);
+    let g = fp.shard_groups.iter().find(|g| g.split).unwrap();
+    let failing = g
+        .assignments
+        .iter()
+        .position(|t| t.iter().any(|t| t == "fails_on_purpose_when_asked"))
+        .unwrap();
+    assert!(failing < 2, "the example must fail before the last shard");
+    let (o, shards) = run_plan(&l, &fp);
+    assert_eq!(o.status, JobStatus::Failure);
+    for (i, (_, outcome, cancelled)) in shards.iter().enumerate() {
+        assert_eq!(*cancelled, i > failing, "shard {i}: {shards:?}");
+        assert_eq!(matches!(outcome, Outcome::Fail), i == failing, "shard {i}");
+    }
+    // without fail-fast every shard runs
+    let (_, fp) = split(&l, &a, "rust", 3);
+    let (_, shards) = run_plan(&l, &fp);
+    assert!(shards.iter().all(|(_, _, c)| !c), "{shards:?}");
 }

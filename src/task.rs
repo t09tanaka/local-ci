@@ -15,7 +15,7 @@ use crate::shard::ShardOutcome;
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How a job ended, as `needs.<id>.result` sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +220,22 @@ pub(crate) fn combine(job: &str, mut parts: Vec<JobOutcome>) -> JobOutcome {
         },
         ancestor_failed: parts.iter().any(|p| p.ancestor_failed),
     }
+}
+
+/// The outputs of `parts` that two of them give different values, as
+/// sentences. The shards of one job run the same job: an output they disagree
+/// on has no one value to publish.
+pub(crate) fn conflicting_outputs(parts: &[JobOutcome]) -> Vec<String> {
+    let mut first: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut out = BTreeSet::new();
+    for (k, v) in parts.iter().flat_map(|p| &p.outputs) {
+        if *first.entry(k).or_insert(v) != v {
+            out.insert(k.as_str());
+        }
+    }
+    out.into_iter()
+        .map(|k| format!("the shards gave different values for the output `{k}`"))
+        .collect()
 }
 
 /// The job that a matrix is, from the outcomes of its variants, which may

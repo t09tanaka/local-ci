@@ -374,6 +374,26 @@ impl CargoTest {
     }
 }
 
+/// `text` without the colour and cursor sequences (`ESC [ ... letter`) a
+/// terminal would turn into style.
+fn without_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn is_doctest(name: &str) -> bool {
     name.contains(" - ") && name.ends_with(')') && name.contains("(line ")
 }
@@ -398,32 +418,56 @@ impl RunnerAdapter for CargoTest {
     }
 
     fn discover_command(&self) -> Invocation {
-        invocation(self.command(&["--", "--list"]))
+        // Plain, chatty output whatever the user's cargo configuration says:
+        // the `Running` lines tell how many targets there are.
+        Invocation {
+            argv: self.command(&["--color", "never", "--", "--list"]),
+            env: vec![
+                ("CARGO_TERM_QUIET".into(), "false".into()),
+                ("CARGO_TERM_VERBOSE".into(), "false".into()),
+            ],
+        }
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
         if !out.success {
             return Err(failed_listing(out));
         }
+        let (stdout, stderr) = (without_ansi(&out.stdout), without_ansi(&out.stderr));
         let mut tests = Vec::new();
         let mut complete = true;
         let mut seen = BTreeSet::new();
-        for name in out.stdout.lines().filter_map(|l| l.strip_suffix(": test")) {
-            if is_doctest(name) || !seen.insert(name) {
-                complete = false;
+        for line in stdout.lines() {
+            match line.strip_suffix(": test") {
+                Some(name) => {
+                    if is_doctest(name) || !seen.insert(name) {
+                        complete = false;
+                    }
+                    tests.push(name.to_string());
+                }
+                // what libtest prints around the tests; anything else is a
+                // target that prints what it likes
+                None if line.trim().is_empty()
+                    || is_list_summary(line)
+                    || line.ends_with(": benchmark") => {}
+                None => complete = false,
             }
-            tests.push(name.to_string());
         }
         // Every target cargo ran ends its listing with a summary. A target
         // with a harness of its own (`harness = false`) prints what it likes,
-        // so its tests are not in the list.
-        let targets = out
-            .stderr
+        // so its tests are not in the list. The two streams cannot be read in
+        // order, so the targets and the summaries are counted: a run that
+        // shows no target (a quiet cargo), or one with a summary too few or too
+        // many, is not known to be the whole.
+        let targets = stderr
             .lines()
-            .filter(|l| l.trim_start().starts_with("Running "))
+            .filter(|l| {
+                let l = l.trim_start();
+                l.starts_with("Running ") || l.starts_with("Doc-tests ")
+            })
             .count();
-        let summaries = out.stdout.lines().filter(|l| is_list_summary(l)).count();
-        if targets > summaries {
+        let summaries = stdout.lines().filter(|l| is_list_summary(l)).count();
+        if targets == 0 || targets != summaries {
             complete = false;
         }
         tests.sort();
@@ -771,10 +815,31 @@ mod tests {
         assert_eq!(c.info().config, vec!["--workspace"]);
         assert_eq!(
             c.discover_command().argv,
-            ["cargo", "test", "--workspace", "--", "--list"]
+            [
+                "cargo",
+                "test",
+                "--workspace",
+                "--color",
+                "never",
+                "--",
+                "--list"
+            ]
+        );
+        // whatever the user's cargo is set to, the listing is read as it is
+        assert_eq!(
+            c.discover_command().env,
+            [
+                ("CARGO_TERM_QUIET".to_string(), "false".to_string()),
+                ("CARGO_TERM_VERBOSE".to_string(), "false".to_string())
+            ]
         );
         let listing = "b::two: test\na::one: test\n\n2 tests, 0 benchmarks\nbench_x: benchmark\n";
-        let d = c.discover(&out(listing, true)).unwrap();
+        let one = CommandOutput {
+            stdout: listing.into(),
+            stderr: "   Running unittests src/lib.rs (target/debug/deps/a-1)\n".into(),
+            success: true,
+        };
+        let d = c.discover(&one).unwrap();
         assert_eq!(d.tests, ["a::one", "b::two"]);
         assert!(d.complete);
         // the same name in two targets, and a doctest, make it incomplete
@@ -1199,6 +1264,17 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         let d = listing(two, custom);
         assert!(!d.complete);
         assert_eq!(d.tests, ["a"]);
+        // a target that prints nothing has no summary either
+        assert!(!listing(two, "a: test\n\n1 test, 0 benchmarks\n").complete);
+        // a summary more than there are targets: something else printed one
+        let more = format!("{ok}\n1 test, 0 benchmarks\n");
+        assert!(!listing(two, &more).complete);
+        // text of its own among the tests is not libtest's either
+        assert!(!listing(two, &format!("noise\n{ok}")).complete);
+        // doc-tests are a target of their own, with a summary of their own
+        let doc = format!("{two}   Doc-tests a\n");
+        assert!(listing(&doc, &format!("{ok}\n0 tests, 0 benchmarks\n")).complete);
+        assert!(!listing(&doc, ok).complete);
         // lines that only look like a summary are not one
         for line in [
             "1 test, 0",
@@ -1210,6 +1286,36 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
             assert!(!is_list_summary(line), "{line}");
         }
         assert!(is_list_summary("12 tests, 3 benchmarks"));
+    }
+
+    #[test]
+    fn colour_and_a_quiet_cargo_do_not_make_a_listing_look_complete_or_empty() {
+        let c = CargoTest::new("1", &[], Safety::default());
+        let listing = |stderr: &str, stdout: &str| {
+            c.discover(&CommandOutput {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                success: true,
+            })
+            .unwrap()
+        };
+        let ok = "a: test\n\n1 test, 0 benchmarks\n";
+        // `CARGO_TERM_COLOR=always`: the target lines come with escape codes
+        let coloured = "\u{1b}[1m\u{1b}[92m     Running\u{1b}[0m unittests src/lib.rs (target/debug/deps/a-1)\n";
+        let d = listing(coloured, ok);
+        assert!(d.complete, "{d:?}");
+        assert_eq!(d.tests, ["a"]);
+        // a colour code on a test line does not hide the test
+        let d = listing(coloured, "\u{1b}[0ma: test\n\n1 test, 0 benchmarks\n");
+        assert_eq!(d.tests, ["a"]);
+        // a bare escape that opens no sequence is kept
+        assert_eq!(without_ansi("a\u{1b}b"), "a\u{1b}b");
+        assert_eq!(without_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        // `CARGO_TERM_QUIET`: no target is shown, so nothing says the listing is
+        // the whole one
+        let d = listing("", ok);
+        assert!(!d.complete);
+        assert_eq!(d.tests, ["a"]);
     }
 
     #[test]

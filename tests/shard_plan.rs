@@ -76,6 +76,16 @@ const JOBS: &str = "  test:
     runs-on: x
     steps:
       - uses: ./local
+  coe:
+    runs-on: x
+    steps:
+      - run: cargo test
+        continue-on-error: true
+  wd:
+    runs-on: x
+    steps:
+      - run: cargo test
+        working-directory: web
   multi:
     runs-on: x
     steps:
@@ -146,6 +156,7 @@ fn request(job: &str, plan: ShardPlan, d: Discovered) -> ShardRequest {
         job: job.into(),
         plan,
         step: 0,
+        dir: String::new(),
         discovered: d,
         fail_fast: true,
     }
@@ -448,6 +459,25 @@ fn a_job_is_split_only_where_its_step_is_the_command_the_plan_was_made_from() {
     assert_eq!(reasons(&sp, "pyshell"), vec![NotSplit::NotConnectable]);
     let sp = fp.with_shards(&[split_request("action", 2)]).unwrap();
     assert_eq!(reasons(&sp, "action"), vec![NotSplit::NotConnectable]);
+    // a step that may fail without failing the job would hide a failed shard
+    let sp = fp.with_shards(&[split_request("coe", 2)]).unwrap();
+    assert_eq!(reasons(&sp, "coe"), vec![NotSplit::NotConnectable]);
+    // the tests were listed where the step runs, and nowhere else
+    let at = |job: &str, dir: &str| ShardRequest {
+        dir: dir.into(),
+        ..split_request(job, 2)
+    };
+    let sp = fp.with_shards(&[at("wd", "")]).unwrap();
+    assert_eq!(reasons(&sp, "wd"), vec![NotSplit::NotConnectable]);
+    let sp = fp.with_shards(&[at("test", "web")]).unwrap();
+    assert_eq!(reasons(&sp, "test"), vec![NotSplit::NotConnectable]);
+    let sp = fp.with_shards(&[at("wd", "web")]).unwrap();
+    assert!(group(&sp, "wd").split);
+    let shard = sp.tasks.iter().find_map(|t| t.shard.as_ref()).unwrap();
+    assert_eq!(shard.dir, "web");
+    // and the plan remembers where
+    assert_eq!(sp.shard_requests()[0].dir, "web");
+    assert_eq!(sp.with_plan(sp.to_plan()).unwrap(), sp);
     // the step named is the one, not the first
     let sp = fp
         .with_shards(&[step_request("multi", 1, &["--workspace"])])
