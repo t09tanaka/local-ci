@@ -133,7 +133,7 @@ pub(crate) fn ctx_of(o: &JobOutcome) -> Value {
 }
 
 /// What running a task produced.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
     /// Each job (each matrix entry) with its steps, as a run reports them.
@@ -145,9 +145,9 @@ pub struct TaskResult {
     /// commit, another workspace, another template key); the task then did all
     /// its setup itself. `None` when there was no receipt or it was used.
     pub receipt_ignored: Option<String>,
-    /// Names of the artifacts the task published (none are produced yet; the
-    /// `artifacts` a task's [`crate::dag::OutputVerification`] asks for are
-    /// checked against this).
+    /// Names of the artifacts uploaded by the task's own jobs, in the area of
+    /// its workflow (the `artifacts` a task's
+    /// [`crate::dag::OutputVerification`] asks for are checked against this).
     pub artifacts: Vec<String>,
 }
 

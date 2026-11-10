@@ -260,12 +260,16 @@ they end.
 
 ### Artifacts (`upload-artifact@v4`, `download-artifact@v4`)
 
-Within one run, an upload copies its files into the run's own area
-(`<run dir>/artifacts/<name>/v<N>/`), read-only, and writes a receipt (name,
-each file's relative path, size and SHA-256, the plan digest, the attempt and
-the job) before the step completes. A download reads the receipt, checks every
-file against it and only then places the files, so a job that `needs` the
-uploading job gets exactly what was uploaded. A run is not a `success` while an
+Within one workflow run, an upload copies its files into the area of its
+workflow (`<run dir>/artifacts/<workflow>/<name>/v<N>/`, `<workflow>` being the
+workflow file's path made safe as a directory name), read-only, and writes a
+receipt (name, each file's relative path, size and SHA-256, the plan digest,
+the attempt and the job) before the step completes. A download reads the
+receipt, checks every file against it and only then places the files, so a job
+that `needs` the uploading job gets exactly what was uploaded. As on GitHub,
+artifacts belong to a workflow run: two workflows may each upload a `coverage`
+without a conflict, and a job cannot download what a job of another workflow
+uploaded (it fails as not found, `pattern` included). A run is not a `success` while an
 artifact its plan requires (a literal name, a step that always runs — no `if:`,
 or one that is only `always()`, `success()`, `!cancelled()` or `true` — and
 `if-no-files-found: error`) has no receipt.
@@ -278,11 +282,11 @@ the workflow, the job and the step. The other workflows run as usual.
 
 Units that use these actions are kept in the results cache. A kept result
 carries the artifacts its unit uploaded (receipt and files); reusing it puts
-them into the run's own area, every file checked against its receipt first
+them into the area of its workflow in the run, every file checked against its receipt first
 (the receipt then carries this run's plan digest and attempt, and
 `restored_from` says which attempt made it), and a file that does not match
 makes it a miss: the unit runs again. A unit that downloads is reused only when
-each artifact it took (named literally) is, in this run, the same artifact
+each artifact it took (named literally) is, in this run and workflow, the same artifact
 (same files, sizes and SHA-256) the result was kept against, which is the case
 when the unit that uploads it is reused too. A download by `pattern`, or by a
 name that is an expression, is never taken from the cache.
@@ -383,7 +387,7 @@ cargo test
 ```
 
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
-`src/dag.rs`, `src/frozen.rs`) are gated on 100% line coverage over the whole test suite.
+`src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`) are gated on 100% line coverage over the whole test suite.
 All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 

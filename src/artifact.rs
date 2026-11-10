@@ -366,7 +366,7 @@ pub fn decide_version(name: &str, latest: Option<u32>, overwrite: bool) -> Resul
         None => Ok(1),
         Some(v) if overwrite => Ok(v + 1),
         Some(_) => Err(format!(
-            "an artifact named `{name}` was already uploaded in this run (set `overwrite: true` to replace it, or give each upload its own name)"
+            "an artifact named `{name}` was already uploaded in this workflow run (set `overwrite: true` to replace it, or give each upload its own name)"
         )),
     }
 }
@@ -708,7 +708,9 @@ pub fn select_artifacts(
         return if available.iter().any(|a| a == n) {
             Ok(vec![n.to_string()])
         } else {
-            Err(format!("no artifact named `{n}` was uploaded in this run"))
+            Err(format!(
+                "no artifact named `{n}` was uploaded in this workflow run"
+            ))
         };
     }
     let picked: Vec<String> = available
@@ -719,7 +721,7 @@ pub fn select_artifacts(
     if picked.is_empty() {
         return Err(match pattern {
             Some(p) => format!("no artifact matches `{p}`"),
-            None => "no artifact was uploaded in this run".into(),
+            None => "no artifact was uploaded in this workflow run".into(),
         });
     }
     Ok(picked)

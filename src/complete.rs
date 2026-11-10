@@ -20,6 +20,7 @@ use crate::report::RunResult;
 use crate::task::{JobOutcome, JobStatus, TaskResult};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,8 +129,6 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
             )),
         }
     }
-    // the artifacts the run has a receipt for
-    let published = crate::artifact_io::published_names(&r.run_dir);
     for (ui, spec) in fp.units.iter().enumerate() {
         let file = &fp.workflows[spec.workflow].file;
         let label = unit_label(file, &spec.jobs);
@@ -138,7 +137,7 @@ pub fn validate_run_result(fp: &FrozenPlan, r: &RunResult) -> Completeness {
         }
         match got[ui].as_slice() {
             [] => c.missing.push(format!("the result of {label}")),
-            [one] => check_unit(fp, ui, &label, one, &published, &mut c),
+            [one] => check_unit(fp, ui, &label, one, &r.run_dir, &mut c),
             many => c.duplicate.push(format!("{label}: {} results", many.len())),
         }
     }
@@ -175,7 +174,7 @@ fn check_unit(
     ui: usize,
     label: &str,
     ru: &UnitResult,
-    published: &[String],
+    run_dir: &Path,
     c: &mut Completeness,
 ) {
     let spec = &fp.units[ui];
@@ -243,7 +242,16 @@ fn check_unit(
             .filter(|j| passed.contains(j))
             .collect();
         let every = ok.len() == t.jobs.len();
-        let mut why = check_outputs(t, &ok, &ru.outcomes, published, every);
+        // what the task's own jobs published, as when the task ran
+        let published = crate::artifact_io::published_by(
+            run_dir,
+            &t.workflow,
+            &t.jobs
+                .iter()
+                .map(|j| dag::node_id(&t.workflow, j))
+                .collect::<Vec<_>>(),
+        );
+        let mut why = check_outputs(t, &ok, &ru.outcomes, &published, every);
         why.retain(|w| !w.is_empty());
         c.invalid
             .extend(why.into_iter().map(|w| format!("{label}: {w}")));

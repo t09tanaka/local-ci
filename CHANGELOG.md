@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- CLI behaviour change: a run that has skipped work now ends `incomplete`,
+  exits 3 and has the commit status `error`, where it used to be `success`
+  and exit 0 (see the entry on completeness below; the spec intends this).
+  `--json` and `result.json` have a new state `no_work` for a run whose changes
+  trigger no workflow, which exits 0 and is still posted as `success`.
 - `actions/upload-artifact@v4` and `actions/download-artifact@v4` run within a
   run instead of being skipped (`src/artifact.rs`, `src/artifact_io.rs`):
   `name`, `path` (lines, globs, exclusions), `if-no-files-found`, `overwrite`
@@ -31,6 +36,15 @@
   `execute_task` refuses the same workflows (its jobs are errors, nothing is
   started), a run's directory is never shared by two runs of one commit in the
   same second, and a failed restore leaves no artifact of a unit that runs again.
+  Artifacts belong to a workflow run, as on GitHub: they are laid out per
+  workflow file (`artifacts/<workflow>/<name>/v<N>/`), so two workflows may
+  upload the same name and a job cannot download what another workflow
+  uploaded; the results cache keeps and restores them per workflow too.
+  `validate_run_result` takes what a task published from the receipts of the
+  task's own jobs, as `execute_task` does. Library: `execute_plan` needs a new,
+  unique `Workspace::run_dir` (`claim_run_dir` makes one) and refuses one that
+  already has artifacts; `TaskResult`, `JobResult` and what they hold are
+  `Deserialize`.
 - Library: `source::capture_source` fixes the input of a run (staged and
   unstaged changes, untracked files, deletions, modes, symlinks, submodules,
   LFS payloads) in a private content-addressed store and describes it in a
@@ -141,8 +155,7 @@
     that triggers nothing, as before.
   - A run that skipped what local-ci cannot reproduce (a step that uses an
     action it does not know, a `secrets` step, an install of system
-    packages, a push or deploy, `upload-artifact` / `download-artifact`) has
-    the state `incomplete` and exits 3 (it used to be a `success` with a
+    packages, a push or deploy) has the state `incomplete` and exits 3 (it used to be a `success` with a
     "not covered" note and exit 0; exit 2 stays for `error`). Its commit
     status is `error`, never `success`, and its description names the first
     steps that were left out; `local-ci status` does the same. A workflow that
@@ -151,6 +164,10 @@
     `incomplete` too, with the reason under `completeness.incomplete`; a
     workflow the changes simply do not trigger does not. `checkout`, `cache` and the
     setup actions are not gaps.
+    `upload-artifact` and `download-artifact` are not gaps either: they run.
+    Only a form that `artifact::parse_uses` refuses (another major version, a
+    sub-action such as `upload-artifact/merge`), or an option local-ci cannot
+    run, is not run, and then as an `error` of the jobs of its workflow.
   - A task that cannot be run (not a step that fails: the task itself)
     counts as a failure for the jobs that need it. Before, those jobs saw a
     need that was not there.

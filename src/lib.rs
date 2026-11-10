@@ -34,8 +34,9 @@ pub use complete::{validate_run_result, verify_task_result, Completeness, Verdic
 pub use context::{CancelHandle, ExecContext};
 pub use frozen::{derive_job_dag, FrozenPlan};
 pub use run::{
-    build_frozen_plan, build_frozen_plan_with, execute_plan, freeze, post_status, publish_target,
-    resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions, RunReport, Target,
+    build_frozen_plan, build_frozen_plan_with, claim_run_dir, execute_plan, freeze, post_status,
+    publish_target, resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions,
+    RunReport, Target,
 };
 pub use task::{
     aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,

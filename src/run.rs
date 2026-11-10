@@ -363,7 +363,7 @@ pub fn post_status(
 /// or with `-<n>` after it when another run of the same commit started in the
 /// same second and has it. The directory is made here, so two runs never share
 /// one (what a run does to its artifact area would destroy the other's).
-fn claim_run_dir(runs: &std::path::Path, stamp: u64, sha7: &str) -> Result<PathBuf> {
+pub fn claim_run_dir(runs: &std::path::Path, stamp: u64, sha7: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(runs)?;
     for n in 0u32.. {
         let name = if n == 0 {
@@ -457,7 +457,29 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
 /// their order and the setup are the plan's. The attempt's processes and
 /// containers are tracked in `ctx.cancel`; the containers are gone when this
 /// returns, the workspace is left for the caller to remove.
+///
+/// `ws.run_dir` must be new and unique to this run (see [`claim_run_dir`]):
+/// the run's artifacts are laid out in it, and one that has artifacts already
+/// (another run's, or an earlier call's) is refused before anything starts.
 pub fn execute_plan(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    ws: &exec::Workspace,
+    opts: exec::Opts,
+) -> Result<report::RunResult> {
+    let area = ws.run_dir.join("artifacts");
+    if std::fs::read_dir(&area).is_ok_and(|mut d| d.next().is_some()) {
+        bail!(
+            "{} already has artifacts: a run needs a directory of its own",
+            ws.run_dir.display()
+        );
+    }
+    run_plan(ctx, fp, ws, opts)
+}
+
+/// [`execute_plan`] without the check of the run directory, for a run that
+/// has put the artifacts of its reused units there itself.
+fn run_plan(
     ctx: &ExecContext,
     fp: &FrozenPlan,
     ws: &exec::Workspace,
@@ -702,7 +724,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             tools: tools.clone(),
             lock_file: cache.join("locks").join(format!("{key}.lock")),
         };
-        let result = execute_plan(ctx, &fp, &ws, opts);
+        let result = run_plan(ctx, &fp, &ws, opts);
         if a.keep {
             obs.notice(&format!("kept worktree {}", report::tilde(&wt, ctx.home())));
             if fp.units.len() > 1 {

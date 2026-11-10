@@ -63,6 +63,18 @@ fn target(dir: &Path) -> Target {
 
 const W1: &str = ".github/workflows/one.yml";
 
+/// The directory of the artifacts of workflow `one.yml` in a run.
+fn wdir() -> String {
+    artifact_io::workflow_dir(W1)
+}
+
+/// The workflow of the artifacts of the tests that call `artifact_io` directly.
+const IO_WF: &str = "w.yml";
+
+fn io_wdir() -> String {
+    artifact_io::workflow_dir(IO_WF)
+}
+
 /// A repository whose workflow `one.yml` has these jobs; `feature` changes
 /// `x/f`, which is what triggers it.
 fn lab(jobs: &str) -> (common::Tmp, PathBuf) {
@@ -90,7 +102,8 @@ fn plan(tmp: &common::Tmp, dir: &Path) -> Result<FrozenPlan, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
-fn run(jobs: &str) -> (common::Tmp, FrozenPlan, RunResult) {
+/// A planned lab, its worktree and a run directory of its own (`claim_run_dir`).
+fn lab_ws(jobs: &str) -> (common::Tmp, FrozenPlan, Workspace) {
     let (tmp, dir) = lab(jobs);
     let fp = plan(&tmp, &dir).unwrap();
     let cache = tmp.path().join("lab");
@@ -100,21 +113,28 @@ fn run(jobs: &str) -> (common::Tmp, FrozenPlan, RunResult) {
     let ws = Workspace {
         root: wt,
         repo_root: dir.clone(),
-        run_dir: cache.join("runs/r1"),
+        run_dir: local_ci::claim_run_dir(&cache.join("runs"), 1, "abcdef0").unwrap(),
         tools: cache.join("wt/w.tools"),
         lock_file: cache.join("locks/lab.lock"),
     };
-    std::fs::create_dir_all(&ws.run_dir).unwrap();
-    let opts = Opts {
-        parallel: 2,
+    (tmp, fp, ws)
+}
+
+fn lab_opts(tmp: &common::Tmp, parallel: usize) -> Opts {
+    Opts {
+        parallel,
         canirun: None,
         portool: None,
         containers: 1,
         job_timeout_min: 5.0,
         keep: true,
-        trash: cache.join("trash"),
-    };
-    let r = local_ci::execute_plan(&ctx(tmp.path()), &fp, &ws, opts).unwrap();
+        trash: tmp.path().join("lab/trash"),
+    }
+}
+
+fn run(jobs: &str) -> (common::Tmp, FrozenPlan, RunResult) {
+    let (tmp, fp, ws) = lab_ws(jobs);
+    let r = local_ci::execute_plan(&ctx(tmp.path()), &fp, &ws, lab_opts(&tmp, 2)).unwrap();
     (tmp, fp, r)
 }
 
@@ -145,7 +165,7 @@ fn notes(r: &RunResult, id: &str) -> String {
 fn receipt(r: &RunResult, name: &str, v: u32) -> Receipt {
     let p = r
         .run_dir
-        .join(format!("artifacts/{name}/v{v}/receipt.json"));
+        .join(format!("artifacts/{}/{name}/v{v}/receipt.json", wdir()));
     serde_json::from_slice(&std::fs::read(&p).unwrap_or_else(|_| panic!("no {p:?}"))).unwrap()
 }
 
@@ -196,11 +216,13 @@ fn an_upload_is_downloaded_by_a_job_that_needs_it() {
         "7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed"
     );
     assert_eq!(rc.plan_digest, fp.digest);
-    assert_eq!(rc.attempt_id, "r1");
+    assert_eq!(rc.attempt_id, "1-abcdef0");
     assert_eq!(rc.job, format!("{W1}::build"));
     assert_eq!(rc.task.as_deref(), Some(&*format!("{W1}::build")));
     // the files are fixed read-only in the run's area
-    let stored = r.run_dir.join("artifacts/bundle/v1/files/a.txt");
+    let stored = r
+        .run_dir
+        .join(format!("artifacts/{}/bundle/v1/files/a.txt", wdir()));
     assert!(std::fs::metadata(stored).unwrap().permissions().readonly());
     // the plan knows what the task must publish and what the other one needs
     let t_build = fp.tasks.iter().find(|t| t.jobs == ["build"]).unwrap();
@@ -265,7 +287,10 @@ fn a_missing_file_follows_if_no_files_found() {
             "{}",
             notes(&r, "a")
         );
-        assert!(!r.run_dir.join("artifacts/nothing").exists());
+        assert!(!r
+            .run_dir
+            .join(format!("artifacts/{}/nothing", wdir()))
+            .exists());
     }
     let (_t, _f, r) = run(&jobs("          if-no-files-found: ignore\n"));
     assert_eq!(r.state, "success");
@@ -299,7 +324,10 @@ fn a_second_upload_of_a_name_is_a_conflict_unless_it_overwrites() {
         "{e}"
     );
     assert_eq!(receipt(&r, "r", 1).files[0].size, 5);
-    assert!(!r.run_dir.join("artifacts/r/v2").exists());
+    assert!(!r
+        .run_dir
+        .join(format!("artifacts/{}/r/v2", wdir()))
+        .exists());
 
     // overwrite makes a new version and a download takes the newest
     let jobs = format!(
@@ -658,7 +686,11 @@ fn an_always_true_condition_keeps_an_upload_required() {
         let (_t, fp, r) = run(&jobs);
         assert_eq!(r.state, "success", "{cond}");
         assert_eq!(fp.tasks[0].verification.artifacts, ["bundle"], "{cond}");
-        std::fs::remove_file(r.run_dir.join("artifacts/bundle/v1/receipt.json")).unwrap();
+        std::fs::remove_file(
+            r.run_dir
+                .join(format!("artifacts/{}/bundle/v1/receipt.json", wdir())),
+        )
+        .unwrap();
         let c = validate_run_result(&fp, &r);
         assert_eq!(c.verdict, Verdict::Invalid, "{cond}: {c:?}");
     }
@@ -781,10 +813,18 @@ fn a_unit_that_uploads_is_reused_with_its_artifacts() {
     assert_ne!(b.plan_digest, a.plan_digest);
     assert_eq!(b.files, a.files);
     assert_eq!(
-        std::fs::read_to_string(second.run_dir.join("artifacts/bundle/v1/files/a.txt")).unwrap(),
+        std::fs::read_to_string(
+            second
+                .run_dir
+                .join(format!("artifacts/{}/bundle/v1/files/a.txt", wdir()))
+        )
+        .unwrap(),
         "one"
     );
-    assert_eq!(artifact_io::published_names(&second.run_dir), ["bundle"]);
+    assert_eq!(
+        artifact_io::published_names(&second.run_dir, W1),
+        ["bundle"]
+    );
 
     // a file that is not what the receipt says: the unit runs again
     let f = &kept[0];
@@ -796,7 +836,12 @@ fn a_unit_that_uploads_is_reused_with_its_artifacts() {
     let c = receipt(&third, "bundle", 1);
     assert_eq!(c.restored_from, None);
     assert_eq!(
-        std::fs::read_to_string(third.run_dir.join("artifacts/bundle/v1/files/a.txt")).unwrap(),
+        std::fs::read_to_string(
+            third
+                .run_dir
+                .join(format!("artifacts/{}/bundle/v1/files/a.txt", wdir()))
+        )
+        .unwrap(),
         "one"
     );
     // and what that run kept is whole again
@@ -806,21 +851,27 @@ fn a_unit_that_uploads_is_reused_with_its_artifacts() {
 
 #[test]
 fn a_unit_that_downloads_is_reused_only_against_the_same_artifact() {
-    let (tmp, dir) = lab(BUILD_ONLY);
-    std::fs::write(
-        dir.join(".github/workflows/two.yml"),
-        "name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  check:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: test \"$(cat got/a.txt)\" = one\n",
-    )
-    .unwrap();
-    git(&dir, &["add", ".github/workflows/two.yml"]);
-    git(&dir, &["commit", "-qm", "two"]);
+    // two units of one workflow: `check` takes what `build` uploads (without
+    // `needs`, so they are not one unit; a download across workflows would
+    // not find it)
+    let jobs = format!(
+        "{BUILD_ONLY}  check:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: test \"$(cat got/a.txt)\" = one\n"
+    );
+    let (tmp, dir) = lab(&jobs);
     // the uploader first, so the download has its artifact whatever the order
-    let r1 = run_cached(&tmp, &dir, &["one.yml"]);
+    let mut only = cached_opts(&tmp, &dir, &[]);
+    only.target.jobs = vec!["build".into()];
+    let r1 = local_ci::run(&ctx(tmp.path()), only, &mut Quiet)
+        .unwrap()
+        .result;
     assert_eq!(r1.state, "success", "{r1:?}");
     // the downloader runs, against the uploader's reused artifact
     let r2 = run_cached(&tmp, &dir, &[]);
     assert_eq!(r2.state, "success", "{r2:?}");
-    assert!(is_cached(&r2, "build") && !is_cached(&r2, "check"));
+    assert!(
+        is_cached(&r2, "build") && !is_cached(&r2, "check"),
+        "{r2:?}"
+    );
     // both are reused now
     let r3 = run_cached(&tmp, &dir, &[]);
     assert!(is_cached(&r3, "build") && is_cached(&r3, "check"), "{r3:?}");
@@ -871,7 +922,11 @@ fn a_run_with_a_required_artifact_missing_is_not_a_success() {
     assert_eq!(r.state, "success");
     assert_eq!(validate_run_result(&fp, &r).verdict, Verdict::Complete);
     // the receipt is gone: the result is not the plan's
-    std::fs::remove_file(r.run_dir.join("artifacts/bundle/v1/receipt.json")).unwrap();
+    std::fs::remove_file(
+        r.run_dir
+            .join(format!("artifacts/{}/bundle/v1/receipt.json", wdir())),
+    )
+    .unwrap();
     let c = validate_run_result(&fp, &r);
     assert_eq!(c.verdict, Verdict::Invalid);
     assert!(
@@ -888,12 +943,12 @@ fn a_run_with_a_required_artifact_missing_is_not_a_success() {
     assert_eq!(again.state, "error");
     // a task result names what the task published
     let (_t, _f, ok) = run(jobs);
-    assert_eq!(artifact_io::published_names(&ok.run_dir), ["bundle"]);
+    assert_eq!(artifact_io::published_names(&ok.run_dir, W1), ["bundle"]);
     assert_eq!(
-        artifact_io::published_by(&ok.run_dir, &[format!("{W1}::build")]),
+        artifact_io::published_by(&ok.run_dir, W1, &[format!("{W1}::build")]),
         ["bundle"]
     );
-    assert!(artifact_io::published_by(&ok.run_dir, &[format!("{W1}::other")]).is_empty());
+    assert!(artifact_io::published_by(&ok.run_dir, W1, &[format!("{W1}::other")]).is_empty());
 }
 
 fn w(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -910,7 +965,7 @@ fn a_download_checks_every_file_against_the_receipt_before_placing_any() {
     std::fs::create_dir_all(ws.join("out")).unwrap();
     std::fs::write(ws.join("out/a"), "alpha").unwrap();
     std::fs::write(ws.join("out/b"), "beta").unwrap();
-    let area = Area::of_run(&tmp.path().join("run"), "sha256:plan");
+    let area = Area::of_run(&tmp.path().join("run"), "sha256:plan", IO_WF);
     let who = Who {
         job: "w::j".into(),
         display: "j".into(),
@@ -935,7 +990,9 @@ fn a_download_checks_every_file_against_the_receipt_before_placing_any() {
     artifact_io::download(&area, &dest, &w(&[("name", "n"), ("path", "d")])).unwrap();
 
     // a file that was changed afterwards is found; nothing is placed
-    let stored = tmp.path().join("run/artifacts/n/v1/files/b");
+    let stored = tmp
+        .path()
+        .join(format!("run/artifacts/{}/n/v1/files/b", io_wdir()));
     let mut perm = std::fs::metadata(&stored).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
     std::fs::set_permissions(&stored, perm).unwrap();
@@ -948,7 +1005,9 @@ fn a_download_checks_every_file_against_the_receipt_before_placing_any() {
 
     // a receipt that names a path outside is refused too
     std::fs::write(&stored, "beta").unwrap();
-    let rp = tmp.path().join("run/artifacts/n/v1/receipt.json");
+    let rp = tmp
+        .path()
+        .join(format!("run/artifacts/{}/n/v1/receipt.json", io_wdir()));
     let mut perm = std::fs::metadata(&rp).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
     std::fs::set_permissions(&rp, perm).unwrap();
@@ -976,9 +1035,13 @@ fn a_download_checks_every_file_against_the_receipt_before_placing_any() {
     let e = artifact_io::download(&area, &fresh, &w(&[("merge-multiple", "true")])).unwrap_err();
     assert!(e.contains("both write `a`"), "{e}");
     // a version without a receipt is not published
-    std::fs::create_dir_all(tmp.path().join("run/artifacts/half/v1")).unwrap();
+    std::fs::create_dir_all(
+        tmp.path()
+            .join(format!("run/artifacts/{}/half/v1", io_wdir())),
+    )
+    .unwrap();
     assert_eq!(
-        artifact_io::published_names(&tmp.path().join("run")),
+        artifact_io::published_names(&tmp.path().join("run"), IO_WF),
         ["m", "n"]
     );
     // an artifact that is not there
@@ -1016,7 +1079,7 @@ fn lab_io() -> Lab {
     let out = tmp.path().join("outside");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::create_dir_all(&out).unwrap();
-    let area = Area::of_run(&tmp.path().join("run"), "sha256:plan");
+    let area = Area::of_run(&tmp.path().join("run"), "sha256:plan", IO_WF);
     Lab { tmp, ws, out, area }
 }
 
@@ -1038,9 +1101,10 @@ impl Lab {
         d
     }
     fn receipt_path(&self, name: &str) -> PathBuf {
-        self.tmp
-            .path()
-            .join(format!("run/artifacts/{name}/v1/receipt.json"))
+        self.tmp.path().join(format!(
+            "run/artifacts/{}/{name}/v1/receipt.json",
+            io_wdir()
+        ))
     }
     fn edit_receipt(&self, name: &str, from: &str, to: &str) {
         let rp = self.receipt_path(name);
@@ -1111,7 +1175,7 @@ fn a_receipt_must_be_of_the_artifact_version_and_run_that_was_asked_for() {
     let d = l.fresh("d");
     l.down(&d, &[("name", "n")]).unwrap();
     // another run (a plan digest that is not this one's)
-    let other = Area::of_run(&l.tmp.path().join("run"), "sha256:other");
+    let other = Area::of_run(&l.tmp.path().join("run"), "sha256:other", IO_WF);
     let e = artifact_io::download(&other, &d, &w(&[("name", "n")])).unwrap_err();
     assert!(e.contains("another run"), "{e}");
     // a receipt of another name, and of another version
@@ -1152,7 +1216,10 @@ fn a_rejection_partway_leaves_nothing_placed() {
     assert!(e.contains("not replaced"), "{e}");
     assert!(!d2.join("a").exists());
     // a file that does not match its receipt, after one that does
-    let stored = l.tmp.path().join("run/artifacts/n/v1/files/sub/b");
+    let stored = l
+        .tmp
+        .path()
+        .join(format!("run/artifacts/{}/n/v1/files/sub/b", io_wdir()));
     let mut perm = std::fs::metadata(&stored).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
     std::fs::set_permissions(&stored, perm).unwrap();
@@ -1170,8 +1237,11 @@ fn names_and_files_that_differ_only_in_case_are_a_conflict() {
     let e = l.up("report", "f").unwrap_err();
     assert!(e.contains("only in case"), "{e}");
     assert!(
-        !l.tmp.path().join("run/artifacts/report/v1").exists()
-            || std::fs::read_dir(l.tmp.path().join("run/artifacts"))
+        !l.tmp
+            .path()
+            .join(format!("run/artifacts/{}/report/v1", io_wdir()))
+            .exists()
+            || std::fs::read_dir(l.tmp.path().join(format!("run/artifacts/{}", io_wdir())))
                 .unwrap()
                 .count()
                 == 1
@@ -1232,29 +1302,37 @@ fn a_temp_file_swapped_for_a_symlink_is_not_written_through() {
     );
 }
 
-const TWO_PACKAGE: &str = "name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  package:\n    runs-on: x\n    steps:\n      - run: sleep 2\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: mkdir -p dist && cp got/a.txt dist/d.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: dist\n          path: dist\n";
+/// `build` uploads `bundle`; `package` `needs` it, takes it and uploads `dist`.
+/// The two are one unit: jobs that need each other are run and kept together.
+fn pipeline(overwrite: bool) -> String {
+    let ow = if overwrite {
+        "          overwrite: true\n"
+    } else {
+        ""
+    };
+    format!(
+        "{BUILD_ONLY}{ow}  package:\n    runs-on: x\n    needs: build\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: bundle\n          path: got\n      - run: mkdir -p dist && cp got/a.txt dist/d.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: dist\n          path: dist\n{ow}"
+    )
+}
 
 #[test]
-fn a_restore_that_fails_leaves_no_artifact_of_the_units_that_run_again() {
+fn a_restore_that_fails_leaves_no_artifact_of_the_unit_that_runs_again() {
+    // A unit that downloads what it uploads itself is the one shape of chain
+    // inside a workflow (jobs that need each other are one unit); a chain
+    // between units is settled by `cache::settle` (its unit tests).
     for overwrite in [false, true] {
-        let (tmp, dir) = lab(BUILD_ONLY);
-        let two = if overwrite {
-            format!("{TWO_PACKAGE}          overwrite: true\n")
-        } else {
-            TWO_PACKAGE.to_string()
-        };
-        std::fs::write(dir.join(".github/workflows/two.yml"), two).unwrap();
-        git(&dir, &["add", ".github/workflows/two.yml"]);
-        git(&dir, &["commit", "-qm", "two"]);
-        // the uploader first; `package` waits a little, so that when both run
-        // together `bundle` is there when it downloads
-        let first = run_cached(&tmp, &dir, &["one.yml"]);
+        let (tmp, dir) = lab(&pipeline(overwrite));
+        let first = run_cached(&tmp, &dir, &[]);
         assert_eq!(first.state, "success", "{overwrite}: {first:?}");
+        assert!(!is_cached(&first, "build") && !is_cached(&first, "package"));
         let second = run_cached(&tmp, &dir, &[]);
         assert_eq!(second.state, "success", "{overwrite}: {second:?}");
-        let third = run_cached(&tmp, &dir, &[]);
-        assert!(is_cached(&third, "build") && is_cached(&third, "package"));
-        // the artifact `package` takes is not what its receipt says
+        assert!(is_cached(&second, "build") && is_cached(&second, "package"));
+        assert_eq!(
+            artifact_io::published_names(&second.run_dir, W1),
+            ["bundle", "dist"]
+        );
+        // the artifact the unit kept is not what its receipt says
         let kept = kept_files(&tmp.path().join("cache3"));
         assert_eq!(kept.len(), 1, "{kept:?}");
         std::fs::set_permissions(
@@ -1263,20 +1341,168 @@ fn a_restore_that_fails_leaves_no_artifact_of_the_units_that_run_again() {
         )
         .unwrap();
         std::fs::write(&kept[0], "tampered").unwrap();
-        // both run again, and `dist` of the restored result is not left over
+        // the unit runs again, and nothing of the restore is left over
+        let third = run_cached(&tmp, &dir, &[]);
+        assert_eq!(third.state, "success", "{overwrite}: {third:?}");
+        assert!(!is_cached(&third, "build") && !is_cached(&third, "package"));
+        assert!(!why_all(&third).contains("already uploaded"));
+        for name in ["bundle", "dist"] {
+            assert!(third
+                .run_dir
+                .join(format!("artifacts/{}/{name}/v1", wdir()))
+                .exists());
+            assert!(
+                !third
+                    .run_dir
+                    .join(format!("artifacts/{}/{name}/v2", wdir()))
+                    .exists(),
+                "{overwrite}: a stale v1 of `{name}` was left in the run's area"
+            );
+            assert_eq!(receipt(&third, name, 1).restored_from, None);
+        }
         let fourth = run_cached(&tmp, &dir, &[]);
-        assert_eq!(fourth.state, "success", "{overwrite}: {fourth:?}");
-        assert!(!is_cached(&fourth, "build") && !is_cached(&fourth, "package"));
-        assert!(!why_all(&fourth).contains("already uploaded"));
-        assert!(fourth.run_dir.join("artifacts/dist/v1").exists());
-        assert!(
-            !fourth.run_dir.join("artifacts/dist/v2").exists(),
-            "{overwrite}: a stale v1 of `dist` was left in the run's area"
-        );
-        assert_eq!(receipt(&fourth, "dist", 1).restored_from, None);
-        let fifth = run_cached(&tmp, &dir, &[]);
-        assert!(is_cached(&fifth, "build") && is_cached(&fifth, "package"));
+        assert!(is_cached(&fourth, "build") && is_cached(&fourth, "package"));
     }
+}
+
+/// A workflow `two.yml` with these jobs, committed on the lab's branch.
+fn add_two(dir: &Path, jobs: &str) {
+    std::fs::write(
+        dir.join(".github/workflows/two.yml"),
+        format!("name: two\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n{jobs}"),
+    )
+    .unwrap();
+    git(dir, &["add", ".github/workflows/two.yml"]);
+    git(dir, &["commit", "-qm", "two"]);
+}
+
+const W2: &str = ".github/workflows/two.yml";
+
+#[test]
+fn two_workflows_may_upload_the_same_name() {
+    let (tmp, dir) = lab(BUILD_ONLY);
+    add_two(
+        &dir,
+        "  other:\n    runs-on: x\n    steps:\n      - run: mkdir -p out && printf two > out/a.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: bundle\n          path: out\n",
+    );
+    for round in 0..2 {
+        let r = run_cached(&tmp, &dir, &[]);
+        assert_eq!(r.state, "success", "{round}: {r:?}");
+        assert_eq!(is_cached(&r, "build"), round == 1, "{round}");
+        assert_eq!(is_cached(&r, "other"), round == 1, "{round}");
+        // each workflow has its own `bundle`, v1 and not a conflict
+        for (wf, text) in [(W1, "one"), (W2, "two")] {
+            assert_eq!(artifact_io::published_names(&r.run_dir, wf), ["bundle"]);
+            let stored = r.run_dir.join(format!(
+                "artifacts/{}/bundle/v1/files/a.txt",
+                artifact_io::workflow_dir(wf)
+            ));
+            assert_eq!(std::fs::read_to_string(stored).unwrap(), text, "{round}");
+        }
+    }
+}
+
+#[test]
+fn a_download_does_not_reach_what_another_workflow_uploaded() {
+    let (tmp, dir) = lab(BUILD_ONLY);
+    let take = |with: &str| {
+        format!(
+            "  package:\n    runs-on: x\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n{with}          path: got\n"
+        )
+    };
+    for (with, wanted) in [
+        ("          name: bundle\n", "no artifact named `bundle`"),
+        ("          pattern: bun*\n", "no artifact matches `bun*`"),
+        ("", "no artifact was uploaded"),
+    ] {
+        add_two(&dir, &take(with));
+        let r = run_cached(&tmp, &dir, &[]);
+        // `build` of `one.yml` did upload it, and passed
+        assert_eq!(artifact_io::published_names(&r.run_dir, W1), ["bundle"]);
+        assert!(artifact_io::published_names(&r.run_dir, W2).is_empty());
+        assert_eq!(r.state, "error", "{with}: {r:?}");
+        let e = why(&r, "package");
+        assert!(e.contains(wanted), "{with}: {e}");
+    }
+}
+
+/// Two jobs of one workflow, each of which must publish an artifact.
+const REQUIRED: &str = "  a:\n    runs-on: x\n    steps:\n      - run: mkdir -p out && printf a > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: ra\n          path: out\n          if-no-files-found: error\n  b:\n    runs-on: x\n    steps:\n      - run: mkdir -p out2 && printf b > out2/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: rb\n          path: out2\n          if-no-files-found: error\n";
+
+#[test]
+fn the_cli_and_the_library_agree_on_the_artifacts_a_task_must_publish() {
+    // the run (`validate_run_result`)...
+    let (tmp, dir) = lab(REQUIRED);
+    let fp = plan(&tmp, &dir).unwrap();
+    let r = run_cached(&tmp, &dir, &[]);
+    assert_eq!(r.state, "success", "{r:?}");
+    assert_eq!(validate_run_result(&fp, &r).verdict, Verdict::Complete);
+    // ...and each task run through the library (`verify_task_result`), of the
+    // same workflow, are of one mind
+    let (tmp2, fp2, ws) = lab_ws(REQUIRED);
+    assert_eq!(fp2.tasks.len(), 2);
+    for task in &fp2.tasks {
+        let t = local_ci::execute_task(
+            &ctx(tmp2.path()),
+            &fp2,
+            &task.id,
+            &local_ci::TaskInputs::default(),
+            None,
+            &ws,
+            lab_opts(&tmp2, 1),
+        )
+        .unwrap();
+        assert!(
+            local_ci::verify_task_result(task, &t).is_empty(),
+            "{task:?}"
+        );
+    }
+    // one task publishing what another was to is not publishing it: `ra` is
+    // taken for a job of `b`, and the run is invalid, as the task's result
+    // (what `a` itself published, which is nothing) is
+    let rp = r.run_dir.join(format!(
+        "artifacts/{}/ra/v1/receipt.json",
+        artifact_io::workflow_dir(W1)
+    ));
+    let mut perm = std::fs::metadata(&rp).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+    std::fs::set_permissions(&rp, perm).unwrap();
+    let text = std::fs::read_to_string(&rp).unwrap();
+    assert!(text.contains(&format!("{W1}::a")), "{text}");
+    std::fs::write(&rp, text.replace(&format!("{W1}::a"), &format!("{W1}::b"))).unwrap();
+    let c = validate_run_result(&fp, &r);
+    assert_eq!(c.verdict, Verdict::Invalid, "{c:?}");
+    assert!(
+        c.invalid.iter().any(|w| w.contains("artifact `ra`")),
+        "{c:?}"
+    );
+    let a = fp.tasks.iter().find(|t| t.jobs == ["a"]).unwrap();
+    let mine = artifact_io::published_by(&r.run_dir, W1, &[format!("{W1}::a")]);
+    assert!(mine.is_empty());
+    let mut lib = local_ci::task::TaskResult {
+        task: a.id.clone(),
+        jobs: vec![],
+        outcomes: r.units.iter().flat_map(|u| u.outcomes.clone()).collect(),
+        receipt_ignored: None,
+        artifacts: mine,
+    };
+    lib.outcomes.retain(|o| o.job == "a");
+    let why = local_ci::verify_task_result(a, &lib);
+    assert!(why.iter().any(|w| w.contains("artifact `ra`")), "{why:?}");
+}
+
+#[test]
+fn a_run_directory_that_has_artifacts_is_refused_and_each_claim_is_new() {
+    let (tmp, fp, ws) = lab_ws(BUILD_ONLY);
+    let runs = ws.run_dir.parent().unwrap();
+    let other = local_ci::claim_run_dir(runs, 1, "abcdef0").unwrap();
+    assert_ne!(other, ws.run_dir);
+    let r = local_ci::execute_plan(&ctx(tmp.path()), &fp, &ws, lab_opts(&tmp, 2)).unwrap();
+    assert_eq!(r.state, "success", "{r:?}");
+    // the same directory again would share, and break, its artifact area
+    let e = local_ci::execute_plan(&ctx(tmp.path()), &fp, &ws, lab_opts(&tmp, 2)).unwrap_err();
+    assert!(format!("{e:#}").contains("already has artifacts"), "{e:#}");
+    assert_eq!(artifact_io::published_names(&r.run_dir, W1), ["bundle"]);
 }
 
 fn why_all(r: &RunResult) -> String {
@@ -1316,7 +1542,7 @@ fn a_matrix_job_that_uploads_is_reused_with_its_artifacts() {
     assert!(is_cached(&second, "m"), "{second:?}");
     // both variants' uploads are in this run's area again
     assert_eq!(
-        artifact_io::published_names(&second.run_dir),
+        artifact_io::published_names(&second.run_dir, W1),
         ["bundle-a", "bundle-b"]
     );
     // a matrix entry names the job by its id
@@ -1327,31 +1553,11 @@ fn a_matrix_job_that_uploads_is_reused_with_its_artifacts() {
 fn a_task_run_through_the_library_is_refused_like_a_run() {
     // an upload of a matrix whose name does not tell the variants apart
     let jobs = "  m:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: mkdir -p out && echo hi > out/f\n      - uses: actions/upload-artifact@v4\n        with:\n          name: report\n          path: out\n          overwrite: true\n";
-    let (tmp, dir) = lab(jobs);
-    let fp = plan(&tmp, &dir).unwrap();
-    let cache = tmp.path().join("lab");
-    std::fs::create_dir_all(cache.join("locks")).unwrap();
-    let wt = cache.join("wt/w");
-    local_ci::git::add_worktree(&ctx(tmp.path()), &dir, &wt, &fp.source.execution_commit).unwrap();
-    let ws = Workspace {
-        root: wt.clone(),
-        repo_root: dir.clone(),
-        run_dir: cache.join("runs/r1"),
-        tools: cache.join("wt/w.tools"),
-        lock_file: cache.join("locks/lab.lock"),
-    };
-    std::fs::create_dir_all(&ws.run_dir).unwrap();
+    let (tmp, fp, ws) = lab_ws(jobs);
+    let wt = ws.root.clone();
     assert!(!fp.tasks.is_empty());
     for task in &fp.tasks {
-        let opts = Opts {
-            parallel: 1,
-            canirun: None,
-            portool: None,
-            containers: 1,
-            job_timeout_min: 5.0,
-            keep: true,
-            trash: cache.join("trash"),
-        };
+        let opts = lab_opts(&tmp, 1);
         let r = local_ci::execute_task(
             &ctx(tmp.path()),
             &fp,
@@ -1393,4 +1599,23 @@ fn a_refused_matrix_job_has_an_error_for_each_variant_in_a_complete_check() {
     assert!(entries
         .iter()
         .all(|j| matches!(j.outcome, Outcome::Error(_))));
+}
+
+#[test]
+fn a_workflow_directory_name_stays_inside_the_area_and_tells_files_apart() {
+    let names: Vec<String> = ["a/b.yml", "a_b.yml", "../x", "..", ".", "", "a b\\c:d"]
+        .iter()
+        .map(|w| artifact_io::workflow_dir(w))
+        .collect();
+    for n in &names {
+        assert!(
+            !n.contains('/') && !n.contains('\\') && n != "." && n != "..",
+            "{n}"
+        );
+        assert!(!n.starts_with('.') || n.len() > 2, "{n}");
+    }
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "{names:?}");
 }

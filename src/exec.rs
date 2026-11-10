@@ -15,7 +15,7 @@ use crate::task::{self, combine, outcome_of, JobOutcome, JobStatus, TaskInputs, 
 use crate::workflow::{Job, Service, Step, Workflow};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -77,7 +77,7 @@ fn alive(pid: i32) -> bool {
     sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "result", content = "reason", rename_all = "lowercase")]
 pub enum Outcome {
     Pass,
@@ -87,7 +87,7 @@ pub enum Outcome {
     Error(String),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResult {
     pub label: String,
     #[serde(flatten)]
@@ -101,7 +101,7 @@ pub struct StepResult {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
     pub workflow: String,
     pub job: String,
@@ -112,7 +112,7 @@ pub struct JobResult {
     pub steps: Vec<StepResult>,
     /// The run was cancelled while the job ran (its `outcome` is an error) or
     /// before it started (a skip). `needs.<id>.result` is `cancelled` then.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
     /// Where the time went. Absent for jobs that did not run and for reused results.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,7 +126,7 @@ pub struct JobResult {
 /// of a whole unit (`wait_lock_secs` for the repository lock, `wait_parallel_secs`
 /// for a `--parallel` place) are charged to its first job, so that the sum over
 /// jobs is not counted twice.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct JobTime {
     /// The job's own running, setup of its services and environment included:
     /// `secs` without `wait_queue_secs`.
@@ -214,7 +214,10 @@ pub struct Workspace {
     /// The repository that checkout belongs to; copies for parallel units are
     /// made from it.
     pub repo_root: PathBuf,
-    /// Where logs go.
+    /// Where logs and the run's artifacts go. It must be new and unique to
+    /// this run: [`crate::execute_plan`] refuses one that already has
+    /// artifacts, and two runs in one directory would share (and destroy) one
+    /// artifact area. [`crate::claim_run_dir`] makes one.
     pub run_dir: PathBuf,
     /// The attempt's own tool directory (shims, scripts, installed tools).
     pub tools: PathBuf,
@@ -2015,6 +2018,7 @@ impl<'a> Runner<'a> {
             receipt_ignored,
             artifacts: artifact_io::published_by(
                 &self.run_dir,
+                &task.workflow,
                 &task
                     .jobs
                     .iter()
@@ -2998,7 +3002,7 @@ impl<'a> Runner<'a> {
                 Err(e) => return (Outcome::Error(format!("with.{k}: {e:#}")), None),
             }
         }
-        let area = artifact_io::Area::of_run(&self.run_dir, &self.fp.digest);
+        let area = artifact_io::Area::of_run(&self.run_dir, &self.fp.digest, &w.file);
         let node = dag::node_id(&w.file, &job.id);
         let mut holding = self
             .fp
@@ -3852,5 +3856,67 @@ mod tests {
             slug_of("Run integration tests (1/2)"),
             "run-integration-tests-1-2"
         );
+    }
+
+    #[test]
+    fn a_task_result_survives_a_round_trip_through_json() {
+        let step = |o: Outcome, note: Option<&str>| StepResult {
+            label: "step".into(),
+            outcome: o,
+            exit: Some(1),
+            secs: 1.5,
+            log: Some(PathBuf::from("/l/log")),
+            note: note.map(String::from),
+        };
+        let job = |display: &str, o: Outcome, cancelled: bool, time: Option<JobTime>| JobResult {
+            workflow: "ci.yml".into(),
+            job: "j".into(),
+            display: display.into(),
+            outcome: o,
+            secs: 2.0,
+            steps: vec![
+                step(Outcome::Pass, Some("a note")),
+                step(Outcome::Fail, None),
+            ],
+            cancelled,
+            time,
+        };
+        let time = JobTime {
+            work_secs: 1.0,
+            wait_lock_secs: 2.0,
+            wait_slot_secs: 3.0,
+            wait_queue_secs: 4.0,
+            wait_parallel_secs: 5.0,
+        };
+        let r = crate::task::TaskResult {
+            task: "t1".into(),
+            jobs: vec![
+                job("a", Outcome::Pass, false, Some(time.clone())),
+                job("b", Outcome::Fail, true, None),
+                job("c", Outcome::Skip("why".into()), false, None),
+                job("d", Outcome::Error("boom".into()), false, None),
+            ],
+            outcomes: vec![crate::task::JobOutcome {
+                job: "j".into(),
+                variant: Some(1),
+                status: crate::task::JobStatus::Success,
+                outputs: [("k".to_string(), "v".to_string())].into(),
+                skipped: None,
+                ancestor_failed: true,
+            }],
+            receipt_ignored: Some("another commit".into()),
+            artifacts: vec!["bundle".into()],
+        };
+        let text = serde_json::to_string(&r).unwrap();
+        let back: crate::task::TaskResult = serde_json::from_str(&text).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), text);
+        assert_eq!(back.jobs[0].time, Some(time));
+        assert_eq!(back.jobs[1].outcome, Outcome::Fail);
+        assert!(back.jobs[1].cancelled && !back.jobs[0].cancelled);
+        assert_eq!(back.jobs[2].outcome, Outcome::Skip("why".into()));
+        assert_eq!(back.jobs[3].outcome, Outcome::Error("boom".into()));
+        assert_eq!(back.jobs[0].steps[0].note.as_deref(), Some("a note"));
+        assert_eq!(back.jobs[0].steps[1].note, None);
+        assert_eq!(back.artifacts, ["bundle"]);
     }
 }

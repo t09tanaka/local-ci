@@ -288,20 +288,23 @@ pub struct Hit {
 /// another reused result uploads (its newest version), with the digest it was
 /// kept against: an artifact that will be made again by a unit that runs, or
 /// that changed, is not. Results that depend on each other are settled
-/// together, whatever their order.
+/// together, whatever their order. An artifact is of the workflow that
+/// uploaded it: another workflow's result of the same name is not it.
 pub fn settle(hits: &[Option<Hit>]) -> Vec<bool> {
     let mut taken = vec![false; hits.len()];
-    let mut available: HashMap<&str, &str> = HashMap::new();
+    // artifacts belong to a workflow: (workflow, name) -> digest
+    let mut available: HashMap<(&str, &str), &str> = HashMap::new();
     loop {
         let mut progress = false;
         for (i, h) in hits.iter().enumerate() {
             let Some(h) = h.as_ref().filter(|_| !taken[i]) else {
                 continue;
             };
+            let wf = h.result.workflow.as_str();
             if !h
                 .downloads
                 .iter()
-                .all(|(n, d)| available.get(n.as_str()) == Some(&d.as_str()))
+                .all(|(n, d)| available.get(&(wf, n.as_str())) == Some(&d.as_str()))
             {
                 continue;
             }
@@ -310,7 +313,7 @@ pub fn settle(hits: &[Option<Hit>]) -> Vec<bool> {
             let mut ups: Vec<&(String, u32, String)> = h.uploads.iter().collect();
             ups.sort_by_key(|u| u.1);
             for (n, _, d) in ups {
-                available.insert(n, d);
+                available.insert((wf, n), d);
             }
         }
         if !progress {
@@ -418,7 +421,13 @@ impl Store {
         if hit.uploads.is_empty() {
             return Ok(());
         }
-        artifact_io::restore_artifacts(&self.artifacts_dir(fp), run_dir, plan_digest, &hit.uploads)
+        artifact_io::restore_artifacts(
+            &self.artifacts_dir(fp),
+            run_dir,
+            plan_digest,
+            &hit.result.workflow,
+            &hit.uploads,
+        )
     }
 
     /// Keep `u`'s result under `fp` when every job passed or was skipped, with
@@ -455,7 +464,8 @@ impl Store {
             .dir
             .join(format!(".{fp}.artifacts.{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp_art);
-        let Ok(uploads) = artifact_io::save_unit_artifacts(run_dir, &nodes, &tmp_art) else {
+        let Ok(uploads) = artifact_io::save_unit_artifacts(run_dir, &u.workflow, &nodes, &tmp_art)
+        else {
             let _ = std::fs::remove_dir_all(&tmp_art);
             return;
         };
@@ -465,7 +475,7 @@ impl Store {
             .iter()
             .filter(|n| !uploads.iter().any(|(u, _, _)| u == *n))
         {
-            let Some(d) = artifact_io::latest_digest(run_dir, n) else {
+            let Some(d) = artifact_io::latest_digest(run_dir, &u.workflow, n) else {
                 let _ = std::fs::remove_dir_all(&tmp_art);
                 return;
             };
@@ -727,10 +737,18 @@ jobs:
     }
 
     fn hit(downloads: &[(&str, &str)], uploads: &[(&str, u32, &str)]) -> Option<Hit> {
+        hit_in("ci.yml", downloads, uploads)
+    }
+
+    fn hit_in(
+        workflow: &str,
+        downloads: &[(&str, &str)],
+        uploads: &[(&str, u32, &str)],
+    ) -> Option<Hit> {
         Some(Hit {
             result: UnitResult {
                 unit: None,
-                workflow: "ci.yml".into(),
+                workflow: workflow.into(),
                 jobs: vec![],
                 waited_secs: 0.0,
                 copy_secs: None,
@@ -788,6 +806,45 @@ jobs:
                 hit(&[], &[("a", 1, "1")]),
             ]),
             [false, true]
+        );
+    }
+
+    #[test]
+    fn an_artifact_is_only_of_the_workflow_that_uploaded_it() {
+        // the same name and digest, uploaded by another workflow: not it
+        assert_eq!(
+            settle(&[
+                hit_in("e2e.yml", &[("b", "d")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "d")]),
+            ]),
+            [false, true]
+        );
+        // the same workflow: it is
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("b", "d")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "d")]),
+            ]),
+            [true, true]
+        );
+        // two workflows that upload one name each have their own
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("b", "x")], &[]),
+                hit_in("e2e.yml", &[("b", "y")], &[]),
+                hit_in("ci.yml", &[], &[("b", 1, "x")]),
+                hit_in("e2e.yml", &[], &[("b", 1, "y")]),
+            ]),
+            [true, true, true, true]
+        );
+        // a chain inside one workflow settles whatever its order
+        assert_eq!(
+            settle(&[
+                hit_in("ci.yml", &[("c", "x")], &[]),
+                hit_in("ci.yml", &[("b", "y")], &[("c", 1, "x")]),
+                hit_in("ci.yml", &[], &[("b", 1, "y")]),
+            ]),
+            [true, true, true]
         );
     }
 }

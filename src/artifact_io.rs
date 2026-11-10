@@ -1,13 +1,17 @@
 //! The artifacts of a run on disk: what `actions/upload-artifact@v4` and
 //! `actions/download-artifact@v4` do within one run.
 //!
-//! An upload copies its files into the run's artifact area
-//! (`<run dir>/artifacts/<name>/v<N>/files/`), read-only, and writes the
+//! An upload copies its files into the artifact area of its workflow in the
+//! run (`<run dir>/artifacts/<workflow>/<name>/v<N>/files/`), read-only, and writes the
 //! receipt (`receipt.json`: name, version, each file's path, size and SHA-256,
 //! the plan digest, the attempt, the job and task) last and atomically; the
 //! step completes after that. A download waits for nothing but the receipt:
 //! it takes the newest version that has one, checks every file against it and
 //! only then places the files, refusing any write outside the workspace.
+//! Artifacts belong to a workflow run, as on GitHub: each workflow file has an
+//! area of its own ([`workflow_dir`]) and what one workflow uploads is not
+//! there for another to download, nor does the same name in two of them
+//! conflict.
 //! What to decide is [`crate::artifact`]'s; this module does the file work.
 
 use crate::artifact::{self, Kind, NoFiles};
@@ -24,7 +28,34 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The run's artifact area and what a receipt records about the run.
+/// The directory name of a workflow file in the artifact area: its path with
+/// every character other than a letter, digit, `.`, `-` or `_` made `_`, and
+/// the start of its SHA-256 after it (two files never share a name, and
+/// nothing in it can leave the area).
+pub fn workflow_dir(workflow: &str) -> String {
+    let safe: String = workflow
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(
+        "{safe}-{}",
+        &hex(&Sha256::digest(workflow.as_bytes()))[..12]
+    )
+}
+
+/// Where the artifacts of workflow `workflow` are in a run directory.
+fn workflow_root(run_dir: &Path, workflow: &str) -> PathBuf {
+    run_dir.join("artifacts").join(workflow_dir(workflow))
+}
+
+/// A workflow's artifact area in the run and what a receipt records about the
+/// run.
 pub struct Area {
     pub root: PathBuf,
     pub plan_digest: String,
@@ -32,10 +63,10 @@ pub struct Area {
 }
 
 impl Area {
-    /// The area of a run directory.
-    pub fn of_run(run_dir: &Path, plan_digest: &str) -> Area {
+    /// The area of workflow file `workflow` in a run directory.
+    pub fn of_run(run_dir: &Path, plan_digest: &str, workflow: &str) -> Area {
         Area {
-            root: run_dir.join("artifacts"),
+            root: workflow_root(run_dir, workflow),
             plan_digest: plan_digest.to_string(),
             attempt: run_dir
                 .file_name()
@@ -242,10 +273,13 @@ fn latest_receipt(area: &Area, name: &str) -> Option<(u32, PathBuf, Receipt)> {
         .find_map(|(n, d)| read_receipt(&d).map(|r| (n, d, r)))
 }
 
-/// The names of the artifacts that have a receipt.
-pub fn published_names(run_dir: &Path) -> Vec<String> {
-    let root = run_dir.join("artifacts");
-    let mut out: Vec<String> = fs::read_dir(&root)
+/// The names of the artifacts of workflow `workflow` that have a receipt.
+pub fn published_names(run_dir: &Path, workflow: &str) -> Vec<String> {
+    published_names_in(&workflow_root(run_dir, workflow))
+}
+
+fn published_names_in(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
@@ -260,10 +294,11 @@ pub fn published_names(run_dir: &Path) -> Vec<String> {
     out
 }
 
-/// The names of the artifacts uploaded by one of `jobs` (`<file>::<id>`).
-pub fn published_by(run_dir: &Path, jobs: &[String]) -> Vec<String> {
-    let area = Area::of_run(run_dir, "");
-    published_names(run_dir)
+/// The names of the artifacts uploaded by one of `jobs` (`<file>::<id>`) of
+/// workflow `workflow`.
+pub fn published_by(run_dir: &Path, workflow: &str, jobs: &[String]) -> Vec<String> {
+    let area = Area::of_run(run_dir, "", workflow);
+    published_names(run_dir, workflow)
         .into_iter()
         .filter(|n| {
             version_dirs(&area.root.join(n))
@@ -287,10 +322,10 @@ fn receipt_digest(r: &Receipt) -> String {
     )
 }
 
-/// The digest of the files of the newest version of `name` in a run, or
-/// `None` when there is none.
-pub fn latest_digest(run_dir: &Path, name: &str) -> Option<String> {
-    latest_receipt(&Area::of_run(run_dir, ""), name).map(|(_, _, r)| receipt_digest(&r))
+/// The digest of the files of the newest version of `name` of workflow
+/// `workflow` in a run, or `None` when there is none.
+pub fn latest_digest(run_dir: &Path, workflow: &str, name: &str) -> Option<String> {
+    latest_receipt(&Area::of_run(run_dir, "", workflow), name).map(|(_, _, r)| receipt_digest(&r))
 }
 
 /// Copy one version (`receipt.json` and `files/`) from `from` to `to`,
@@ -324,13 +359,19 @@ fn copy_version(from: &Path, to: &Path, receipt: &Receipt, write: &Receipt) -> R
 }
 
 /// Keep, in `dest`, every version of an artifact that one of `jobs`
-/// (`<file>::<id>`) uploaded in the run (`<name>/v<N>/` as in the run), each
+/// (`<file>::<id>`) of workflow `workflow` uploaded in the run (`<name>/v<N>/`
+/// as in the workflow's area), each
 /// file checked against its receipt. What is kept, by name, version and
 /// digest. Fails, leaving `dest` to be removed, when a file does not match.
-pub fn save_unit_artifacts(run_dir: &Path, jobs: &[String], dest: &Path) -> Result<Vec<Kept>> {
-    let area = Area::of_run(run_dir, "");
+pub fn save_unit_artifacts(
+    run_dir: &Path,
+    workflow: &str,
+    jobs: &[String],
+    dest: &Path,
+) -> Result<Vec<Kept>> {
+    let area = Area::of_run(run_dir, "", workflow);
     let mut kept = Vec::new();
-    for name in published_names(run_dir) {
+    for name in published_names(run_dir, workflow) {
         for (n, vdir) in version_dirs(&area.root.join(&name)) {
             let Some(r) = read_receipt(&vdir) else {
                 continue;
@@ -352,8 +393,8 @@ pub fn save_unit_artifacts(run_dir: &Path, jobs: &[String], dest: &Path) -> Resu
     Ok(kept)
 }
 
-/// Put what [`save_unit_artifacts`] kept in `src` into the run's own area, as
-/// if the unit had uploaded it here: every file is checked against its receipt
+/// Put what [`save_unit_artifacts`] kept in `src` into the area of workflow
+/// `workflow` in the run, as if the unit had uploaded it here: every file is checked against its receipt
 /// first, the receipt is rewritten with this run's plan digest and attempt (the
 /// original attempt goes to `restored_from`), and a version is only put where
 /// none is. Nothing is left behind when it fails. `expect` is what the
@@ -362,9 +403,10 @@ pub fn restore_artifacts(
     src: &Path,
     run_dir: &Path,
     plan_digest: &str,
+    workflow: &str,
     expect: &[Kept],
 ) -> Result<()> {
-    let area = Area::of_run(run_dir, plan_digest);
+    let area = Area::of_run(run_dir, plan_digest, workflow);
     let mut found: Vec<(String, u32, PathBuf, Receipt)> = Vec::new();
     for e in fs::read_dir(src)
         .with_context(|| format!("read {}", src.display()))?
@@ -770,13 +812,10 @@ fn download_inner(area: &Area, ws: &Path, with: &[(String, String)]) -> Result<S
     if let Some(n) = name {
         artifact::runtime_name(n).map_err(|e| anyhow!(e))?;
     }
-    let available = published_names(
-        area.root
-            .parent()
-            .expect("the artifact area is inside a run directory"),
-    );
-    let picked = artifact::select_artifacts(&available, name, get("pattern"))
-        .map_err(|e| anyhow!("{e} (the job must `needs` the job that uploads it)"))?;
+    let available = published_names_in(&area.root);
+    let picked = artifact::select_artifacts(&available, name, get("pattern")).map_err(|e| {
+        anyhow!("{e} (the job must `needs` the job of its own workflow that uploads it)")
+    })?;
     let direct = name.is_some() || merge;
 
     // every rejection comes before the first file is placed

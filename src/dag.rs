@@ -278,7 +278,8 @@ pub enum GroupedReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspacePolicy {
     /// A checkout of the planned commit of its own; nothing is shared with
-    /// another task (files cross tasks only as artifacts, later).
+    /// another task (files cross jobs as artifacts, within one workflow run:
+    /// see [`crate::artifact_io`]).
     pub own_checkout: bool,
     /// The jobs of the task share that checkout.
     pub shared_by_jobs: bool,
@@ -297,12 +298,17 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
 }
 
-/// What the result of the task has to contain to be accepted (filled in by the
-/// checks of a later stage; for now what the jobs declare).
+/// What the result of the task has to contain to be accepted: what its jobs
+/// declare (checked by [`crate::verify_task_result`] and
+/// [`crate::validate_run_result`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OutputVerification {
     /// `<job>.<output>` for each output the jobs declare.
     pub job_outputs: Vec<String>,
+    /// The artifacts the task must publish: a literal name uploaded by a step
+    /// that always runs and fails without files
+    /// ([`crate::artifact::required_upload`]). Each must be among the artifacts
+    /// uploaded by the task's own jobs.
     pub artifacts: Vec<String>,
 }
 
@@ -340,7 +346,8 @@ pub struct ExecutionTask {
     pub depends_on: Vec<String>,
     /// Outputs of jobs outside the task that its expressions read.
     pub needs_outputs: Vec<NeedsOutput>,
-    /// Artifacts needed from other tasks (none are produced yet).
+    /// The artifacts the task's jobs download by name
+    /// ([`crate::artifact::needed_download`]), of the same workflow run.
     pub artifacts: Vec<String>,
     pub workspace: WorkspacePolicy,
     pub services: Vec<TaskService>,
