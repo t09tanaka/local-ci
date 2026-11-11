@@ -129,6 +129,35 @@ fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
+/// What `git cat-file --batch-check` said of the `n` names it was given, in
+/// order: `Some(name)` for one that is missing, `None` for one that is
+/// there. `None` when the answer is not `n` lines that are each `<name>
+/// missing` or `<id> <type> <size>` (`<name> ambiguous`, for one): what is
+/// not understood is not taken for an object that is there.
+fn batch_checked(text: &str, n: usize) -> Option<Vec<Option<&str>>> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != n {
+        return None;
+    }
+    lines
+        .into_iter()
+        .map(|l| match l.strip_suffix(" missing") {
+            Some(name) => Some(Some(name)),
+            None => match l.split(' ').collect::<Vec<_>>()[..] {
+                [id, kind, size]
+                    if is_object_id(id)
+                        && !kind.is_empty()
+                        && !size.is_empty()
+                        && size.bytes().all(|c| c.is_ascii_digit()) =>
+                {
+                    Some(None)
+                }
+                _ => None,
+            },
+        })
+        .collect()
+}
+
 // ---- asked once -----------------------------------------------------------
 //
 // A git process costs about as much as everything it does here, so a capture
@@ -1315,12 +1344,10 @@ fn import_objects(
         Some(input),
     ) {
         let text = String::from_utf8_lossy(&out);
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.len() == blobs.len() + 1 && !lines[0].ends_with(" missing") {
-            let missing: Vec<&str> = lines[1..]
-                .iter()
-                .filter_map(|l| l.strip_suffix(" missing"))
-                .collect();
+        // an answer that is not understood is no answer: the history and
+        // the blobs are then looked for the way they were
+        if let Some([None, blobs @ ..]) = batch_checked(&text, blobs.len() + 1).as_deref() {
+            let missing: Vec<&str> = blobs.iter().flatten().copied().collect();
             return copy_missing(ctx, root, git_dir, &missing);
         }
     }
@@ -1500,6 +1527,28 @@ impl Settings {
         (!value.is_empty()).then_some(value)
     }
 
+    /// The filter drivers whose program can look at the file it is given the
+    /// content of: a `clean` command that takes the path (`%f`), or a
+    /// `process`, which is told the path of every file. Such a program can
+    /// tell a file that is at its path from one that is not.
+    fn drivers_given_the_path(&self) -> BTreeSet<String> {
+        let mut drivers = BTreeSet::new();
+        for (key, value) in &self.records {
+            let key = String::from_utf8_lossy(key);
+            let value = String::from_utf8_lossy(value.as_deref().unwrap_or_default());
+            let Some((name, var)) = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if (var == "clean" && value.contains("%f"))
+                || (var == "process" && !value.trim().is_empty())
+            {
+                drivers.insert(name.to_string());
+            }
+        }
+        drivers
+    }
+
     /// `-c key=value` arguments that repeat the settings. They are passed on
     /// the command line, so the original's config is read and never written.
     fn args(&self) -> Vec<OsString> {
@@ -1556,27 +1605,44 @@ impl AttrTree {
     /// its path here, for `git hash-object --stdin-paths` to read. `false`
     /// when it cannot be there under a name that command can be given: a
     /// name it would read differently (it takes one path per line, and a
-    /// line that starts with a quote as a quoted one), or one that is taken
+    /// line that starts with a quote as a quoted one), one that is taken
     /// (two names that differ by case, on a filesystem that does not tell
-    /// them apart).
+    /// them apart), or one that this filesystem reads as `.gitattributes`
+    /// when it is not: there it would be the attributes of its directory.
     fn place(&self, store: &ObjectStore, path: &RelPath, hash: &str) -> bool {
         let name = &path.0;
         if name.contains(&b'\n') || name.starts_with(b"\"") || name.ends_with(b"\r") {
             return false;
         }
-        if Self::is_attrs(path) {
-            return true; // `new` wrote this very content
-        }
         let target = self.dir.join(path.to_path());
-        if std::fs::symlink_metadata(&target).is_ok() {
+        if Self::is_attrs(path) {
+            // `new` wrote this very content, unless another attributes file
+            // took its name after it (`A/.gitattributes`, `a/.gitattributes`)
+            return matches!(
+                (std::fs::read(&target), store.read(hash)),
+                (Ok(here), Ok(content)) if here == content
+            );
+        }
+        let Some(parent) = target.parent() else {
+            return false;
+        };
+        if std::fs::symlink_metadata(&target).is_ok() || std::fs::create_dir_all(parent).is_err() {
             return false;
         }
+        // asked of the filesystem and not of the name: which names are one
+        // (`.GITATTRIBUTES`, and more than a change of case) is its to say
+        let attributes = parent.join(".gitattributes");
+        let had = std::fs::symlink_metadata(&attributes).is_ok();
         // a copy and not a link: a filter runs in this directory, and what
         // it does to a file here must not reach the store
-        target
-            .parent()
-            .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-            && std::fs::copy(store.object_path(hash), &target).is_ok()
+        if std::fs::copy(store.object_path(hash), &target).is_err() {
+            return false;
+        }
+        if !had && std::fs::symlink_metadata(&attributes).is_ok() {
+            let _ = std::fs::remove_file(&target);
+            return false;
+        }
+        true
     }
 }
 
@@ -1740,6 +1806,11 @@ fn hash_filtered(
 /// it does with a file it adds. A file that cannot be put there, and every
 /// file when that process fails or says something unexpected, is hashed the
 /// way one file is, so an error is the error of the first file that fails.
+///
+/// The files `alone` ([`given_the_path`]) are never put there: a filter that
+/// looks for the file it is cleaning has always found none, and what it
+/// answers then is the blob. They are hashed one at a time, before any other
+/// file is in the scratch directory.
 fn hash_filtered_all(
     ctx: &ExecContext,
     store: &ObjectStore,
@@ -1747,11 +1818,21 @@ fn hash_filtered_all(
     attrs: &AttrTree,
     cfg: &[OsString],
     files: &[(&RelPath, &str)],
+    alone: &BTreeSet<RelPath>,
 ) -> Result<Vec<String>> {
-    let mut shas: Vec<Option<String>> = vec![None; files.len()];
+    let mut shas: Vec<Option<Result<String>>> = files
+        .iter()
+        .map(|(path, hash)| {
+            alone
+                .contains(*path)
+                .then(|| hash_filtered(ctx, git_dir, attrs, cfg, path, store.read(hash)?))
+        })
+        .collect();
+    let rest: Vec<usize> = (0..files.len()).filter(|&i| shas[i].is_none()).collect();
     // one file is one process either way
-    if files.len() > 1 {
-        let placed: Vec<usize> = (0..files.len())
+    if rest.len() > 1 {
+        let placed: Vec<usize> = rest
+            .into_iter()
             .filter(|&i| attrs.place(store, files[i].0, files[i].1))
             .collect();
         let mut input = vec![];
@@ -1772,7 +1853,7 @@ fn hash_filtered_all(
             let ids: Vec<&str> = text.lines().collect();
             if ids.len() == placed.len() && ids.iter().all(|id| is_object_id(id)) {
                 for (&i, id) in placed.iter().zip(ids) {
-                    shas[i] = Some(id.to_string());
+                    shas[i] = Some(Ok(id.to_string()));
                 }
             }
         }
@@ -1780,11 +1861,44 @@ fn hash_filtered_all(
     let mut out = vec![];
     for (sha, (path, hash)) in shas.into_iter().zip(files) {
         out.push(match sha {
-            Some(s) => s,
+            Some(s) => s?,
             None => hash_filtered(ctx, git_dir, attrs, cfg, path, store.read(hash)?)?,
         });
     }
     Ok(out)
+}
+
+/// The files of `files` whose filter is a program that is given their path
+/// ([`Settings::drivers_given_the_path`]). `filter_of` is the `filter`
+/// attribute of the paths, when it was asked for already.
+fn given_the_path(
+    ctx: &ExecContext,
+    git_dir: &Path,
+    settings: &Settings,
+    attrs: &AttrTree,
+    cfg: &[OsString],
+    filter_of: Option<BTreeMap<RelPath, String>>,
+    files: &[(&RelPath, &str)],
+) -> Result<BTreeSet<RelPath>> {
+    let drivers = settings.drivers_given_the_path();
+    if drivers.is_empty() || files.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let filter_of = match filter_of {
+        Some(f) => f,
+        None => {
+            let paths: Vec<&RelPath> = files.iter().map(|f| f.0).collect();
+            check_attr(ctx, git_dir, attrs, cfg, &["filter"], &paths)?
+                .into_iter()
+                .map(|(p, _, v)| (p, v))
+                .collect()
+        }
+    };
+    Ok(files
+        .iter()
+        .filter(|f| filter_of.get(f.0).is_some_and(|d| drivers.contains(d)))
+        .map(|f| f.0.clone())
+        .collect())
 }
 
 /// Hash bytes as they are (no path, so no filter).
@@ -1800,7 +1914,9 @@ fn hash_plain(ctx: &ExecContext, git_dir: &Path, content: Vec<u8>) -> Result<Str
 }
 
 /// Paths (of `paths`) that no attribute and no setting touches on their way
-/// into Git: their blob is their bytes.
+/// into Git: their blob is their bytes. And the `filter` attribute of those
+/// that have one, when the attributes were asked for.
+#[allow(clippy::type_complexity)]
 fn untouched_paths(
     ctx: &ExecContext,
     git_dir: &Path,
@@ -1808,10 +1924,10 @@ fn untouched_paths(
     attrs: &AttrTree,
     cfg: &[OsString],
     paths: &[&RelPath],
-) -> Result<BTreeSet<RelPath>> {
+) -> Result<(BTreeSet<RelPath>, Option<BTreeMap<RelPath, String>>)> {
     let autocrlf = settings.get("core.autocrlf").unwrap_or_default();
     if !(autocrlf.is_empty() || autocrlf == "false") || paths.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok((BTreeSet::new(), None));
     }
     let found = check_attr(
         ctx,
@@ -1828,16 +1944,22 @@ fn untouched_paths(
         ],
         paths,
     )?;
-    let touched: BTreeSet<RelPath> = found
-        .into_iter()
-        .filter(|(_, _, v)| v != "unspecified")
-        .map(|(p, _, _)| p)
-        .collect();
-    Ok(paths
+    let mut touched = BTreeSet::new();
+    let mut filter_of = BTreeMap::new();
+    for (path, name, value) in found {
+        if value != "unspecified" {
+            if name == "filter" {
+                filter_of.insert(path.clone(), value);
+            }
+            touched.insert(path);
+        }
+    }
+    let untouched = paths
         .iter()
         .filter(|p| !touched.contains(**p))
         .map(|p| (*p).clone())
-        .collect())
+        .collect();
+    Ok((untouched, Some(filter_of)))
 }
 
 /// Make sure the blobs `shas` of the original are in the private repository
@@ -1979,7 +2101,7 @@ fn blob_ids(
             _ => need_attrs.push(i),
         }
     }
-    let untouched = untouched_paths(
+    let (untouched, filter_of) = untouched_paths(
         ctx,
         git_dir,
         settings,
@@ -2030,7 +2152,8 @@ fn blob_ids(
         .iter()
         .map(|&i| (&entries[i].path, entries[i].hash.as_str()))
         .collect();
-    let ids = hash_filtered_all(ctx, store, git_dir, attrs, cfg, &files)?;
+    let alone = given_the_path(ctx, git_dir, settings, attrs, cfg, filter_of, &files)?;
+    let ids = hash_filtered_all(ctx, store, git_dir, attrs, cfg, &files, &alone)?;
     for (&i, id) in filtered.iter().zip(ids) {
         shas[i] = Some(id);
     }
@@ -2955,5 +3078,139 @@ mod read_secret_tests {
             ),
             "{e:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod attr_tree_tests {
+    use super::*;
+
+    /// A store below a temporary directory, and whether the file system it
+    /// is on tells two names that differ by case apart.
+    fn store() -> (tempfile::TempDir, ObjectStore, bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path().join("store")).unwrap();
+        std::fs::create_dir_all(store.tmp_dir()).unwrap();
+        std::fs::write(store.tmp_dir().join("Probe"), "").unwrap();
+        let folds = store.tmp_dir().join("probe").exists();
+        (tmp, store, folds)
+    }
+
+    fn entry(store: &ObjectStore, path: &str, content: &str) -> FileEntry {
+        let (hash, size) = store.put_bytes(content.as_bytes()).unwrap();
+        FileEntry {
+            path: RelPath::new(path),
+            mode: 0o100644,
+            size,
+            hash,
+        }
+    }
+
+    #[test]
+    fn an_attributes_file_is_read_from_the_tree_only_when_it_holds_its_content() {
+        let (_tmp, store, folds) = store();
+        let entries = [
+            entry(&store, "A/.gitattributes", "*.txt text\n"),
+            entry(&store, "a/.gitattributes", "*.txt -text\n"),
+            entry(&store, "b/.gitattributes", "*.md text\n"),
+        ];
+        let tree = AttrTree::new(&store, &entries).unwrap();
+        let placed: Vec<bool> = entries
+            .iter()
+            .map(|e| tree.place(&store, &e.path, &e.hash))
+            .collect();
+        for (e, placed) in entries.iter().zip(&placed) {
+            if *placed {
+                assert_eq!(
+                    std::fs::read(tree.dir.join(e.path.to_path())).unwrap(),
+                    store.read(&e.hash).unwrap(),
+                    "{}",
+                    e.path.display()
+                );
+            }
+        }
+        assert!(placed[2]);
+        if folds {
+            // one file holds one of the two contents: the other is not there
+            assert_eq!(placed[..2], [false, true]);
+        } else {
+            eprintln!("note: this file system tells A from a: the collision is not tested");
+            assert_eq!(placed[..2], [true, true]);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_name_the_file_system_reads_as_gitattributes_is_not_put_in_the_tree() {
+        let (_tmp, store, folds) = store();
+        let tree = AttrTree::new(&store, &[]).unwrap();
+        // the last one ends in a long s, which folds to `s`
+        for (dir, name) in [("d", ".GITATTRIBUTES"), ("e", ".gitattribute\u{17f}")] {
+            let e = entry(&store, &format!("{dir}/{name}"), "* filter=upper\n");
+            let taken = tree.dir.join(dir).join(".gitattributes");
+            let placed = tree.place(&store, &e.path, &e.hash);
+            if placed {
+                assert!(!taken.exists(), "{name} is an attributes file");
+            } else {
+                assert!(std::fs::read_dir(tree.dir.join(dir))
+                    .unwrap()
+                    .next()
+                    .is_none());
+            }
+            if folds && name.is_ascii() {
+                assert!(!placed, "{name}");
+            } else if !folds {
+                eprintln!("note: this file system tells {name} from .gitattributes: not tested");
+                assert!(placed, "{name}");
+            }
+        }
+        // any other name is put there, once
+        let e = entry(&store, "d/plain.txt", "text\n");
+        assert!(tree.place(&store, &e.path, &e.hash));
+        assert!(!tree.place(&store, &e.path, &e.hash));
+    }
+
+    #[test]
+    fn an_answer_of_batch_check_is_read_only_when_every_line_is_one_it_gives() {
+        let id = "b7fcd48714df21ff5b66c934c5c2359f72ad5ed6";
+        let gone = "0000000000000000000000000000000000000001";
+        let text = format!("{id} commit 212\n{gone} missing\n{id} blob 3\n");
+        assert_eq!(batch_checked(&text, 3), Some(vec![None, Some(gone), None]));
+        assert_eq!(batch_checked(&text, 2), None);
+        assert_eq!(batch_checked(&text, 4), None);
+        assert_eq!(batch_checked("", 0), Some(vec![]));
+        for odd in [
+            "refs/local-ci/heads/x ambiguous\n".to_string(),
+            format!("{id}\n"),
+            format!("{id} commit\n"),
+            format!("{id} commit 212 more\n"),
+            format!("{id} commit many\n"),
+            format!("{} commit 212\n", &id[..39]),
+            "warning: something\n".to_string(),
+            "\n".to_string(),
+        ] {
+            assert_eq!(batch_checked(&odd, 1), None, "{odd:?}");
+        }
+    }
+
+    #[test]
+    fn the_drivers_that_are_given_the_path_are_those_with_a_percent_f_or_a_process() {
+        let rec =
+            |k: &str, v: Option<&str>| (k.as_bytes().to_vec(), v.map(|v| v.as_bytes().to_vec()));
+        let settings = Settings {
+            records: vec![
+                rec("filter.upper.clean", Some("tr a-z A-Z")),
+                rec("filter.upper.smudge", Some("cat %f")),
+                rec("filter.upper.required", None),
+                rec("filter.lfs.clean", Some("git-lfs clean -- %f")),
+                rec("filter.long.process", Some("a-filter")),
+                rec("filter.none.process", Some("")),
+                rec("filter.none.clean", None),
+                rec("filter.a.b.clean", Some("x \"%f\"")),
+                rec("core.autocrlf", Some("%f")),
+            ],
+            attributes_file: None,
+        };
+        let want: BTreeSet<String> = ["a.b", "lfs", "long"].map(String::from).into();
+        assert_eq!(settings.drivers_given_the_path(), want);
     }
 }

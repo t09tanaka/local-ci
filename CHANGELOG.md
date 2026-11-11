@@ -34,6 +34,18 @@
     answers in an unexpected shape (a path with a line break in it, for
     one), they are asked the way they were, so the result and the error are
     the same ones.
+  - A file is hashed by a process of its own, its content on standard input
+    as before, whenever reading it from a scratch directory could give
+    another blob:
+    - its `filter` is a program that is given the path of the file (`%f` in
+      `filter.<name>.clean`, or a `filter.<name>.process`). Such a program
+      can look for the file, and where it runs there has never been one at
+      that path. The blob does not depend on how many files changed.
+    - its name cannot be held there as it is: a second name that differs
+      from another by case only, on a store whose filesystem does not tell
+      them apart (two `.gitattributes` among them), or a name that this
+      filesystem reads as `.gitattributes` when it is not (`.GITATTRIBUTES`),
+      which would have become the attributes of its directory.
 
 ## [0.10.0] - 2026-11-10
 
