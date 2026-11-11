@@ -12,8 +12,9 @@
   against a golden file made by 0.10.0). On the fixture of that test, a dirty
   working tree with two submodules went from 187 git processes to 105 (164 to
   88 once the history is in the store), and a clean checkout that takes its
-  secret files from another working tree from 59 to 31; the time follows the
-  count, since starting git costs more here than what it does.
+  secret files from another working tree from 59 to 31. Starting git costs
+  more here than what it does, so the time goes down with the count, though
+  by less: on a busy macOS machine the three captures took 15 to 30% less.
   - What was asked of Git once per file is asked once per capture: the blobs
     of changed files that an attribute or a setting touches (`git hash-object
     --stdin-paths` instead of one `hash-object` each), the pointers of LFS
