@@ -2,6 +2,84 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-11
+
+- `source::export_with_basis(ctx, store, m, have)` writes the bundle of a
+  capture cut at the commits the receiving host has (`have`, 40-digit hex
+  ids, anything else is refused before Git runs) instead of at the merge base
+  with origin; an empty `have` gives the whole history of the execution
+  commit, for a host with no origin. `have` holds at most
+  `source::MAX_HAVE` = 256 entries (more are refused); an entry given twice
+  counts once. Dirty submodules inside dirty submodules are in the bundle as
+  with `export_from`, which is unchanged.
+  - A ref whose tip lies below a `have` (an unchanged dirty submodule's
+    snapshot) is kept: that `have` is not used and the parents of the tip
+    are excluded instead. The exclusions of a bundle are not per ref, so the
+    unused `have` cuts nothing for the other refs either, and the bundle is
+    larger than that `have` alone would suggest.
+  - If a ref is still missing after that, the bundle is written once more
+    with no basis (the whole history) instead of the export failing.
+  - A Git failure while a `have` is compared with a tip is an error; it is
+    not taken for "not an ancestor".
+  - A Git failure while the refs of the written bundle are listed is an
+    error too; it is not taken for a bundle that lacks a ref.
+  - The bundle's file name depends on the set of `have` (not on its order):
+    the source id, `-`, and 32 hex digits of the SHA-256 of the set. Every
+    distinct set leaves one file in `bundles/` of the store; nothing prunes
+    them, the caller owns the cleanup, and a caller that takes `have` from a
+    network peer should bound how many distinct sets it accepts for one
+    source.
+- `source::import_objects_for(ctx, clone_dir, bundle, m, nested)` is
+  `import_objects` for a receiving host that has no store: `nested` holds
+  the manifests (`&[SourceManifest]`, at most `source::MAX_NESTED` = 256) of
+  the dirty submodules below `m`, at every depth. They are trusted no more
+  than the bundle:
+  - each must hold its ids and its digest; every dirty submodule of `m` and
+    of each manifest reached from it must have its manifest in the list, and
+    a manifest that is not reached that way is refused;
+  - a nested snapshot ref is fetched without force and must be the execution
+    commit its manifest names, in the bundle and in the clone: a ref that is
+    already in the clone with another value is refused and left as it is;
+  - the tree of that commit must be the manifest's worktree tree, and the
+    gitlink of every dirty submodule, at every level, must be the execution
+    commit of that submodule's manifest.
+
+  `import_objects` still learns of nested submodules from this host's store,
+  as far as the store has their manifests.
+- `source::import_objects` and `import_objects_for` are stricter about what
+  they write to the clone. For a bundle that `export_*` made of the manifest
+  it is imported with, into a clone that holds no ref of the source with
+  another value, nothing changes.
+  - The snapshot ref of the source must be the execution commit of its
+    manifest, in the bundle and afterwards in the clone; before, a bundle
+    could bind it to a descendant. The index ref is held to the commit the
+    bundle lists for it; that commit must have the index tree of the
+    manifest and no parent (its author, dates and message are not checked:
+    the manifest names the tree, not the commit).
+  - All refs are fetched without force, all or none (`git fetch --atomic`,
+    which needs Git 2.31 or later). A ref of the source that is already in
+    the clone with another value is refused before anything is fetched and
+    left as it is; before, it was overwritten. A ref that is there with the
+    same value is fine, so a source can be imported again. A ref the bundle
+    lists twice is refused.
+  - An import that is refused leaves no ref under `refs/local-ci/` that the
+    clone did not hold before the call (the objects stay until the next
+    `git gc`); before, a bundle that failed the tree or gitlink check left
+    its refs behind.
+  - The path of a dirty submodule in a manifest must be a plain relative
+    path (not empty, no `/` at its end, no `..`, no NUL or newline) and must
+    be a gitlink in the tree of its commit: a path that names a directory, a
+    file or nothing is refused. One path of one commit is read once.
+  - `source::MAX_DIRTY_SUBMODULES` = 1024 is the most dirty submodule
+    entries an import walks, over the manifest and all nested ones; more are
+    refused before Git runs.
+  - A Git failure while a ref is looked for in the clone is an error; it is
+    not taken for a ref that is not there. The same holds for
+    `remove_imported_refs`.
+  - The digest of a manifest is unkeyed: it shows that the manifest holds
+    together, not who made it. Where a manifest and a bundle come from is
+    for the caller to establish.
+
 ## [0.10.1] - 2026-11-11
 
 - `source::capture_source` starts about half as many git processes, and the

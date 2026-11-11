@@ -408,6 +408,29 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
   content. A worker without the program of a filter the capture ran gets
   `SourceError::FilterMissing` and can be left out; a workspace that Git still
   sees as changed is `SourceError::WorkspaceNotClean`.
+- `source::export_objects` / `export_from` bundle the capture down to the
+  merge base with origin; `source::export_with_basis` cuts it at commits the
+  receiving host says it has instead (an empty list gives the whole history,
+  for a host with no origin; at most `source::MAX_HAVE` = 256 commits). Each
+  distinct list leaves one bundle file in `bundles/` of the store (its name
+  ends in 32 hex digits for the list); removing them is the caller's job,
+  and a caller that takes the list from a network peer should bound how many
+  distinct lists it accepts for one source.
+  `source::import_objects` brings a bundle into a clone;
+  `import_objects_for(ctx, clone_dir, bundle, m, nested)` is for a receiving
+  host with no store: `nested` holds the manifests of the dirty submodules
+  below `m` at every depth (at most `source::MAX_NESTED` = 256), exactly the
+  ones that are reached from `m`, and each one's snapshot ref, tree and
+  gitlinks are checked against its manifest. Both fetch the refs of the
+  source without force, all or none (`git fetch --atomic`, Git 2.31 or
+  later): the snapshot ref must be the execution commit of the manifest, a
+  ref that is already in the clone with another value is refused and kept,
+  and an import that is refused leaves no ref behind that it made (the
+  objects stay until the next `git gc`). A manifest holds at most
+  `source::MAX_DIRTY_SUBMODULES` = 1024 dirty submodule entries, nested ones
+  counted in. The digest of a manifest has no key: it shows that the
+  manifest holds together, not who made it, so where a manifest and a bundle
+  come from is for the caller to establish.
 - Not supported yet: shallow clones (`git fetch --unshallow` first) and
   repositories that use SHA-256 object names. Both are refused with an
   explicit error.
