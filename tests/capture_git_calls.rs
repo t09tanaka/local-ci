@@ -1,5 +1,7 @@
 //! A capture is the same capture however it asks Git: the manifests of a
-//! fixture with a bit of everything are pinned (`tests/golden/`).
+//! fixture with a bit of everything are pinned (`tests/golden/`), and the
+//! number of git processes one capture starts does not grow with the number
+//! of files.
 //!
 //! `LOCAL_CI_UPDATE_GOLDEN=1` rewrites the golden file;
 //! `LOCAL_CI_CAPTURE_PROFILE=<file>` writes the git processes of the
@@ -383,6 +385,8 @@ fn subcommand(argv: &[String]) -> String {
 struct Captured {
     /// what is pinned: manifest, warnings, the secret files of the bundle
     json: serde_json::Value,
+    /// the git processes the capture started
+    spawns: usize,
 }
 
 fn profile_line(name: &str, w: &World, wall: f64) -> String {
@@ -429,6 +433,7 @@ fn run(
             "warnings": snap.warnings,
             "secret_bundle": bundle,
         }),
+        spawns: spawned(&w.trace).len(),
     }
 }
 
@@ -500,4 +505,26 @@ fn the_captures_of_a_fixture_with_a_bit_of_everything_are_what_they_were() {
     );
     // the original is as it was: a second capture is the same capture
     assert_eq!(worktree(&w).json, got["worktree"]);
+}
+
+#[test]
+fn the_number_of_git_processes_does_not_grow_with_the_number_of_files() {
+    let (small, large) = (world(1), world(6));
+    for (name, f) in [
+        ("worktree", worktree as fn(&World) -> Captured),
+        ("commit", commit),
+        ("directory", directory),
+    ] {
+        let (a, b) = (f(&small), f(&large));
+        assert_eq!(
+            a.spawns, b.spawns,
+            "{name}: {} git processes for the small fixture, {} for the large one",
+            a.spawns, b.spawns
+        );
+        // and a second capture, which finds the history and the blobs
+        // already in the store, starts no more than the first
+        let again = f(&large);
+        assert!(again.spawns <= b.spawns, "{name}: {}", again.spawns);
+    }
+    assert_eq!(directory(&small).spawns, 0);
 }
