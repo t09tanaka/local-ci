@@ -2,20 +2,26 @@
   "worktree": {
     "manifest": {
       "schema_version": 2,
-      "source_id": "src-45acb2f899e0e7cf906ed9ae9124a230",
-      "manifest_digest": "sha256:45acb2f899e0e7cf906ed9ae9124a230589ae6b58d26e6ec9b8d127113b0b108",
+      "source_id": "src-cda1284b3cbfe28ed49dba983866e81c",
+      "manifest_digest": "sha256:cda1284b3cbfe28ed49dba983866e81c40796bebd5c9c6f63675e609d9f923af",
       "repository_id": "root:b1aba8ae822bff1d66f63abc61caa220b1cba602",
       "source_kind": "worktree",
       "original_head": "819a719c7b642ad98d066d276004fff2c30af880",
       "index_tree": "dfdd717fc020f6be2664145b53d7384bf9fd4c8b",
-      "worktree_tree": "0f6b480afbaaabf95767cc6e8094ccfa80f226cd",
-      "execution_commit": "a2ae287039005fdae018e4e6bf720b3dde935c58",
+      "worktree_tree": "94341b5872c71fbea2cb954e6e3a026167233da2",
+      "execution_commit": "f53e29498d0a3de6531abec1f0bdda53d69160a1",
       "base": "main",
       "merge_base": "819a719c7b642ad98d066d276004fff2c30af880",
       "branch": "main",
       "cwd_relative": "",
       "object_manifest": {
         "entries": [
+          {
+            "path": "\"quoted\".txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "2645b8b32aef797f5ae3288eb115104601b28b98952a3a0c5c9914a4cb477579"
+          },
           {
             "path": ".gitattributes",
             "mode": 33188,
@@ -101,6 +107,12 @@
             "hash": "3428719b7688c78a0cc8ba4b9e80b4e464c815fbccfd4b20695a15ffcefc22af"
           },
           {
+            "path": "docs/line\nbreak.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "2645b8b32aef797f5ae3288eb115104601b28b98952a3a0c5c9914a4cb477579"
+          },
+          {
             "path": "docs/m0.md",
             "mode": 33188,
             "size": 11,
@@ -117,6 +129,12 @@
             "mode": 33188,
             "size": 14,
             "hash": "7c0498f78b741148ccde7df04c07717a407e64dd70697cb01cc8f2e6bcfa794e"
+          },
+          {
+            "path": "docs/return.txt\r",
+            "mode": 33188,
+            "size": 4,
+            "hash": "80a3ef2f5539b0a6b5ee045e2a1de83bfb38550da54aa4d60dc1b9526b4b0805"
           },
           {
             "path": "exec_new0.sh",
@@ -299,9 +317,9 @@
             "hash": "9fc4c6bdc7e5374b75e38fa9e1097577399bb74f1ccc33b1712d53a26d02c09a"
           }
         ],
-        "tree_digest": "sha256:e019330e2b50aa32e93a6f9f62493c74ea75b0237f2c330799bd90845dacdec0",
+        "tree_digest": "sha256:827bbb75189aadc0e6c6fef45b71e213b180e489b051823feecc935ead703c04",
         "git_tips": [
-          "a2ae287039005fdae018e4e6bf720b3dde935c58"
+          "f53e29498d0a3de6531abec1f0bdda53d69160a1"
         ]
       },
       "submodules": [
@@ -391,7 +409,7 @@
     }
   },
   "refs_after_worktree": [
-    "refs/local-ci/heads/819a719c7b642ad98d066d276004fff2c30af880 819a719c7b642ad98d066d276004fff2c30af880\nrefs/local-ci/index/src-45acb2f899e0e7cf906ed9ae9124a230 344ceb75421342e0543c0b693d15f56be7eb24de\nrefs/local-ci/snapshots/src-45acb2f899e0e7cf906ed9ae9124a230 a2ae287039005fdae018e4e6bf720b3dde935c58",
+    "refs/local-ci/heads/819a719c7b642ad98d066d276004fff2c30af880 819a719c7b642ad98d066d276004fff2c30af880\nrefs/local-ci/index/src-cda1284b3cbfe28ed49dba983866e81c 344ceb75421342e0543c0b693d15f56be7eb24de\nrefs/local-ci/snapshots/src-cda1284b3cbfe28ed49dba983866e81c f53e29498d0a3de6531abec1f0bdda53d69160a1",
     "refs/local-ci/heads/8d7d442bc12278373eff78143ed76d945dcca563 8d7d442bc12278373eff78143ed76d945dcca563\nrefs/local-ci/index/src-026c15094adb5ed527a9e5e85f8f1edf bf85164e7f0a3b97e28ba4fc90d67addc2c9a366\nrefs/local-ci/snapshots/src-026c15094adb5ed527a9e5e85f8f1edf 05d9c764e59d9d7031cde15f457d77cdf0e558a7",
     "refs/local-ci/heads/a407a05931e7c50af637531f444c5a28d214e7d9 a407a05931e7c50af637531f444c5a28d214e7d9\nrefs/local-ci/index/src-4459b9ecfc2b10f0ea18b162dbd60738 8ef892429970c1938d5a147c5326560486aeeec0\nrefs/local-ci/snapshots/src-4459b9ecfc2b10f0ea18b162dbd60738 872a00a711fe7a5818132dd351eba780abbb836d"
   ],
@@ -715,7 +733,7 @@
     }
   },
   "refs_after_commit": [
-    "refs/local-ci/heads/819a719c7b642ad98d066d276004fff2c30af880 819a719c7b642ad98d066d276004fff2c30af880\nrefs/local-ci/index/src-45acb2f899e0e7cf906ed9ae9124a230 344ceb75421342e0543c0b693d15f56be7eb24de\nrefs/local-ci/index/src-52aa212a2375ac0703f721f01fb0ef36 16883f5c5d33de2a5e1aacb3de8d808d8026cc24\nrefs/local-ci/snapshots/src-45acb2f899e0e7cf906ed9ae9124a230 a2ae287039005fdae018e4e6bf720b3dde935c58\nrefs/local-ci/snapshots/src-52aa212a2375ac0703f721f01fb0ef36 80b9ca4fb6438a5ef722a3e2ef75043d714b735d",
+    "refs/local-ci/heads/819a719c7b642ad98d066d276004fff2c30af880 819a719c7b642ad98d066d276004fff2c30af880\nrefs/local-ci/index/src-52aa212a2375ac0703f721f01fb0ef36 16883f5c5d33de2a5e1aacb3de8d808d8026cc24\nrefs/local-ci/index/src-cda1284b3cbfe28ed49dba983866e81c 344ceb75421342e0543c0b693d15f56be7eb24de\nrefs/local-ci/snapshots/src-52aa212a2375ac0703f721f01fb0ef36 80b9ca4fb6438a5ef722a3e2ef75043d714b735d\nrefs/local-ci/snapshots/src-cda1284b3cbfe28ed49dba983866e81c f53e29498d0a3de6531abec1f0bdda53d69160a1",
     "refs/local-ci/heads/8d7d442bc12278373eff78143ed76d945dcca563 8d7d442bc12278373eff78143ed76d945dcca563\nrefs/local-ci/index/src-026c15094adb5ed527a9e5e85f8f1edf bf85164e7f0a3b97e28ba4fc90d67addc2c9a366\nrefs/local-ci/snapshots/src-026c15094adb5ed527a9e5e85f8f1edf 05d9c764e59d9d7031cde15f457d77cdf0e558a7",
     "refs/local-ci/heads/a407a05931e7c50af637531f444c5a28d214e7d9 a407a05931e7c50af637531f444c5a28d214e7d9\nrefs/local-ci/index/src-4459b9ecfc2b10f0ea18b162dbd60738 8ef892429970c1938d5a147c5326560486aeeec0\nrefs/local-ci/snapshots/src-4459b9ecfc2b10f0ea18b162dbd60738 872a00a711fe7a5818132dd351eba780abbb836d"
   ],

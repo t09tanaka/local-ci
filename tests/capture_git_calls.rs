@@ -301,6 +301,11 @@ fn world(n: usize) -> World {
             ],
         );
     }
+    // names that a list of paths, one per line, cannot hold as they are
+    // (once, whatever `n` is: each of them is hashed by a process of its own)
+    write(d.join("docs/line\nbreak.txt"), "odd\r\n");
+    write(d.join("\"quoted\".txt"), "odd\r\n");
+    write(d.join("docs/return.txt\r"), "odd\n");
     write(d.join(".env"), "API_TOKEN=correct-horse-battery-staple\n");
     chmod(d.join(".env"), 0o600);
     // one submodule is dirty, the other is as committed
