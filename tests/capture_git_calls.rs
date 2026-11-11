@@ -60,8 +60,9 @@ fn chmod(p: PathBuf, mode: u32) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+#[derive(Clone)]
 struct World {
-    _tmp: common::Tmp,
+    _tmp: std::sync::Arc<common::Tmp>,
     home: PathBuf,
     /// the dirty working tree
     work: PathBuf,
@@ -70,29 +71,59 @@ struct World {
     /// a directory that is not a repository
     plain: PathBuf,
     trace: PathBuf,
+    /// the store of the captures
+    store: PathBuf,
+    /// set, the question git does not answer ([`Unanswered`])
+    unanswered: Option<Unanswered>,
+}
+
+/// A question the git of `tests/fixtures/git-that-fails` does not answer:
+/// see there.
+#[derive(Clone)]
+struct Unanswered {
+    pattern: &'static str,
+    stdin: &'static str,
+    mode: &'static str,
+    log: PathBuf,
+}
+
+const PATH: &str = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin";
+
+fn real_git() -> String {
+    PATH.split(':')
+        .map(|d| format!("{d}/git"))
+        .find(|g| Path::new(g).is_file())
+        .unwrap()
 }
 
 impl World {
     /// The context of a capture; every git process it starts is written to
     /// `trace`.
     fn ctx(&self) -> ExecContext {
-        ExecContext::new(
-            [
-                ("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"),
-                ("HOME", self.home.to_str().unwrap()),
-                ("LOCAL_CI_HOME", self.home.to_str().unwrap()),
-                ("GIT_CONFIG_NOSYSTEM", "1"),
-                ("GIT_TRACE2_EVENT", self.trace.to_str().unwrap()),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        )
+        let mut env = vec![
+            ("PATH", PATH.to_string()),
+            ("HOME", self.home.to_str().unwrap().to_string()),
+            ("LOCAL_CI_HOME", self.home.to_str().unwrap().to_string()),
+            ("GIT_CONFIG_NOSYSTEM", "1".to_string()),
+            ("GIT_TRACE2_EVENT", self.trace.to_str().unwrap().to_string()),
+        ];
+        if let Some(u) = &self.unanswered {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/git-that-fails");
+            env[0].1 = format!("{dir}:{PATH}");
+            env.extend([
+                ("GIT_WRAP_REAL", real_git()),
+                ("GIT_WRAP_MATCH", u.pattern.to_string()),
+                ("GIT_WRAP_STDIN", u.stdin.to_string()),
+                ("GIT_WRAP_MODE", u.mode.to_string()),
+                ("GIT_WRAP_LOG", u.log.to_str().unwrap().to_string()),
+            ]);
+        }
+        ExecContext::new(env.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 
     fn opts(&self) -> CaptureOptions {
         CaptureOptions {
-            store: Some(self.home.join("store")),
+            store: Some(self.store.clone()),
             include: vec!["out/**".into()],
             exclude: vec!["docs/n1.txt".into()],
             secret_files: vec![
@@ -338,7 +369,9 @@ fn world(n: usize) -> World {
     write(plain.join(".env"), "TOKEN=1\n");
     World {
         trace: root.join("trace.json"),
-        _tmp: tmp,
+        store: home.join("store"),
+        unanswered: None,
+        _tmp: std::sync::Arc::new(tmp),
         home,
         work,
         clean,
@@ -479,7 +512,7 @@ fn directory(w: &World) -> Captured {
 /// directories, which hold a temporary path.
 fn private_refs(w: &World) -> Vec<String> {
     let mut all = vec![];
-    for e in std::fs::read_dir(w.home.join("store/git")).unwrap() {
+    for e in std::fs::read_dir(w.store.join("git")).unwrap() {
         let dir = e.unwrap().path();
         // every object the refs reach is there
         git(&dir, &["fsck", "--connectivity-only"]);
@@ -490,6 +523,10 @@ fn private_refs(w: &World) -> Vec<String> {
     }
     all.sort();
     all
+}
+
+fn golden_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/capture.json")
 }
 
 #[test]
@@ -506,7 +543,7 @@ fn the_captures_of_a_fixture_with_a_bit_of_everything_are_what_they_were() {
         "refs_after_commit": private_refs(&w),
         "directory": dir.json,
     });
-    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/capture.json");
+    let golden = golden_path();
     let text = serde_json::to_string_pretty(&got).unwrap() + "\n";
     if std::env::var_os("LOCAL_CI_UPDATE_GOLDEN").is_some() {
         write(golden.clone(), &text);
@@ -540,4 +577,164 @@ fn the_number_of_git_processes_does_not_grow_with_the_number_of_files() {
         assert!(again.spawns <= b.spawns, "{name}: {}", again.spawns);
     }
     assert_eq!(directory(&small).spawns, 0);
+}
+
+/// Each question a capture asks of Git for several things at once has the
+/// questions it replaces behind it. Here git does not answer one of them (it
+/// fails, or says something else), and the captures are still the pinned
+/// ones.
+#[test]
+fn a_capture_is_the_same_when_git_does_not_answer_a_question_that_was_put_together() {
+    let (toplevel, in_store) = (
+        "*rev-parse --show-toplevel --is-shallow-repository*",
+        "--git-dir * cat-file --batch-check",
+    );
+    // what is asked, the command line, the first line of its input, and
+    // what git does instead of answering
+    let cases = [
+        // `locate`
+        ("where the repository is", toplevel, "", "fail"),
+        ("where the repository is", toplevel, "", "garble"),
+        // `head_of`
+        ("HEAD", "*--abbrev-ref=loose*", "", "fail"),
+        ("HEAD", "*--abbrev-ref=loose*", "", "garble"),
+        // the index with its flags: then `ls-files -s`, and `ls-files -v`
+        // for the flags
+        ("the index and its flags", "*ls-files -z -s -v", "", "fail"),
+        // the files of a `secret_root`
+        ("tracked and not", "*ls-files -z -t -c -o", "", "fail"),
+        ("tracked and not", "*ls-files -z -t -c -o", "", "garble"),
+        // `import_objects`: the look that says what the store has (the
+        // look for blobs alone, which is behind it, is answered)
+        ("what the store has", in_store, "refs/*", "fail"),
+        ("what the store has", in_store, "refs/*", "garble"),
+        ("what the store has", in_store, "refs/*", "ambiguous"),
+        // `pack_across`
+        ("the staged blobs", "*pack-objects*", "", "fail"),
+        ("the staged blobs", "*unpack-objects*", "", "fail"),
+        // `hash_filtered_all`
+        ("the blobs of changed files", "*--stdin-paths", "", "fail"),
+        ("the blobs of changed files", "*--stdin-paths", "", "garble"),
+        // `set_refs`
+        ("the two refs", "*update-ref --stdin", "", "fail"),
+        // `default_base`
+        ("the base", "-C * cat-file --batch-check", "", "fail"),
+        ("the base", "-C * cat-file --batch-check", "", "garble"),
+    ];
+    let world = world(2);
+    let want: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(golden_path()).unwrap()).unwrap();
+    // a capture only reads the original, so the cases share it; each has a
+    // store of its own, where what is copied once is copied again
+    let case =
+        |i: usize,
+         (what, pattern, stdin, mode): (&str, &'static str, &'static str, &'static str)| {
+            let name = format!("{what} ({mode})");
+            let mut w = world.clone();
+            w.store = w.home.join(format!("store{i}"));
+            w.trace = w.home.join(format!("trace{i}.json"));
+            let log = w.home.join(format!("unanswered{i}"));
+            w.unanswered = Some(Unanswered {
+                pattern,
+                stdin,
+                mode,
+                log: log.clone(),
+            });
+            assert_eq!(worktree(&w).json, want["worktree"], "{name}");
+            let refs = serde_json::json!(private_refs(&w));
+            assert_eq!(refs, want["refs_after_worktree"], "{name}");
+            assert_eq!(commit(&w).json, want["commit"], "{name}");
+            let refs = serde_json::json!(private_refs(&w));
+            assert_eq!(refs, want["refs_after_commit"], "{name}");
+            // and the question was asked, and not answered
+            let asked = std::fs::read_to_string(&log).unwrap_or_default();
+            assert!(!asked.is_empty(), "{name}: git was never asked {pattern}");
+        };
+    std::thread::scope(|s| {
+        for (i, c) in cases.into_iter().enumerate() {
+            let case = &case;
+            s.spawn(move || case(i, c));
+        }
+    });
+}
+
+/// A filter program that is given the path of the file (`%f`) can look for
+/// it. The content a capture has Git clean is not a file of a working tree,
+/// and no file is at that path where the filter runs: what such a filter
+/// answers is the same whether one file changed or many.
+#[test]
+fn a_filter_that_looks_for_the_file_finds_none_however_many_files_changed() {
+    let tmp = common::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let (home, d) = (root.join("home"), root.join("work"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&d).unwrap();
+    git(&d, &["init", "-q", "-b", "main"]);
+    let looks = r#"sh -c 'if test -e "$1"; then echo there; else echo absent; fi; cat' - %f"#;
+    git(&d, &["config", "filter.looks.clean", looks]);
+    git(&d, &["config", "filter.upper.clean", "tr a-z A-Z"]);
+    write(
+        d.join(".gitattributes"),
+        "*.see filter=looks\n*.up filter=upper\n*.txt text\n",
+    );
+    for i in 0..4 {
+        write(d.join(format!("dir/f{i}.see")), "first\n");
+        write(d.join(format!("g{i}.up")), "first\n");
+        write(d.join(format!("t{i}.txt")), "first\n");
+    }
+    git(&d, &["add", "."]);
+    git(&d, &["commit", "-qm", "base"]);
+
+    let ctx = ExecContext::new(
+        [
+            ("PATH", PATH),
+            ("HOME", home.to_str().unwrap()),
+            ("LOCAL_CI_HOME", home.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    let store = home.join("store");
+    // a capture of `d`: the content of a path in the commit it leaves
+    let capture = || {
+        let opts = CaptureOptions {
+            store: Some(store.clone()),
+            ..CaptureOptions::default()
+        };
+        let snap = capture_source(&ctx, &d, &opts).unwrap();
+        let commit = snap.manifest.execution_commit.unwrap();
+        let dirs: Vec<PathBuf> = std::fs::read_dir(store.join("git"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(dirs.len(), 1);
+        move |path: &str| git_out(&dirs[0], &["cat-file", "blob", &format!("{commit}:{path}")])
+    };
+
+    // committed by Git itself, in a working tree: the file was there
+    let blob = capture();
+    assert_eq!(blob("dir/f0.see"), "there\nfirst");
+
+    // one file changed
+    write(d.join("dir/f0.see"), "second 0\n");
+    let blob = capture();
+    assert_eq!(blob("dir/f0.see"), "absent\nsecond 0");
+    assert_eq!(blob("dir/f1.see"), "there\nfirst");
+
+    // many changed, new ones too, among files of other filters and of none
+    for i in 0..4 {
+        write(d.join(format!("dir/f{i}.see")), format!("third {i}\n"));
+        write(d.join(format!("new{i}.see")), format!("new {i}\n"));
+        write(d.join(format!("g{i}.up")), format!("third {i}\n"));
+        write(d.join(format!("t{i}.txt")), format!("third {i}\r\n"));
+    }
+    let blob = capture();
+    for i in 0..4 {
+        assert_eq!(blob(&format!("dir/f{i}.see")), format!("absent\nthird {i}"));
+        assert_eq!(blob(&format!("new{i}.see")), format!("absent\nnew {i}"));
+        assert_eq!(blob(&format!("g{i}.up")), format!("THIRD {i}"));
+        assert_eq!(blob(&format!("t{i}.txt")), format!("third {i}"));
+    }
 }
