@@ -154,10 +154,15 @@ fn world(n: usize) -> World {
     let d = &work;
     std::fs::create_dir_all(d).unwrap();
     git(d, &["init", "-q", "-b", "main"]);
+    // a filter that is a program: what Git stores is upper case
+    git(d, &["config", "filter.upper.clean", "tr a-z A-Z"]);
+    git(d, &["config", "filter.upper.smudge", "cat"]);
+    git(d, &["config", "filter.upper.required", "true"]);
+    git(d, &["config", "filter.unused.clean", "cat"]);
     write(d.join(".gitignore"), "*.log\n.env\nout/\nsecrets/\n");
     write(
         d.join(".gitattributes"),
-        "*.txt text\n*.crlf text eol=crlf\n*.dat filter=lfs diff=lfs merge=lfs -text\n",
+        "*.txt text\n*.crlf text eol=crlf\n*.dat filter=lfs diff=lfs merge=lfs -text\n*.up filter=upper\n",
     );
     write(d.join("docs/.gitattributes"), "*.md text eol=lf\n");
     let mut pointers = vec![];
@@ -172,6 +177,11 @@ fn world(n: usize) -> World {
         write(d.join(format!("docs/m{i}.md")), format!("# m{i}\n"));
         write(d.join(format!("docs/gone{i}.txt")), "gone\n");
         write(d.join(format!("win{i}.crlf")), "one\r\ntwo\r\n");
+        write(d.join(format!("docs/data{i}.up")), format!("lower {i}\n"));
+        write(
+            d.join(format!("docs/same{i}.up")),
+            format!("as it was {i}\n"),
+        );
         write(d.join(format!("bin/run{i}.sh")), "#!/bin/sh\necho hi\n");
         chmod(d.join(format!("bin/run{i}.sh")), 0o755);
         write(d.join(format!("bin/tool{i}.sh")), "#!/bin/sh\n");
@@ -251,6 +261,9 @@ fn world(n: usize) -> World {
         write(d.join(format!("docs/n{i}.txt")), "changed\r\nnote\n");
         write(d.join(format!("docs/m{i}.md")), "# changed\r\n");
         write(d.join(format!("win{i}.crlf")), "one\r\ntwo\r\nthree\r\n");
+        // through the filter program: changed, and new
+        write(d.join(format!("docs/data{i}.up")), format!("changed {i}\n"));
+        write(d.join(format!("new{i}.up")), format!("not tracked {i}\n"));
         // staged
         write(d.join(format!("src/d{i}/f1.rs")), "fn staged() {}\n");
         git(d, &["add", "--", &format!("src/d{i}/f1.rs")]);
