@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-11
+
+- `source::capture_source` starts about half as many git processes, and the
+  number no longer grows with the number of files. Nothing about what a
+  capture contains changes: the manifest, the digests, the commits and refs
+  of the private repository, the secret bundle, the warnings and the errors
+  are the same (a test pins them for a fixture with a bit of everything,
+  against a golden file made by 0.10.0). On the fixture of that test, a dirty
+  working tree with two submodules went from 187 git processes to 105 (164 to
+  88 once the history is in the store), and a clean checkout that takes its
+  secret files from another working tree from 59 to 31. Starting git costs
+  more here than what it does, so the time goes down with the count, though
+  by less: on a busy macOS machine the three captures took 15 to 30% less.
+  - What was asked of Git once per file is asked once per capture: the blobs
+    of changed files that an attribute or a setting touches (`git hash-object
+    --stdin-paths` instead of one `hash-object` each), the pointers of LFS
+    files (with the other blobs that go in as they are), and staged blobs
+    that are only in the original (`pack-objects` into `unpack-objects`
+    instead of a `cat-file` and a `hash-object` each).
+  - What does not move during a capture is asked once and together: where
+    the repository, its common directory and its index are, whether it is
+    shallow, its object format (one `rev-parse` instead of five and more);
+    the settings that decide how content becomes a blob (one `git config`
+    instead of eight).
+  - What Git can answer in one process is asked in one: `HEAD`, its tree and
+    its branch; the index entries and their skip-worktree / assume-unchanged
+    flags; the tracked and untracked files of a `secret_root`; the candidate
+    base branches; the two refs a capture leaves.
+  - Each of these has the questions it replaces behind it: when git fails or
+    answers in an unexpected shape (a path with a line break in it, for
+    one), they are asked the way they were, so the result and the error are
+    the same ones.
+  - A file is hashed by a process of its own, its content on standard input
+    as before, whenever reading it from a scratch directory could give
+    another blob:
+    - its `filter` is a program that is given the path of the file (`%f` in
+      `filter.<name>.clean`, or a `filter.<name>.process`). Such a program
+      can look for the file, and where it runs there has never been one at
+      that path. The blob does not depend on how many files changed.
+    - its name cannot be held there as it is: a second name that differs
+      from another by case only, on a store whose filesystem does not tell
+      them apart (two `.gitattributes` among them), or a name that this
+      filesystem reads as `.gitattributes` when it is not (`.GITATTRIBUTES`),
+      which would have become the attributes of its directory.
+
 ## [0.10.0] - 2026-11-10
 
 Breaking changes for external code (library API; the CLI is unchanged). Each

@@ -1,0 +1,921 @@
+{
+  "worktree": {
+    "manifest": {
+      "schema_version": 2,
+      "source_id": "src-a45f1de104fa55c330157d2b1207b980",
+      "manifest_digest": "sha256:a45f1de104fa55c330157d2b1207b9803523509a3a8799363bda9f307f02854c",
+      "repository_id": "root:21664b699a796de1662ae2198fa70effcd9746e1",
+      "source_kind": "worktree",
+      "original_head": "b7fcd48714df21ff5b66c934c5c2359f72ad5ed6",
+      "index_tree": "3d520646faabccafc9feb25aeea055115e5f43fd",
+      "worktree_tree": "0b475adea20f5dcb2ffd6f1b301503d3886681d7",
+      "execution_commit": "f572dfd2cdd2fe5f1c685a24c4e2b35173ca7814",
+      "base": "main",
+      "merge_base": "b7fcd48714df21ff5b66c934c5c2359f72ad5ed6",
+      "branch": "main",
+      "cwd_relative": "",
+      "object_manifest": {
+        "entries": [
+          {
+            "path": "\"quoted\".txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "2645b8b32aef797f5ae3288eb115104601b28b98952a3a0c5c9914a4cb477579"
+          },
+          {
+            "path": ".gitattributes",
+            "mode": 33188,
+            "size": 92,
+            "hash": "e8f554462babab55c46b27ec8254bb2198791455b09e2ef92602176d67af0382"
+          },
+          {
+            "path": ".gitignore",
+            "mode": 33188,
+            "size": 25,
+            "hash": "1a0b509ec302696e4ed6296a53ff4287ea931b19ba5156b385abc687b4f584bb"
+          },
+          {
+            "path": ".gitmodules",
+            "mode": 33188,
+            "size": 119,
+            "hash": "22b70f40555143f38e426676dd1e884570384a5f510ce6c03156a67d0b1b38b2"
+          },
+          {
+            "path": "bin/run0.sh",
+            "mode": 33188,
+            "size": 18,
+            "hash": "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba"
+          },
+          {
+            "path": "bin/run1.sh",
+            "mode": 33188,
+            "size": 18,
+            "hash": "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba"
+          },
+          {
+            "path": "bin/tool0.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "bin/tool1.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "blob0.bin",
+            "mode": 33188,
+            "size": 5,
+            "hash": "1ee9b25151b280006dcfae48ef94f255fe8a849ad2d4afe542f8f1da3b9e3726"
+          },
+          {
+            "path": "blob1.bin",
+            "mode": 33188,
+            "size": 5,
+            "hash": "92544688580061662e92394ebeda41933ccbf134664d31594931e66ca2621aa2"
+          },
+          {
+            "path": "dirlink0",
+            "mode": 40960,
+            "size": 4,
+            "hash": "46b42b4229cd7a39c564e780bb665a8bde4fdf722007e8473f167fe53ed4b995"
+          },
+          {
+            "path": "dirlink1",
+            "mode": 40960,
+            "size": 4,
+            "hash": "46b42b4229cd7a39c564e780bb665a8bde4fdf722007e8473f167fe53ed4b995"
+          },
+          {
+            "path": "docs/.gitattributes",
+            "mode": 33188,
+            "size": 17,
+            "hash": "d2eb1a317920a1e2fd04a1b7352ef04bfb1f0b9f4d0594f4dc395a87ce2ccfba"
+          },
+          {
+            "path": "docs/added0.txt",
+            "mode": 33188,
+            "size": 6,
+            "hash": "3428719b7688c78a0cc8ba4b9e80b4e464c815fbccfd4b20695a15ffcefc22af"
+          },
+          {
+            "path": "docs/added1.txt",
+            "mode": 33188,
+            "size": 6,
+            "hash": "3428719b7688c78a0cc8ba4b9e80b4e464c815fbccfd4b20695a15ffcefc22af"
+          },
+          {
+            "path": "docs/data0.up",
+            "mode": 33188,
+            "size": 10,
+            "hash": "981bd1337e88294ffec5214b0fd02369b724fe8d5dacdf5158a862a728a2af5e"
+          },
+          {
+            "path": "docs/data1.up",
+            "mode": 33188,
+            "size": 10,
+            "hash": "1db91d37e7ab762d6df5a7e3f3f6f948ea5cb0ea055b73aa9a4459ef14077590"
+          },
+          {
+            "path": "docs/line\nbreak.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "2645b8b32aef797f5ae3288eb115104601b28b98952a3a0c5c9914a4cb477579"
+          },
+          {
+            "path": "docs/m0.md",
+            "mode": 33188,
+            "size": 11,
+            "hash": "3684713dbdc34609fea76974fc1aa5383ee2326d4a15e1c653d4bbab084006bf"
+          },
+          {
+            "path": "docs/m1.md",
+            "mode": 33188,
+            "size": 11,
+            "hash": "3684713dbdc34609fea76974fc1aa5383ee2326d4a15e1c653d4bbab084006bf"
+          },
+          {
+            "path": "docs/n0.txt",
+            "mode": 33188,
+            "size": 14,
+            "hash": "7c0498f78b741148ccde7df04c07717a407e64dd70697cb01cc8f2e6bcfa794e"
+          },
+          {
+            "path": "docs/return.txt\r",
+            "mode": 33188,
+            "size": 4,
+            "hash": "80a3ef2f5539b0a6b5ee045e2a1de83bfb38550da54aa4d60dc1b9526b4b0805"
+          },
+          {
+            "path": "docs/same0.up",
+            "mode": 33188,
+            "size": 12,
+            "hash": "d073ec5724dbba1a17473ae4fabea43d55099228d564ffa8f531e1c81db375a4"
+          },
+          {
+            "path": "docs/same1.up",
+            "mode": 33188,
+            "size": 12,
+            "hash": "e64283f6d60d02ef65bdd384ad13a3342751585222bba4521fe43bc9e925728c"
+          },
+          {
+            "path": "exec_new0.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "exec_new1.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "link0",
+            "mode": 40960,
+            "size": 17,
+            "hash": "6969f64eccf1c5f826f800bc6c32542ead171b8df563c758c463e419738fd39f"
+          },
+          {
+            "path": "link1",
+            "mode": 40960,
+            "size": 17,
+            "hash": "6969f64eccf1c5f826f800bc6c32542ead171b8df563c758c463e419738fd39f"
+          },
+          {
+            "path": "new0.up",
+            "mode": 33188,
+            "size": 14,
+            "hash": "55746c4381b1a36651cef9925175e12f2b0b3219df1ecdbce203fe7cdab034ed"
+          },
+          {
+            "path": "new1.up",
+            "mode": 33188,
+            "size": 14,
+            "hash": "20ba67620dfe4f1a523de9b90c43ddda24e0d481f466259a88e8b02c87297e8f"
+          },
+          {
+            "path": "out/gen0.txt",
+            "mode": 33188,
+            "size": 10,
+            "hash": "9f5936ff15d3a2ba7d3d8f21858338a6c1e2adc9fe34c685c7de5b4a00caa29a"
+          },
+          {
+            "path": "out/gen1.txt",
+            "mode": 33188,
+            "size": 10,
+            "hash": "9f5936ff15d3a2ba7d3d8f21858338a6c1e2adc9fe34c685c7de5b4a00caa29a"
+          },
+          {
+            "path": "ptr0.dat",
+            "mode": 33188,
+            "size": 950,
+            "hash": "3caec47ee284b20108425c8c982609bf609304e154e9186f9b6624cf3296119f"
+          },
+          {
+            "path": "ptr1.dat",
+            "mode": 33188,
+            "size": 950,
+            "hash": "3edf9204c790d1170426cbd4c666773d3bd9ed2bf5768d4aba5bf98ce6296040"
+          },
+          {
+            "path": "smudged0.dat",
+            "mode": 33188,
+            "size": 1150,
+            "hash": "8947ddf92c378005c4b4d914317f2dfbeb1fa7e84984d40b2bb825f1ac6f6aae"
+          },
+          {
+            "path": "smudged1.dat",
+            "mode": 33188,
+            "size": 1150,
+            "hash": "cfd555f03a3624f4ee280da92163df79699433160eac9ab6542162c209ac10dc"
+          },
+          {
+            "path": "src/d0/added.rs",
+            "mode": 33188,
+            "size": 14,
+            "hash": "51838a55903898822056add56e31b1b221369cc366c234527e658ecb850a13a4"
+          },
+          {
+            "path": "src/d0/again.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "ab30081ac49daa00f0bcacb996cfb74ec42e1275ad15c0bda6ae91b47501a1f9"
+          },
+          {
+            "path": "src/d0/f0.rs",
+            "mode": 33188,
+            "size": 16,
+            "hash": "b3e0b232b4fe61d1e8e80a7ec7be5e349fe979ff331622cb410be6e20f9bbca7"
+          },
+          {
+            "path": "src/d0/f1.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "98782748e2570adc8ecd80e4606d17a876f682d0acf14d716aedb1da9f43e1fe"
+          },
+          {
+            "path": "src/d0/f2.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "8d0afcd49380942dde254abe9864a0ccdfac0551aecf4d90c770fda35f1e2e09"
+          },
+          {
+            "path": "src/d0/f3.rs",
+            "mode": 33188,
+            "size": 16,
+            "hash": "502ffd801a4c90a0a1d0e0ca132c173caeee8a42167630a4d6a4ce1729147dea"
+          },
+          {
+            "path": "src/d0/untracked.rs",
+            "mode": 33188,
+            "size": 12,
+            "hash": "8c6c25d67ed27d733756694bb6a34a1ef9891c8d33b3933578af5f112beee866"
+          },
+          {
+            "path": "src/d1/added.rs",
+            "mode": 33188,
+            "size": 14,
+            "hash": "51838a55903898822056add56e31b1b221369cc366c234527e658ecb850a13a4"
+          },
+          {
+            "path": "src/d1/again.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "ab30081ac49daa00f0bcacb996cfb74ec42e1275ad15c0bda6ae91b47501a1f9"
+          },
+          {
+            "path": "src/d1/f0.rs",
+            "mode": 33188,
+            "size": 16,
+            "hash": "b3e0b232b4fe61d1e8e80a7ec7be5e349fe979ff331622cb410be6e20f9bbca7"
+          },
+          {
+            "path": "src/d1/f1.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "98782748e2570adc8ecd80e4606d17a876f682d0acf14d716aedb1da9f43e1fe"
+          },
+          {
+            "path": "src/d1/f2.rs",
+            "mode": 33188,
+            "size": 15,
+            "hash": "8d0afcd49380942dde254abe9864a0ccdfac0551aecf4d90c770fda35f1e2e09"
+          },
+          {
+            "path": "src/d1/f3.rs",
+            "mode": 33188,
+            "size": 16,
+            "hash": "502ffd801a4c90a0a1d0e0ca132c173caeee8a42167630a4d6a4ce1729147dea"
+          },
+          {
+            "path": "src/d1/untracked.rs",
+            "mode": 33188,
+            "size": 12,
+            "hash": "8c6c25d67ed27d733756694bb6a34a1ef9891c8d33b3933578af5f112beee866"
+          },
+          {
+            "path": "sub dir/newあ0.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "ace37921d021787938f5c1c09574fd863e7ffc001f3d56fdf5d92332591a37e0"
+          },
+          {
+            "path": "sub dir/newあ1.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "ace37921d021787938f5c1c09574fd863e7ffc001f3d56fdf5d92332591a37e0"
+          },
+          {
+            "path": "untracked0.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "9f5d1ba48d2fd5c3aaa39bad078e9a929f1d292511f8febc308def37c3840ab2"
+          },
+          {
+            "path": "untracked1.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "9f5d1ba48d2fd5c3aaa39bad078e9a929f1d292511f8febc308def37c3840ab2"
+          },
+          {
+            "path": "win0.crlf",
+            "mode": 33188,
+            "size": 17,
+            "hash": "9fc4c6bdc7e5374b75e38fa9e1097577399bb74f1ccc33b1712d53a26d02c09a"
+          },
+          {
+            "path": "win1.crlf",
+            "mode": 33188,
+            "size": 17,
+            "hash": "9fc4c6bdc7e5374b75e38fa9e1097577399bb74f1ccc33b1712d53a26d02c09a"
+          }
+        ],
+        "tree_digest": "sha256:80a8a25cc3305d72e9d11f64908d0612d5b8be43557258c4383fd9fd69e6c726",
+        "git_tips": [
+          "f572dfd2cdd2fe5f1c685a24c4e2b35173ca7814"
+        ]
+      },
+      "submodules": [
+        {
+          "path": "vendor/lib",
+          "revision": "a407a05931e7c50af637531f444c5a28d214e7d9",
+          "source_id": "src-4459b9ecfc2b10f0ea18b162dbd60738",
+          "dirty": true
+        },
+        {
+          "path": "vendor/lib2",
+          "revision": "8d7d442bc12278373eff78143ed76d945dcca563",
+          "source_id": "src-026c15094adb5ed527a9e5e85f8f1edf",
+          "dirty": false
+        }
+      ],
+      "lfs": [
+        {
+          "path": "ptr0.dat",
+          "oid": "3caec47ee284b20108425c8c982609bf609304e154e9186f9b6624cf3296119f",
+          "size": 950,
+          "pointer_hash": "068f828d0bb6179d343790771ff6645319a9a2690007ff0986f1ca83a78d84ce"
+        },
+        {
+          "path": "ptr1.dat",
+          "oid": "3edf9204c790d1170426cbd4c666773d3bd9ed2bf5768d4aba5bf98ce6296040",
+          "size": 950,
+          "pointer_hash": "3341ca49dbd15934fd9e5334bb3ccc159d3e06bc218849f1c0fded5871515e30"
+        },
+        {
+          "path": "smudged0.dat",
+          "oid": "8947ddf92c378005c4b4d914317f2dfbeb1fa7e84984d40b2bb825f1ac6f6aae",
+          "size": 1150,
+          "pointer_hash": "8002f4e65620a51ad1cbe1b2241312c8a335ca9d745818606adcba2dc25f49c7"
+        },
+        {
+          "path": "smudged1.dat",
+          "oid": "cfd555f03a3624f4ee280da92163df79699433160eac9ab6542162c209ac10dc",
+          "size": 1150,
+          "pointer_hash": "6df8bd2941c274f37c4c03510a379cfac10a199a842aa9a0bbdf97ee77bd5ccb"
+        }
+      ],
+      "canonical": {
+        "autocrlf": null,
+        "eol": null,
+        "safecrlf": null,
+        "attributes": "",
+        "filters": [
+          {
+            "name": "upper",
+            "clean": "tr a-z A-Z",
+            "smudge": "cat",
+            "process": null,
+            "required": "true"
+          }
+        ]
+      },
+      "secret_files": [
+        {
+          "path": ".env",
+          "hmac": "hmac-sha256:a594916ec6e933ae0e90cd294dd974662ec7885e4f1c5f4a274e0453267194b3"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "hmac": "hmac-sha256:3ea023d55eec34a24377c07a07ce087529fade6a1c981cd57d6203e965ad22d3"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "hmac": "hmac-sha256:e1059a5bc2e67904fe16aea2d64b402a0ffc7d67fbee11f2dd963b04798d4c9b"
+        }
+      ]
+    },
+    "warnings": [
+      "secret_files \"nothing/*\" matches no file"
+    ],
+    "secret_bundle": {
+      "schema_version": 1,
+      "files": [
+        {
+          "path": ".env",
+          "mode": 384,
+          "content_hex": "4150495f544f4b454e3d636f72726563742d686f7273652d626174746572792d737461706c650a"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "mode": 384,
+          "content_hex": "6b657920300a"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "mode": 384,
+          "content_hex": "6b657920310a"
+        }
+      ]
+    }
+  },
+  "refs_after_worktree": [
+    "refs/local-ci/heads/8d7d442bc12278373eff78143ed76d945dcca563 8d7d442bc12278373eff78143ed76d945dcca563\nrefs/local-ci/index/src-026c15094adb5ed527a9e5e85f8f1edf bf85164e7f0a3b97e28ba4fc90d67addc2c9a366\nrefs/local-ci/snapshots/src-026c15094adb5ed527a9e5e85f8f1edf 05d9c764e59d9d7031cde15f457d77cdf0e558a7",
+    "refs/local-ci/heads/a407a05931e7c50af637531f444c5a28d214e7d9 a407a05931e7c50af637531f444c5a28d214e7d9\nrefs/local-ci/index/src-4459b9ecfc2b10f0ea18b162dbd60738 8ef892429970c1938d5a147c5326560486aeeec0\nrefs/local-ci/snapshots/src-4459b9ecfc2b10f0ea18b162dbd60738 872a00a711fe7a5818132dd351eba780abbb836d",
+    "refs/local-ci/heads/b7fcd48714df21ff5b66c934c5c2359f72ad5ed6 b7fcd48714df21ff5b66c934c5c2359f72ad5ed6\nrefs/local-ci/index/src-a45f1de104fa55c330157d2b1207b980 a6d88f313866b72451a09fc375f0619b38aa6ded\nrefs/local-ci/snapshots/src-a45f1de104fa55c330157d2b1207b980 f572dfd2cdd2fe5f1c685a24c4e2b35173ca7814"
+  ],
+  "commit": {
+    "manifest": {
+      "schema_version": 2,
+      "source_id": "src-3c8664776634f552cbf5fb163d1c7329",
+      "manifest_digest": "sha256:3c8664776634f552cbf5fb163d1c73296e966cd1c021051b404a93c70863f793",
+      "repository_id": "root:21664b699a796de1662ae2198fa70effcd9746e1",
+      "source_kind": "worktree",
+      "original_head": "b7fcd48714df21ff5b66c934c5c2359f72ad5ed6",
+      "index_tree": "62f1e0ba9bcb1c5a40051ef3bbd47704b41a4a6d",
+      "worktree_tree": "10c1932b07a8a2b3c27da10ef780f138ee79c53b",
+      "execution_commit": "ea2e1e27c7196a06766b80828537f4660a3d438f",
+      "base": "main",
+      "merge_base": "b7fcd48714df21ff5b66c934c5c2359f72ad5ed6",
+      "branch": null,
+      "cwd_relative": "",
+      "object_manifest": {
+        "entries": [
+          {
+            "path": ".gitattributes",
+            "mode": 33188,
+            "size": 92,
+            "hash": "e8f554462babab55c46b27ec8254bb2198791455b09e2ef92602176d67af0382"
+          },
+          {
+            "path": ".gitignore",
+            "mode": 33188,
+            "size": 25,
+            "hash": "1a0b509ec302696e4ed6296a53ff4287ea931b19ba5156b385abc687b4f584bb"
+          },
+          {
+            "path": ".gitmodules",
+            "mode": 33188,
+            "size": 119,
+            "hash": "22b70f40555143f38e426676dd1e884570384a5f510ce6c03156a67d0b1b38b2"
+          },
+          {
+            "path": "bin/run0.sh",
+            "mode": 33261,
+            "size": 18,
+            "hash": "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba"
+          },
+          {
+            "path": "bin/run1.sh",
+            "mode": 33261,
+            "size": 18,
+            "hash": "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba"
+          },
+          {
+            "path": "bin/tool0.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "bin/tool1.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "blob0.bin",
+            "mode": 33188,
+            "size": 5,
+            "hash": "62ddecbaeb81614dc2a6fc5d0b911b89c602042dbea8e361d3e176994b2b1e7a"
+          },
+          {
+            "path": "blob1.bin",
+            "mode": 33188,
+            "size": 5,
+            "hash": "64dc64a950dac56b47fd3777279ccd11c798381b5524e8e56ff6096f0766ffa1"
+          },
+          {
+            "path": "dirlink0",
+            "mode": 40960,
+            "size": 4,
+            "hash": "46b42b4229cd7a39c564e780bb665a8bde4fdf722007e8473f167fe53ed4b995"
+          },
+          {
+            "path": "dirlink1",
+            "mode": 40960,
+            "size": 4,
+            "hash": "46b42b4229cd7a39c564e780bb665a8bde4fdf722007e8473f167fe53ed4b995"
+          },
+          {
+            "path": "docs/.gitattributes",
+            "mode": 33188,
+            "size": 17,
+            "hash": "d2eb1a317920a1e2fd04a1b7352ef04bfb1f0b9f4d0594f4dc395a87ce2ccfba"
+          },
+          {
+            "path": "docs/data0.up",
+            "mode": 33188,
+            "size": 8,
+            "hash": "63caf1906ee51c8924190b7cb1ef3b47400558a592d72c0e97e6ea36fe94b70c"
+          },
+          {
+            "path": "docs/data1.up",
+            "mode": 33188,
+            "size": 8,
+            "hash": "16349656edea5c13ec42da1e1601829a33e57c9e6d791aa85a819ff93fb588d6"
+          },
+          {
+            "path": "docs/gone0.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "4b9f2c32577beb1ebc8ab2a1e226faaa9176a81cd4eedbaa22f8a0db919972b5"
+          },
+          {
+            "path": "docs/gone1.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "4b9f2c32577beb1ebc8ab2a1e226faaa9176a81cd4eedbaa22f8a0db919972b5"
+          },
+          {
+            "path": "docs/m0.md",
+            "mode": 33188,
+            "size": 5,
+            "hash": "85c29318166fb042f4d59f07671fcb2fc2e3d535760a6a854c23495c716ff9cc"
+          },
+          {
+            "path": "docs/m1.md",
+            "mode": 33188,
+            "size": 5,
+            "hash": "523dc96e9f2b821f1236c25226f6672c5b50ea6d72efa7ad07a450b8b6a77505"
+          },
+          {
+            "path": "docs/n0.txt",
+            "mode": 33188,
+            "size": 7,
+            "hash": "741e5bccebb4eb356ae6c05609985d2a1e7d1aceef1ff59736d0b9b61cea6c02"
+          },
+          {
+            "path": "docs/same0.up",
+            "mode": 33188,
+            "size": 12,
+            "hash": "bc600fd1c81b32876ffafc3f45f7dc292bd2ce20cf40c9ab1f7429ceb1d6281f"
+          },
+          {
+            "path": "docs/same1.up",
+            "mode": 33188,
+            "size": 12,
+            "hash": "ce8804844c6da31d6478b7a6b7e485c7bfe99658d8e11af243294d9fba9cbb4b"
+          },
+          {
+            "path": "link0",
+            "mode": 40960,
+            "size": 11,
+            "hash": "77ca6fc92fc4cc49e9a9fe270e0762d333af0e0d0c905e964f38184bb0ce0a97"
+          },
+          {
+            "path": "link1",
+            "mode": 40960,
+            "size": 11,
+            "hash": "07319ee8b0a9ce456fc14296d6ec3e070ea4beb152a73aac24b9bb1dbd03061e"
+          },
+          {
+            "path": "ptr0.dat",
+            "mode": 33188,
+            "size": 950,
+            "hash": "3caec47ee284b20108425c8c982609bf609304e154e9186f9b6624cf3296119f"
+          },
+          {
+            "path": "ptr1.dat",
+            "mode": 33188,
+            "size": 950,
+            "hash": "3edf9204c790d1170426cbd4c666773d3bd9ed2bf5768d4aba5bf98ce6296040"
+          },
+          {
+            "path": "smudged0.dat",
+            "mode": 33188,
+            "size": 1150,
+            "hash": "8947ddf92c378005c4b4d914317f2dfbeb1fa7e84984d40b2bb825f1ac6f6aae"
+          },
+          {
+            "path": "smudged1.dat",
+            "mode": 33188,
+            "size": 1150,
+            "hash": "cfd555f03a3624f4ee280da92163df79699433160eac9ab6542162c209ac10dc"
+          },
+          {
+            "path": "src/d0/f0.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "0e3fd3ea689303d1d1447a03c7a4dc054b195b54f93231df0ca617f996cc1436"
+          },
+          {
+            "path": "src/d0/f1.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "001de7a1c028ea4b8eab6f53ce6614a32db5e74245be24967747b1e78de78da7"
+          },
+          {
+            "path": "src/d0/f2.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "6778279d6240f298bd9633c0a1cc56ec8ea796b3874cbd19a6b0ed517e8f4ad9"
+          },
+          {
+            "path": "src/d0/f3.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "657519a07024bfeb7485a8939960a628f2f44e974b8204b641cd982b9f47f0d3"
+          },
+          {
+            "path": "src/d1/f0.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "fd299e752e098940fcef24eb483e42db42dd9c54bcdf558c850d8208bd719870"
+          },
+          {
+            "path": "src/d1/f1.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "a287dabc6684fc51579c3a108a9e7ed07818069715f7fd0a2e3ce46486654a85"
+          },
+          {
+            "path": "src/d1/f2.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "3193f0bc2c617e4d08e18ee143c41f74703e4104588c10c556a292ca28b4a3e3"
+          },
+          {
+            "path": "src/d1/f3.rs",
+            "mode": 33188,
+            "size": 13,
+            "hash": "3e952f964f5ea236b7d94c288383ae2c01d98d1ad46c1c941123d1dd2029aa2f"
+          },
+          {
+            "path": "sub dir/newあ0.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "ace37921d021787938f5c1c09574fd863e7ffc001f3d56fdf5d92332591a37e0"
+          },
+          {
+            "path": "sub dir/newあ1.txt",
+            "mode": 33188,
+            "size": 5,
+            "hash": "ace37921d021787938f5c1c09574fd863e7ffc001f3d56fdf5d92332591a37e0"
+          },
+          {
+            "path": "win0.crlf",
+            "mode": 33188,
+            "size": 10,
+            "hash": "6f4792b265fe72790b344fd3ef5294701d9d087bed9fce815c0f4bbad6d2ed87"
+          },
+          {
+            "path": "win1.crlf",
+            "mode": 33188,
+            "size": 10,
+            "hash": "6f4792b265fe72790b344fd3ef5294701d9d087bed9fce815c0f4bbad6d2ed87"
+          }
+        ],
+        "tree_digest": "sha256:472dd503cc8a799ed4ef290650a1e96e07818a81029e90f54bdb4290f96d90a9",
+        "git_tips": [
+          "ea2e1e27c7196a06766b80828537f4660a3d438f"
+        ]
+      },
+      "submodules": [
+        {
+          "path": "vendor/lib",
+          "revision": "a407a05931e7c50af637531f444c5a28d214e7d9",
+          "source_id": null,
+          "dirty": false
+        },
+        {
+          "path": "vendor/lib2",
+          "revision": "8d7d442bc12278373eff78143ed76d945dcca563",
+          "source_id": null,
+          "dirty": false
+        }
+      ],
+      "lfs": [
+        {
+          "path": "ptr0.dat",
+          "oid": "3caec47ee284b20108425c8c982609bf609304e154e9186f9b6624cf3296119f",
+          "size": 950,
+          "pointer_hash": "068f828d0bb6179d343790771ff6645319a9a2690007ff0986f1ca83a78d84ce"
+        },
+        {
+          "path": "ptr1.dat",
+          "oid": "3edf9204c790d1170426cbd4c666773d3bd9ed2bf5768d4aba5bf98ce6296040",
+          "size": 950,
+          "pointer_hash": "3341ca49dbd15934fd9e5334bb3ccc159d3e06bc218849f1c0fded5871515e30"
+        },
+        {
+          "path": "smudged0.dat",
+          "oid": "8947ddf92c378005c4b4d914317f2dfbeb1fa7e84984d40b2bb825f1ac6f6aae",
+          "size": 1150,
+          "pointer_hash": "8002f4e65620a51ad1cbe1b2241312c8a335ca9d745818606adcba2dc25f49c7"
+        },
+        {
+          "path": "smudged1.dat",
+          "oid": "cfd555f03a3624f4ee280da92163df79699433160eac9ab6542162c209ac10dc",
+          "size": 1150,
+          "pointer_hash": "6df8bd2941c274f37c4c03510a379cfac10a199a842aa9a0bbdf97ee77bd5ccb"
+        }
+      ],
+      "canonical": {
+        "autocrlf": null,
+        "eol": null,
+        "safecrlf": null,
+        "attributes": "",
+        "filters": [
+          {
+            "name": "upper",
+            "clean": "tr a-z A-Z",
+            "smudge": "cat",
+            "process": null,
+            "required": "true"
+          }
+        ]
+      },
+      "secret_files": [
+        {
+          "path": ".env",
+          "hmac": "hmac-sha256:a594916ec6e933ae0e90cd294dd974662ec7885e4f1c5f4a274e0453267194b3"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "hmac": "hmac-sha256:3ea023d55eec34a24377c07a07ce087529fade6a1c981cd57d6203e965ad22d3"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "hmac": "hmac-sha256:e1059a5bc2e67904fe16aea2d64b402a0ffc7d67fbee11f2dd963b04798d4c9b"
+        }
+      ]
+    },
+    "warnings": [
+      "secret_files \"nothing/*\" matches no file"
+    ],
+    "secret_bundle": {
+      "schema_version": 1,
+      "files": [
+        {
+          "path": ".env",
+          "mode": 384,
+          "content_hex": "4150495f544f4b454e3d636f72726563742d686f7273652d626174746572792d737461706c650a"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "mode": 384,
+          "content_hex": "6b657920300a"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "mode": 384,
+          "content_hex": "6b657920310a"
+        }
+      ]
+    }
+  },
+  "refs_after_commit": [
+    "refs/local-ci/heads/8d7d442bc12278373eff78143ed76d945dcca563 8d7d442bc12278373eff78143ed76d945dcca563\nrefs/local-ci/index/src-026c15094adb5ed527a9e5e85f8f1edf bf85164e7f0a3b97e28ba4fc90d67addc2c9a366\nrefs/local-ci/snapshots/src-026c15094adb5ed527a9e5e85f8f1edf 05d9c764e59d9d7031cde15f457d77cdf0e558a7",
+    "refs/local-ci/heads/a407a05931e7c50af637531f444c5a28d214e7d9 a407a05931e7c50af637531f444c5a28d214e7d9\nrefs/local-ci/index/src-4459b9ecfc2b10f0ea18b162dbd60738 8ef892429970c1938d5a147c5326560486aeeec0\nrefs/local-ci/snapshots/src-4459b9ecfc2b10f0ea18b162dbd60738 872a00a711fe7a5818132dd351eba780abbb836d",
+    "refs/local-ci/heads/b7fcd48714df21ff5b66c934c5c2359f72ad5ed6 b7fcd48714df21ff5b66c934c5c2359f72ad5ed6\nrefs/local-ci/index/src-3c8664776634f552cbf5fb163d1c7329 3b4ab821e877ad461c81e524c12a2b59a16c6fe4\nrefs/local-ci/index/src-a45f1de104fa55c330157d2b1207b980 a6d88f313866b72451a09fc375f0619b38aa6ded\nrefs/local-ci/snapshots/src-3c8664776634f552cbf5fb163d1c7329 ea2e1e27c7196a06766b80828537f4660a3d438f\nrefs/local-ci/snapshots/src-a45f1de104fa55c330157d2b1207b980 f572dfd2cdd2fe5f1c685a24c4e2b35173ca7814"
+  ],
+  "directory": {
+    "manifest": {
+      "schema_version": 2,
+      "source_id": "src-51a59a586e05c833951e4d2efa000c77",
+      "manifest_digest": "sha256:51a59a586e05c833951e4d2efa000c77aeec1209a4a05eb840ee25ec6c07fb9d",
+      "repository_id": null,
+      "source_kind": "directory",
+      "original_head": null,
+      "index_tree": null,
+      "worktree_tree": null,
+      "execution_commit": null,
+      "base": null,
+      "merge_base": null,
+      "branch": null,
+      "cwd_relative": "",
+      "object_manifest": {
+        "entries": [
+          {
+            "path": "a0.txt",
+            "mode": 33188,
+            "size": 2,
+            "hash": "87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+          },
+          {
+            "path": "a1.txt",
+            "mode": 33188,
+            "size": 2,
+            "hash": "87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+          },
+          {
+            "path": "dir/b0.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "dir/b1.sh",
+            "mode": 33261,
+            "size": 10,
+            "hash": "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+          },
+          {
+            "path": "l0",
+            "mode": 40960,
+            "size": 6,
+            "hash": "29921be439d3196bcaec2aa08e91b023e42005a9dd32cdc45b4e2655f95104c7"
+          },
+          {
+            "path": "l1",
+            "mode": 40960,
+            "size": 6,
+            "hash": "0cabf19c9677be08ef03145576876f4e0e611d92cb27fef8a61c2eecd4b42c2a"
+          }
+        ],
+        "tree_digest": "sha256:02076caf346af119bb332c7aa4fc0b9db955162a448b6a909a245f4349e53268",
+        "git_tips": []
+      },
+      "submodules": [],
+      "lfs": [],
+      "canonical": {
+        "autocrlf": null,
+        "eol": null,
+        "safecrlf": null,
+        "attributes": "",
+        "filters": []
+      },
+      "secret_files": [
+        {
+          "path": ".env",
+          "hmac": "hmac-sha256:81e345021e590805b511bace6c6d772748985c3aa03e99ab6d82bf1a2bdbd519"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "hmac": "hmac-sha256:1ce00802a7d6d3238f4e63a50fc8e9988e79c7889a5141d262ecf55dca3a60b3"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "hmac": "hmac-sha256:d951614ea4edf227bb6b3e0ad607a80d700c3d493080dcfc251e56471b2ab181"
+        }
+      ]
+    },
+    "warnings": [
+      "secret_files \"nothing/*\" matches no file"
+    ],
+    "secret_bundle": {
+      "schema_version": 1,
+      "files": [
+        {
+          "path": ".env",
+          "mode": 384,
+          "content_hex": "544f4b454e3d310a"
+        },
+        {
+          "path": "secrets/key0.pem",
+          "mode": 384,
+          "content_hex": "6b65790a"
+        },
+        {
+          "path": "secrets/key1.pem",
+          "mode": 384,
+          "content_hex": "6b65790a"
+        }
+      ]
+    }
+  }
+}

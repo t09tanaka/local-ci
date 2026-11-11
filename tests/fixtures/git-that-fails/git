@@ -1,0 +1,54 @@
+#!/bin/sh
+# A git that does not answer one chosen question, for the tests of what a
+# capture does then (tests/capture_git_calls.rs). Every other command line
+# goes to the real git as it is.
+#
+#   GIT_WRAP_REAL   the real git
+#   GIT_WRAP_MATCH  a `case` pattern for the whole command line
+#   GIT_WRAP_STDIN  when set, a `case` pattern for the first line of the
+#                   input as well: only a command that is given such a line
+#                   is not answered
+#   GIT_WRAP_MODE   `fail` (exit 1), `garble` (exit 0 and an answer that is
+#                   not one) or `ambiguous` (what `cat-file --batch-check`
+#                   says of a name that is more than one object)
+#   GIT_WRAP_LOG    every command line that was not answered, one per line
+
+case "$*" in
+$GIT_WRAP_MATCH) ;;
+*) exec "$GIT_WRAP_REAL" "$@" ;;
+esac
+
+first=
+if [ -n "$GIT_WRAP_STDIN" ]; then
+    IFS= read -r first
+    case "$first" in
+    $GIT_WRAP_STDIN) ;;
+    *)
+        {
+            printf '%s\n' "$first"
+            cat
+        } | "$GIT_WRAP_REAL" "$@"
+        exit $?
+        ;;
+    esac
+fi
+
+printf '%s\n' "$*" >>"$GIT_WRAP_LOG"
+case "$GIT_WRAP_MODE" in
+garble)
+    cat >/dev/null
+    printf 'not what was asked\n'
+    ;;
+ambiguous)
+    if [ -n "$first" ]; then
+        printf '%s ambiguous\n' "$first"
+    fi
+    while IFS= read -r line; do
+        printf '%s ambiguous\n' "$line"
+    done
+    ;;
+*)
+    cat >/dev/null
+    exit 1
+    ;;
+esac
