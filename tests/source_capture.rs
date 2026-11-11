@@ -5,10 +5,10 @@
 
 mod common;
 use local_ci::source::{
-    capture_directory, capture_source, export_objects, import_objects, materialize_secrets,
-    materialize_source, publishable, remove_imported_refs, seal_manifest, secret_digest,
-    CaptureOptions, ObjectStore, SecretBundle, SecretSpec, SourceError, SourceInfo, SourceKind,
-    Stage,
+    capture_directory, capture_source, export_objects, export_with_basis, import_objects,
+    import_objects_for, materialize_secrets, materialize_source, publishable, remove_imported_refs,
+    seal_manifest, secret_digest, CaptureOptions, ObjectStore, SecretBundle, SecretSpec,
+    SourceError, SourceInfo, SourceKind, Stage,
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
@@ -2368,8 +2368,8 @@ fn skip_worktree_and_assume_unchanged_files_are_taken_as_they_are_on_disk() {
     );
 }
 
-#[test]
-fn a_dirty_submodule_inside_a_dirty_submodule_comes_along() {
+/// A repository whose submodule has a submodule of its own, both edited.
+fn with_nested_dirty() -> Fixture {
     let f = with_submodule();
     let tmp = f.dir.parent().unwrap().to_path_buf();
     // the library gets a submodule of its own
@@ -2395,6 +2395,13 @@ fn a_dirty_submodule_inside_a_dirty_submodule_comes_along() {
     git(&f.dir, &["commit", "-qm", "bump lib"]);
     std::fs::write(lib.join("deep/inner/i.txt"), "inner, edited\n").unwrap();
 
+    f
+}
+
+#[test]
+fn a_dirty_submodule_inside_a_dirty_submodule_comes_along() {
+    let f = with_nested_dirty();
+    let tmp = f.dir.parent().unwrap().to_path_buf();
     let c = f.ctx();
     let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
     assert!(m.submodules[0].dirty);
@@ -3645,4 +3652,149 @@ fn a_secret_file_is_not_written_through_a_symlink_the_commit_made() {
     let bundle = SecretBundle::new(vec![(path, 0o600, b"S=1\n".to_vec())]);
     assert!(materialize_secrets(&with_secret, &bundle, KEY, &dest).is_err());
     assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a\n");
+}
+
+// ---- a bundle cut at what the receiver has ----------------------------------
+
+fn bundle_head(bundle: &Path) -> String {
+    let b = std::fs::read(bundle).unwrap();
+    let n = b.windows(2).position(|w| w == b"\n\n").unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..n]).into_owned()
+}
+
+#[test]
+fn a_bundle_with_a_basis_is_thin_and_without_one_holds_the_whole_history() {
+    let f = fixture();
+    let c = f.ctx();
+    let base = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    for n in 0..2 {
+        std::fs::write(f.dir.join("a.txt"), format!("a{n}\n")).unwrap();
+        git(&f.dir, &["commit", "-qam", &format!("c{n}")]);
+    }
+    std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+
+    let thin = export_with_basis(&c, &store, &m, std::slice::from_ref(&base)).unwrap();
+    let full = export_with_basis(&c, &store, &m, &[]).unwrap();
+    assert_ne!(thin, full);
+    assert!(bundle_head(&thin).contains(&format!("-{base}")));
+    assert!(!bundle_head(&full).lines().any(|l| l.starts_with('-')));
+    assert!(std::fs::metadata(&thin).unwrap().len() < std::fs::metadata(&full).unwrap().len());
+    // a have this store does not know is no exclusion at all
+    let unknown = export_with_basis(&c, &store, &m, &["0".repeat(40)]).unwrap();
+    assert!(!bundle_head(&unknown).lines().any(|l| l.starts_with('-')));
+
+    let exec = m.execution_commit.clone().unwrap();
+    // the thin one fits a clone that has the base; the full one an empty,
+    // origin-less repository
+    let worker = clone_of(&f, "worker");
+    assert_eq!(import_objects(&c, &worker, &thin, &m).unwrap(), exec);
+    let empty = f.home.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    git(&empty, &["init", "-q"]);
+    assert!(import_objects(&c, &empty, &thin, &m).is_err());
+    assert_eq!(import_objects(&c, &empty, &full, &m).unwrap(), exec);
+    assert!(has(&empty, &base));
+}
+
+#[test]
+fn a_have_that_is_not_a_full_commit_id_is_refused_before_git_runs() {
+    let f = fixture();
+    let c = f.ctx();
+    std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let good = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    for bad in [
+        "--output=/tmp/x".to_string(),
+        "HEAD".to_string(),
+        good[..39].to_string(),
+        good.to_uppercase(),
+        format!("{good}\n^{good}"),
+        String::new(),
+    ] {
+        let have = [good.clone(), bad.clone()];
+        assert!(export_with_basis(&c, &store, &m, &have).is_err(), "{bad:?}");
+    }
+    assert!(!f.home.join("sources/bundles").exists() || published_bundles(&f.home).is_empty());
+}
+
+fn published_bundles(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("sources/bundles"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn a_ref_below_a_have_stays_in_the_bundle() {
+    let f = with_submodule();
+    let c = f.ctx();
+    std::fs::write(f.dir.join("vendor/lib/lib.txt"), "lib, edited\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let sub_id = m.submodules[0].source_id.clone().unwrap();
+    let sub_m = store.load_manifest(&sub_id).unwrap().unwrap();
+    let tip = sub_m.execution_commit.clone().unwrap();
+    // the receiver already has the snapshot of the submodule: Git alone would
+    // leave its ref out of the bundle
+    let bundle = export_with_basis(&c, &store, &m, std::slice::from_ref(&tip)).unwrap();
+    let heads = git_out(&f.dir, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+    assert!(
+        heads.contains(&format!("refs/local-ci/snapshots/{sub_id}")),
+        "{heads}"
+    );
+    assert!(heads.contains(&format!("refs/local-ci/snapshots/{}", m.source_id)));
+    // the tip itself is in the bundle, not only below it
+    assert!(!bundle_head(&bundle).contains(&format!("-{tip}")));
+}
+
+#[test]
+fn a_two_level_dirty_submodule_reaches_an_empty_repository_from_the_bundle_alone() {
+    let f = with_nested_dirty();
+    let c = f.ctx();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let lib_id = m.submodules[0].source_id.clone().unwrap();
+    let lib_m = store.load_manifest(&lib_id).unwrap().unwrap();
+    let inner_id = lib_m.submodules[0].source_id.clone().unwrap();
+    let inner_m = store.load_manifest(&inner_id).unwrap().unwrap();
+    let bundle = export_with_basis(&c, &store, &m, &[]).unwrap();
+
+    // the receiving host: its own home (no store), a repository with no origin
+    let other_home = f.home.join("receiver");
+    let c2 = ctx(&other_home);
+    let mk = |name: &str| {
+        let d = f.home.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        git(&d, &["init", "-q"]);
+        d
+    };
+    // without the ids of the nested captures their refs are not fetched (the
+    // objects may arrive with the pack, but nothing names them)
+    let r0 = mk("r0");
+    import_objects(&c2, &r0, &bundle, &m).unwrap();
+    let inner_ref = format!("refs/local-ci/snapshots/{inner_id}");
+    let refs0 = git_out(&r0, &["for-each-ref", "--format=%(refname)"]);
+    assert!(!refs0.contains(&inner_ref), "{refs0}");
+
+    let r1 = mk("r1");
+    let ids = [lib_id.clone(), inner_id.clone()];
+    let exec = import_objects_for(&c2, &r1, &bundle, &m, &ids).unwrap();
+    assert_eq!(Some(exec.clone()), m.execution_commit);
+    assert!(git_out(&r1, &["remote"]).is_empty());
+    assert_eq!(
+        git_out(&r1, &["rev-parse", &inner_ref]),
+        inner_m.execution_commit.clone().unwrap()
+    );
+    for sha in [
+        lib_m.execution_commit.clone().unwrap(),
+        inner_m.execution_commit.clone().unwrap(),
+    ] {
+        assert!(has(&r1, &format!("{sha}^{{commit}}")), "{sha}");
+    }
+    // a name that is not a source id never reaches a ref name
+    let r2 = mk("r2");
+    assert!(import_objects_for(&c2, &r2, &bundle, &m, &["../x".to_string()]).is_err());
 }

@@ -155,6 +155,89 @@ pub fn export_objects(ctx: &ExecContext, m: &SourceManifest) -> Result<PathBuf> 
 }
 
 pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -> Result<PathBuf> {
+    export_impl(ctx, store, m, None)
+}
+
+/// Like [`export_from`], but cut at the commits the receiving host says it
+/// has (`have`) instead of at the merge base with origin: the bundle holds
+/// what is reachable from the refs of `m` and not from the entries of `have`
+/// that this store knows. An empty `have` (or one this store knows nothing
+/// of) gives the whole history of the execution commit. Every entry must be
+/// a 40-digit lowercase hex commit id, or the call is refused before Git runs.
+///
+/// A ref of the bundle (the snapshot of an unchanged dirty submodule, say)
+/// whose tip is reachable from an entry of `have` would be dropped by Git.
+/// Then that entry is not used and the parents of the tip are excluded
+/// instead, so the ref stays in the bundle.
+///
+/// The bundle's name depends on `have`, so exports with different bases of
+/// one source do not replace each other.
+pub fn export_with_basis(
+    ctx: &ExecContext,
+    store: &ObjectStore,
+    m: &SourceManifest,
+    have: &[String],
+) -> Result<PathBuf> {
+    if let Some(h) = have.iter().find(|h| !is_hex40(h)) {
+        bail!("not a commit id: {h:?}");
+    }
+    export_impl(ctx, store, m, Some(have))
+}
+
+/// The `^` arguments of a bundle made over `refs` with the basis `have`.
+fn basis_exclusions(
+    ctx: &ExecContext,
+    dir: &Path,
+    refs: &[String],
+    have: &[String],
+) -> Result<Vec<String>> {
+    let mut tips = vec![];
+    for r in refs {
+        let o = pg(ctx, dir, &["rev-parse", "--verify", r], &[], None)?;
+        tips.push(String::from_utf8_lossy(&o).trim().to_string());
+    }
+    let mut out: Vec<String> = vec![];
+    let mut below: Vec<&String> = vec![];
+    for h in have {
+        let known = pg(
+            ctx,
+            dir,
+            &["cat-file", "-e", &format!("{h}^{{commit}}")],
+            &[],
+            None,
+        )
+        .is_ok();
+        if !known {
+            continue;
+        }
+        let covers: Vec<&String> = tips
+            .iter()
+            .filter(|t| pg(ctx, dir, &["merge-base", "--is-ancestor", t, h], &[], None).is_ok())
+            .collect();
+        if covers.is_empty() {
+            out.push(format!("^{h}"));
+        } else {
+            below.extend(covers);
+        }
+    }
+    below.sort();
+    below.dedup();
+    for t in below {
+        let o = pg(ctx, dir, &["rev-list", "--parents", "-n1", t], &[], None)?;
+        let line = String::from_utf8_lossy(&o).into_owned();
+        out.extend(line.split_whitespace().skip(1).map(|p| format!("^{p}")));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn export_impl(
+    ctx: &ExecContext,
+    store: &ObjectStore,
+    m: &SourceManifest,
+    have: Option<&[String]>,
+) -> Result<PathBuf> {
     check_ids(m)?;
     let Some(commit) = &m.execution_commit else {
         bail!("{} has no Git objects ({:?})", m.source_id, m.source_kind);
@@ -201,7 +284,19 @@ pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -
     }
     let out_dir = store.root().join("bundles");
     std::fs::create_dir_all(&out_dir)?;
-    let dest = out_dir.join(format!("{}.bundle", m.source_id));
+    let name = match have {
+        None => format!("{}.bundle", m.source_id),
+        Some(h) => {
+            use sha2::{Digest, Sha256};
+            let mut sorted: Vec<&str> = h.iter().map(String::as_str).collect();
+            sorted.sort();
+            sorted.dedup();
+            let d = Sha256::digest(sorted.join("\n"));
+            let hex: String = d.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            format!("{}-{hex}.bundle", m.source_id)
+        }
+    };
+    let dest = out_dir.join(name);
     let tmp = super::store::tmp_name(&out_dir, "bundle");
     let mut args: Vec<String> = vec![
         "bundle".into(),
@@ -209,15 +304,40 @@ pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -
         "-q".into(),
         tmp.to_string_lossy().into_owned(),
     ];
-    args.extend(refs);
-    if let Some(mb) = &m.merge_base {
-        args.push(format!("^{mb}"));
+    args.extend(refs.iter().cloned());
+    match have {
+        None => {
+            if let Some(mb) = &m.merge_base {
+                args.push(format!("^{mb}"));
+            }
+        }
+        Some(h) => args.extend(basis_exclusions(ctx, &dir, &refs, h)?),
     }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let res = pg(ctx, &dir, &refs, &[], None);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let res = pg(ctx, &dir, &argv, &[], None);
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("cannot bundle {commit}"));
+    }
+    if have.is_some() {
+        // Git leaves out a ref its exclusions cover; a bundle that lacks one
+        // is never handed on
+        let heads = pg(
+            ctx,
+            &dir,
+            &["bundle", "list-heads", &tmp.to_string_lossy()],
+            &[],
+            None,
+        )
+        .map(|o| String::from_utf8_lossy(&o).into_owned())
+        .unwrap_or_default();
+        let all = refs
+            .iter()
+            .all(|r| heads.lines().any(|l| l.ends_with(&format!(" {r}"))));
+        if !all {
+            let _ = std::fs::remove_file(&tmp);
+            bail!("the bundle of {} lacks a ref it needs", m.source_id);
+        }
     }
     std::fs::rename(&tmp, &dest)?;
     Ok(dest)
@@ -232,6 +352,21 @@ pub fn import_objects(
     clone_dir: &Path,
     bundle: &Path,
     m: &SourceManifest,
+) -> Result<String> {
+    import_objects_for(ctx, clone_dir, bundle, m, &[])
+}
+
+/// Like [`import_objects`], and also fetches the snapshot ref of each source
+/// id in `ids`: the dirty submodules below `m` that this host has no manifest
+/// of (a receiving host that has no store yet). Each id is validated as a
+/// source id before it reaches a ref name; ids already known from `m` and the
+/// store are not repeated.
+pub fn import_objects_for(
+    ctx: &ExecContext,
+    clone_dir: &Path,
+    bundle: &Path,
+    m: &SourceManifest,
+    extra: &[String],
 ) -> Result<String> {
     // a manifest nobody has verified is not taken for what it says
     super::capture::check_digest(m)?;
@@ -255,6 +390,12 @@ pub fn import_objects(
     let mut refspecs: Vec<String> = vec![];
     let mut ids = vec![m.source_id.clone()];
     ids.extend(dirty_submodule_ids(&m.submodules, store.as_ref())?);
+    for id in extra {
+        check_source_id(id)?;
+        ids.push(id.clone());
+    }
+    ids.sort();
+    ids.dedup();
     for id in &ids {
         let r = snapshot_ref(id);
         refspecs.push(format!("+{r}:{r}"));

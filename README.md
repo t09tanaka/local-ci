@@ -408,6 +408,12 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
   content. A worker without the program of a filter the capture ran gets
   `SourceError::FilterMissing` and can be left out; a workspace that Git still
   sees as changed is `SourceError::WorkspaceNotClean`.
+- `source::export_objects` / `export_from` bundle the capture down to the
+  merge base with origin; `source::export_with_basis` cuts it at commits the
+  receiving host says it has instead (an empty list gives the whole history,
+  for a host with no origin). `source::import_objects` brings a bundle into a
+  clone; `import_objects_for` also takes the source ids of nested dirty
+  submodules when the receiving host has no store to learn them from.
 - Not supported yet: shallow clones (`git fetch --unshallow` first) and
   repositories that use SHA-256 object names. Both are refused with an
   explicit error.

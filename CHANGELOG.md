@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-11
+
+- `source::export_with_basis(ctx, store, m, have)` writes the bundle of a
+  capture cut at the commits the receiving host has (`have`, 40-digit hex
+  ids, anything else is refused before Git runs) instead of at the merge base
+  with origin; an empty `have` gives the whole history of the execution
+  commit, for a host with no origin. A ref whose tip lies below a `have`
+  (an unchanged dirty submodule's snapshot) is kept: the parents of its tip
+  are excluded instead. Dirty submodules inside dirty submodules are in the
+  bundle as with `export_from`, which is unchanged. The bundle's file name
+  depends on `have`.
+- `source::import_objects_for(ctx, clone_dir, bundle, m, ids)` is
+  `import_objects` that also fetches the snapshot ref of each given source id,
+  for nested dirty submodules whose manifests the receiving host does not have.
+  `import_objects` is unchanged.
+
 ## [0.10.1] - 2026-11-11
 
 - `source::capture_source` starts about half as many git processes, and the
