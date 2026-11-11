@@ -4492,6 +4492,25 @@ fn a_source_that_was_imported_is_taken_a_second_time() {
     assert_eq!(import_objects(&c2, &r, &real, &m).unwrap(), exec);
 }
 
+#[test]
+fn a_fetch_that_cannot_write_one_ref_writes_none() {
+    let (f, m, real) = dirty_capture();
+    let c2 = ctx(&f.home.join("receiver"));
+    for (way, import) in import_ways() {
+        let r = empty_repo(&f.home, &format!("r-{way}"));
+        // the index ref is locked: the snapshot ref could be written
+        let dir = r.join(".git/refs/local-ci/index");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}.lock", m.source_id)), "").unwrap();
+        let e = import(&c2, &r, &real, &m, &[]);
+        assert!(
+            e.contains("cannot fetch the refs of the bundle"),
+            "{way}: {e}"
+        );
+        assert!(ref_names(&r).is_empty(), "{way}");
+    }
+}
+
 /// `m` with another worktree tree, sealed, and a bundle that has the refs of
 /// that manifest at the commits of `real`: it passes everything that is
 /// looked at before the fetch.

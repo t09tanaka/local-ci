@@ -485,7 +485,11 @@ enum Nested<'a> {
 /// The fetch is `git fetch --atomic`, so Git 2.31 or later is needed. Two
 /// imports of one source into one clone at once are not kept apart by a lock
 /// of their own: one whose fetch loses a ref's lock to the other fails, and
-/// writes and removes nothing.
+/// writes and removes nothing. Two sources that share a dirty submodule
+/// share its snapshot ref: if one import made that ref and is then refused,
+/// it removes it, also when an import of the other source has meanwhile
+/// found it there. A caller that imports into one clone from several
+/// threads or processes keeps the imports apart itself.
 ///
 /// The dirty submodules below the ones `m` names are known only as far as
 /// this host's store has their manifests; a host that has no store uses
@@ -778,20 +782,32 @@ fn import_impl(
     fetch.extend(refspecs.iter().map(String::as_str));
     git_run(ctx, &pre, &fetch, &[], None).context("cannot fetch the refs of the bundle")?;
     let checked = check_imported(ctx, &pre, m, commit, &nested, &known, &plan);
-    if checked.is_err() {
-        // what was refused is not left behind: the refs this call made go
-        // (each only while it is still what this call set it to)
-        for p in plan.iter().filter(|p| !p.was_here) {
-            let _ = git_run(
-                ctx,
-                &pre,
-                &["update-ref", "-d", &p.name, &p.commit],
-                &[],
-                None,
-            );
+    let Err(refused) = checked else {
+        return checked;
+    };
+    // what was refused is not left behind: the refs this call made go (each
+    // only while it is still what this call set it to)
+    let mut left = vec![];
+    for p in plan.iter().filter(|p| !p.was_here) {
+        let gone = git_run(
+            ctx,
+            &pre,
+            &["update-ref", "-d", &p.name, &p.commit],
+            &[],
+            None,
+        );
+        if gone.is_err() {
+            left.push(p.name.as_str());
         }
     }
-    checked
+    if left.is_empty() {
+        Err(refused)
+    } else {
+        Err(refused.context(format!(
+            "the import was refused and these refs could not be removed: {}",
+            left.join(", ")
+        )))
+    }
 }
 
 /// What an import looks at once the fetch is done. Returns the execution
