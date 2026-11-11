@@ -4217,6 +4217,46 @@ fn a_nested_ref_that_is_not_the_commit_or_the_tree_of_its_manifest_is_refused() 
     // tree that was refused
     let r3 = empty_repo(&f.home, "r3");
     import_objects_for(&c2, &r3, &forged, &m, &nested).unwrap();
+
+    // manifests that hold together and name a commit with the right tree for
+    // the submodule, but not the commit the gitlink names
+    let other = git_out(
+        &s2,
+        &[
+            "commit-tree",
+            &format!("{sub_exec}^{{tree}}"),
+            "-m",
+            "another commit",
+        ],
+    );
+    let mut elsewhere = sub_m.clone();
+    elsewhere.execution_commit = Some(other.clone());
+    let elsewhere = seal_manifest(elsewhere);
+    let mut top = m.clone();
+    top.submodules[0].source_id = Some(elsewhere.source_id.clone());
+    let top = seal_manifest(top);
+    for (r, at) in [
+        (snapshot_ref_of(&top.source_id), &exec),
+        (snapshot_ref_of(&elsewhere.source_id), &other),
+        (format!("refs/local-ci/index/{}", top.source_id), &index),
+    ] {
+        git(&s2, &["update-ref", &r, at]);
+    }
+    let forged = bundle_all(&s2, "forged2.bundle");
+    let r4 = empty_repo(&f.home, "r4");
+    let e = err_text(import_objects_for(
+        &c2,
+        &r4,
+        &forged,
+        &top,
+        std::slice::from_ref(&elsewhere),
+    ));
+    assert!(
+        e.contains(&format!(
+            "the gitlink of submodule vendor/lib is {sub_exec}, its manifest says {other}"
+        )),
+        "{e}"
+    );
 }
 
 #[test]
