@@ -411,9 +411,15 @@ symlinks, submodules, LFS payloads) in a private store, and describes it in a
 - `source::export_objects` / `export_from` bundle the capture down to the
   merge base with origin; `source::export_with_basis` cuts it at commits the
   receiving host says it has instead (an empty list gives the whole history,
-  for a host with no origin). `source::import_objects` brings a bundle into a
-  clone; `import_objects_for` also takes the source ids of nested dirty
-  submodules when the receiving host has no store to learn them from.
+  for a host with no origin; at most `source::MAX_HAVE` = 256 commits). Each
+  distinct list leaves a bundle file of its own in `bundles/` of the store,
+  and removing the ones no longer needed is the caller's job.
+  `source::import_objects` brings a bundle into a clone;
+  `import_objects_for(ctx, clone_dir, bundle, m, nested)` is for a receiving
+  host with no store: `nested` holds the manifests of the dirty submodules
+  below `m` at every depth (at most `source::MAX_NESTED` = 256), exactly the
+  ones that are reached from `m`, and each one's snapshot ref, tree and
+  gitlinks are checked against its manifest.
 - Not supported yet: shallow clones (`git fetch --unshallow` first) and
   repositories that use SHA-256 object names. Both are refused with an
   explicit error.

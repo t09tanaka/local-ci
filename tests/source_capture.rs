@@ -3662,6 +3662,50 @@ fn bundle_head(bundle: &Path) -> String {
     String::from_utf8_lossy(&b[..n]).into_owned()
 }
 
+/// The commits a bundle needs in the repository it is brought into.
+fn prerequisites(bundle: &Path) -> Vec<String> {
+    bundle_head(bundle)
+        .lines()
+        .filter_map(|l| l.strip_prefix('-'))
+        .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+        .collect()
+}
+
+fn snapshot_ref_of(id: &str) -> String {
+    format!("refs/local-ci/snapshots/{id}")
+}
+
+/// An empty repository with no origin, below `home`.
+fn empty_repo(home: &Path, name: &str) -> PathBuf {
+    let d = home.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    git(&d, &["init", "-q"]);
+    d
+}
+
+/// The private repository of the store of `home` that holds the snapshot of
+/// `id`.
+fn holder_of(home: &Path, id: &str) -> PathBuf {
+    std::fs::read_dir(home.join("sources/git"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|d| {
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(d)
+                .args(["rev-parse", "--verify", "-q", &snapshot_ref_of(id)])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        })
+        .unwrap()
+}
+
+fn err_text<T: std::fmt::Debug>(r: anyhow::Result<T>) -> String {
+    format!("{:#}", r.unwrap_err())
+}
+
 #[test]
 fn a_bundle_with_a_basis_is_thin_and_without_one_holds_the_whole_history() {
     let f = fixture();
@@ -3699,6 +3743,45 @@ fn a_bundle_with_a_basis_is_thin_and_without_one_holds_the_whole_history() {
 }
 
 #[test]
+fn several_haves_cut_the_bundle_at_the_nearest_and_their_order_does_not_name_another_file() {
+    let f = fixture();
+    let c = f.ctx();
+    let base = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    let mut later = vec![];
+    for n in 0..2 {
+        std::fs::write(f.dir.join("a.txt"), format!("a{n}\n")).unwrap();
+        git(&f.dir, &["commit", "-qam", &format!("c{n}")]);
+        later.push(git_out(&f.dir, &["rev-parse", "HEAD"]));
+    }
+    std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let exec = m.execution_commit.clone().unwrap();
+    let (c0, unknown) = (later[0].clone(), "0".repeat(40));
+
+    // the base, a commit above it and one this store does not know
+    let have = [base.clone(), c0.clone(), unknown.clone()];
+    let bundle = export_with_basis(&c, &store, &m, &have).unwrap();
+    assert_eq!(prerequisites(&bundle), std::slice::from_ref(&c0));
+    let worker = clone_of(&f, "worker");
+    assert_eq!(import_objects(&c, &worker, &bundle, &m).unwrap(), exec);
+
+    // the name is that of the set: neither the order nor an entry given
+    // twice makes another file
+    let reordered = [unknown.clone(), c0.clone(), base.clone()];
+    assert_eq!(
+        export_with_basis(&c, &store, &m, &reordered).unwrap(),
+        bundle
+    );
+    let twice = [base.clone(), c0.clone(), base.clone(), unknown, c0.clone()];
+    assert_eq!(export_with_basis(&c, &store, &m, &twice).unwrap(), bundle);
+    assert_eq!(prerequisites(&bundle), std::slice::from_ref(&c0));
+    // another set, another file
+    let other = export_with_basis(&c, &store, &m, &[base, c0][..1]).unwrap();
+    assert_ne!(other, bundle);
+}
+
+#[test]
 fn a_have_that_is_not_a_full_commit_id_is_refused_before_git_runs() {
     let f = fixture();
     let c = f.ctx();
@@ -3714,8 +3797,16 @@ fn a_have_that_is_not_a_full_commit_id_is_refused_before_git_runs() {
         format!("{good}\n^{good}"),
         String::new(),
     ] {
-        let have = [good.clone(), bad.clone()];
-        assert!(export_with_basis(&c, &store, &m, &have).is_err(), "{bad:?}");
+        // wherever it stands in the list: a valid entry before or after it
+        // does not let it through
+        for have in [
+            vec![good.clone(), bad.clone()],
+            vec![bad.clone(), good.clone()],
+            vec![bad.clone()],
+        ] {
+            let e = err_text(export_with_basis(&c, &store, &m, &have));
+            assert_eq!(e, format!("not a commit id: {bad:?}"), "{have:?}");
+        }
     }
     assert!(!f.home.join("sources/bundles").exists() || published_bundles(&f.home).is_empty());
 }
@@ -3728,7 +3819,55 @@ fn published_bundles(home: &Path) -> Vec<String> {
 }
 
 #[test]
-fn a_ref_below_a_have_stays_in_the_bundle() {
+fn the_caps_on_have_and_on_nested_are_256_and_one_more_is_refused() {
+    assert_eq!(local_ci::source::MAX_HAVE, 256);
+    assert_eq!(local_ci::source::MAX_NESTED, 256);
+    let f = fixture();
+    let c = f.ctx();
+    std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+
+    let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("{i:040x}")).collect() };
+    let e = err_text(export_with_basis(&c, &store, &m, &ids(257)));
+    assert_eq!(e, "too many commits in have: 257 (at most 256)");
+    assert!(!f.home.join("sources/bundles").exists());
+    // an entry given twice still counts toward the cap
+    let mut repeated = ids(1);
+    repeated.resize(257, repeated[0].clone());
+    let e = err_text(export_with_basis(&c, &store, &m, &repeated));
+    assert_eq!(e, "too many commits in have: 257 (at most 256)");
+    let bundle = export_with_basis(&c, &store, &m, &ids(256)).unwrap();
+
+    let r = empty_repo(&f.home, "r");
+    let e = err_text(import_objects_for(
+        &c,
+        &r,
+        &bundle,
+        &m,
+        &vec![m.clone(); 257],
+    ));
+    assert_eq!(e, "too many nested manifests: 257 (at most 256)");
+    // 256 pass the cap (and are refused for what they are: `m` has no
+    // submodule)
+    let e = err_text(import_objects_for(
+        &c,
+        &r,
+        &bundle,
+        &m,
+        &vec![m.clone(); 256],
+    ));
+    assert!(e.contains("is not of a dirty submodule"), "{e}");
+    assert!(git_out(&r, &["for-each-ref"]).is_empty());
+}
+
+/// `with_submodule`, the library edited, captured: the fixture, the manifest
+/// of the repository and that of the library.
+fn dirty_submodule_capture() -> (
+    Fixture,
+    local_ci::source::SourceManifest,
+    local_ci::source::SourceManifest,
+) {
     let f = with_submodule();
     let c = f.ctx();
     std::fs::write(f.dir.join("vendor/lib/lib.txt"), "lib, edited\n").unwrap();
@@ -3736,18 +3875,139 @@ fn a_ref_below_a_have_stays_in_the_bundle() {
     let store = ObjectStore::open(f.home.join("sources")).unwrap();
     let sub_id = m.submodules[0].source_id.clone().unwrap();
     let sub_m = store.load_manifest(&sub_id).unwrap().unwrap();
+    (f, m, sub_m)
+}
+
+#[test]
+fn a_ref_below_a_have_stays_in_the_bundle_and_the_bundle_is_taken() {
+    let (f, m, sub_m) = dirty_submodule_capture();
+    let c = f.ctx();
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let sub_id = sub_m.source_id.clone();
     let tip = sub_m.execution_commit.clone().unwrap();
+    let lib_head = git_out(&f.dir.join("vendor/lib"), &["rev-parse", "HEAD"]);
     // the receiver already has the snapshot of the submodule: Git alone would
     // leave its ref out of the bundle
     let bundle = export_with_basis(&c, &store, &m, std::slice::from_ref(&tip)).unwrap();
     let heads = git_out(&f.dir, &["bundle", "list-heads", bundle.to_str().unwrap()]);
-    assert!(
-        heads.contains(&format!("refs/local-ci/snapshots/{sub_id}")),
-        "{heads}"
+    assert!(heads.contains(&snapshot_ref_of(&sub_id)), "{heads}");
+    assert!(heads.contains(&snapshot_ref_of(&m.source_id)));
+    // the tip itself is in the bundle, not only below it: what the bundle
+    // needs is the commit under the tip
+    assert_eq!(prerequisites(&bundle), std::slice::from_ref(&lib_head));
+
+    // a receiver (no store, no origin) that has the commit under the tip
+    // takes the bundle, the submodule's snapshot ref included
+    let c2 = ctx(&f.home.join("receiver"));
+    let r = empty_repo(&f.home, "r");
+    let nested = [sub_m.clone()];
+    assert!(import_objects_for(&c2, &r, &bundle, &m, &nested).is_err());
+    let lib = f.dir.join("vendor/lib");
+    git(&r, &["fetch", "-q", lib.to_str().unwrap(), "HEAD"]);
+    let exec = import_objects_for(&c2, &r, &bundle, &m, &nested).unwrap();
+    assert_eq!(Some(exec), m.execution_commit);
+    assert_eq!(git_out(&r, &["rev-parse", &snapshot_ref_of(&sub_id)]), tip);
+    // and so does one that has the tip itself (what its have said)
+    let r2 = empty_repo(&f.home, "r2");
+    let full = export_with_basis(&c, &store, &m, &[]).unwrap();
+    import_objects_for(&c2, &r2, &full, &m, &nested).unwrap();
+    git(&r2, &["update-ref", "-d", &snapshot_ref_of(&m.source_id)]);
+    import_objects_for(&c2, &r2, &bundle, &m, &nested).unwrap();
+}
+
+#[test]
+fn a_have_above_the_snapshot_cuts_the_bundle_under_the_snapshot() {
+    let f = fixture();
+    let c = f.ctx();
+    let head = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let exec = m.execution_commit.clone().unwrap();
+    // a commit on top of the snapshot, known to the exporting host
+    let private = holder_of(&f.home, &m.source_id);
+    let above = git_out(
+        &f.home,
+        &[
+            "--git-dir",
+            private.to_str().unwrap(),
+            "commit-tree",
+            &format!("{exec}^{{tree}}"),
+            "-p",
+            &exec,
+            "-m",
+            "above",
+        ],
     );
-    assert!(heads.contains(&format!("refs/local-ci/snapshots/{}", m.source_id)));
-    // the tip itself is in the bundle, not only below it
-    assert!(!bundle_head(&bundle).contains(&format!("-{tip}")));
+    let bundle = export_with_basis(&c, &store, &m, std::slice::from_ref(&above)).unwrap();
+    let heads = git_out(&f.dir, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+    assert!(heads.contains(&format!("{exec} {}", snapshot_ref_of(&m.source_id))));
+    assert_eq!(prerequisites(&bundle), [head]);
+    let worker = clone_of(&f, "worker");
+    assert_eq!(import_objects(&c, &worker, &bundle, &m).unwrap(), exec);
+    assert!(!has(&worker, &above));
+}
+
+#[test]
+fn a_ref_that_the_parents_of_a_covered_tip_would_drop_gets_the_whole_history_instead() {
+    let (f, m1, sub_m) = dirty_submodule_capture();
+    let c = f.ctx();
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let sub_ref = snapshot_ref_of(&sub_m.source_id);
+    let sub_tip = sub_m.execution_commit.clone().unwrap();
+    // the history of the repository takes the snapshot of the library in (a
+    // merge with the tree unchanged), so the library's ref lies below the
+    // parent of the repository's own snapshot
+    let first = export_with_basis(&c, &store, &m1, &[]).unwrap();
+    git(
+        &f.dir,
+        &[
+            "fetch",
+            "-q",
+            first.to_str().unwrap(),
+            &format!("{sub_ref}:refs/tmp/lib"),
+        ],
+    );
+    let merged = git_out(
+        &f.dir,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-p",
+            &sub_tip,
+            "-m",
+            "takes the library in",
+        ],
+    );
+    git(&f.dir, &["update-ref", "HEAD", &merged]);
+    let m = capture_source(&c, &f.dir, &opts()).unwrap().manifest;
+    assert_eq!(
+        m.submodules[0].source_id.as_deref(),
+        Some(sub_m.source_id.as_str())
+    );
+    let exec = m.execution_commit.clone().unwrap();
+    assert_eq!(git_out(&f.dir, &["rev-parse", "HEAD"]), merged);
+
+    // the receiver says it has the snapshot: both tips are covered, and the
+    // parent of the one (the merge) is above the other
+    let bundle = export_with_basis(&c, &store, &m, std::slice::from_ref(&exec)).unwrap();
+    let heads = git_out(&f.dir, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+    assert!(heads.contains(&format!("{sub_tip} {sub_ref}")), "{heads}");
+    assert!(heads.contains(&format!("{exec} {}", snapshot_ref_of(&m.source_id))));
+    // written again with no basis: nothing is asked of the receiver
+    assert!(
+        prerequisites(&bundle).is_empty(),
+        "{}",
+        bundle_head(&bundle)
+    );
+    let c2 = ctx(&f.home.join("receiver"));
+    let r = empty_repo(&f.home, "r");
+    assert_eq!(
+        import_objects_for(&c2, &r, &bundle, &m, std::slice::from_ref(&sub_m)).unwrap(),
+        exec
+    );
 }
 
 #[test]
@@ -3760,41 +4020,238 @@ fn a_two_level_dirty_submodule_reaches_an_empty_repository_from_the_bundle_alone
     let lib_m = store.load_manifest(&lib_id).unwrap().unwrap();
     let inner_id = lib_m.submodules[0].source_id.clone().unwrap();
     let inner_m = store.load_manifest(&inner_id).unwrap().unwrap();
+    let inner_exec = inner_m.execution_commit.clone().unwrap();
     let bundle = export_with_basis(&c, &store, &m, &[]).unwrap();
 
     // the receiving host: its own home (no store), a repository with no origin
-    let other_home = f.home.join("receiver");
-    let c2 = ctx(&other_home);
-    let mk = |name: &str| {
-        let d = f.home.join(name);
-        std::fs::create_dir_all(&d).unwrap();
-        git(&d, &["init", "-q"]);
-        d
-    };
-    // without the ids of the nested captures their refs are not fetched (the
-    // objects may arrive with the pack, but nothing names them)
-    let r0 = mk("r0");
+    let c2 = ctx(&f.home.join("receiver"));
+    // without the manifests of the nested captures the import knows only the
+    // submodules `m` names: the ref of the inner one is not made (its
+    // objects are in the one pack of the bundle and are unpacked with the
+    // rest, but nothing names them)
+    let r0 = empty_repo(&f.home, "r0");
     import_objects(&c2, &r0, &bundle, &m).unwrap();
-    let inner_ref = format!("refs/local-ci/snapshots/{inner_id}");
+    let inner_ref = snapshot_ref_of(&inner_id);
     let refs0 = git_out(&r0, &["for-each-ref", "--format=%(refname)"]);
     assert!(!refs0.contains(&inner_ref), "{refs0}");
+    assert!(has(&r0, &format!("{inner_exec}^{{commit}}")));
 
-    let r1 = mk("r1");
-    let ids = [lib_id.clone(), inner_id.clone()];
-    let exec = import_objects_for(&c2, &r1, &bundle, &m, &ids).unwrap();
+    // a level that is missing from the list is refused, whichever it is,
+    // before anything is brought in
+    let r1 = empty_repo(&f.home, "r1");
+    for (given, missing) in [(vec![], &lib_id), (vec![lib_m.clone()], &inner_id)] {
+        let e = err_text(import_objects_for(&c2, &r1, &bundle, &m, &given));
+        assert!(
+            e.contains(&format!("the manifest of {missing} was not given")),
+            "{e}"
+        );
+        assert!(git_out(&r1, &["for-each-ref"]).is_empty());
+    }
+    // the inner one alone is not reached from `m`, whose own submodule is
+    // the one that is missing
+    let e = err_text(import_objects_for(
+        &c2,
+        &r1,
+        &bundle,
+        &m,
+        std::slice::from_ref(&inner_m),
+    ));
+    assert!(
+        e.contains(&format!("the manifest of {lib_id} was not given")),
+        "{e}"
+    );
+
+    let nested = [inner_m.clone(), lib_m.clone()];
+    let exec = import_objects_for(&c2, &r1, &bundle, &m, &nested).unwrap();
     assert_eq!(Some(exec.clone()), m.execution_commit);
     assert!(git_out(&r1, &["remote"]).is_empty());
-    assert_eq!(
-        git_out(&r1, &["rev-parse", &inner_ref]),
-        inner_m.execution_commit.clone().unwrap()
-    );
-    for sha in [
-        lib_m.execution_commit.clone().unwrap(),
-        inner_m.execution_commit.clone().unwrap(),
-    ] {
+    assert_eq!(git_out(&r1, &["rev-parse", &inner_ref]), inner_exec);
+    for sha in [lib_m.execution_commit.clone().unwrap(), inner_exec.clone()] {
         assert!(has(&r1, &format!("{sha}^{{commit}}")), "{sha}");
     }
-    // a name that is not a source id never reaches a ref name
-    let r2 = mk("r2");
-    assert!(import_objects_for(&c2, &r2, &bundle, &m, &["../x".to_string()]).is_err());
+    // the same again changes nothing and is not an error
+    assert_eq!(
+        import_objects_for(&c2, &r1, &bundle, &m, &nested).unwrap(),
+        exec
+    );
+}
+
+#[test]
+fn a_manifest_that_no_dirty_submodule_names_is_refused() {
+    let (f, m, sub_m) = dirty_submodule_capture();
+    let c = f.ctx();
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let bundle = export_with_basis(&c, &store, &m, &[]).unwrap();
+    let c2 = ctx(&f.home.join("receiver"));
+    let r = empty_repo(&f.home, "r");
+    // a capture of something else, valid in itself
+    let other = empty_repo(&f.home, "other");
+    std::fs::write(other.join("o.txt"), "o\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-qm", "o"]);
+    std::fs::write(other.join("o.txt"), "o, edited\n").unwrap();
+    let extra = capture_source(&c, &other, &opts()).unwrap().manifest;
+    for nested in [
+        vec![sub_m.clone(), extra.clone()],
+        vec![extra.clone(), sub_m.clone()],
+        vec![sub_m.clone(), m.clone()],
+    ] {
+        let unnamed = nested
+            .iter()
+            .find(|n| n.source_id != sub_m.source_id)
+            .unwrap();
+        let e = err_text(import_objects_for(&c2, &r, &bundle, &m, &nested));
+        assert_eq!(
+            e,
+            format!(
+                "the manifest {} is not of a dirty submodule below {}",
+                unnamed.source_id, m.source_id
+            )
+        );
+        assert!(git_out(&r, &["for-each-ref"]).is_empty());
+    }
+    // a manifest that was edited is not believed, and a name that is not a
+    // source id never reaches a ref name
+    let mut edited = sub_m.clone();
+    edited.worktree_tree = m.worktree_tree.clone();
+    let e = err_text(import_objects_for(&c2, &r, &bundle, &m, &[edited]));
+    assert!(e.contains("does not match its digest"), "{e}");
+    let mut named = sub_m.clone();
+    named.source_id = "../x".into();
+    let e = err_text(import_objects_for(&c2, &r, &bundle, &m, &[named]));
+    assert!(e.contains("not a source id"), "{e}");
+    assert!(git_out(&r, &["for-each-ref"]).is_empty());
+    // the same manifest twice is one manifest
+    let twice = [sub_m.clone(), sub_m.clone()];
+    import_objects_for(&c2, &r, &bundle, &m, &twice).unwrap();
+}
+
+/// A bundle of every ref of `repo`.
+fn bundle_all(repo: &Path, name: &str) -> PathBuf {
+    let out = repo.join(name);
+    git(
+        repo,
+        &["bundle", "create", "-q", out.to_str().unwrap(), "--all"],
+    );
+    out
+}
+
+#[test]
+fn a_nested_ref_that_is_not_the_commit_or_the_tree_of_its_manifest_is_refused() {
+    let (f, m, sub_m) = dirty_submodule_capture();
+    let c = f.ctx();
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let real = export_with_basis(&c, &store, &m, &[]).unwrap();
+    let c2 = ctx(&f.home.join("receiver"));
+    let exec = m.execution_commit.clone().unwrap();
+    let sub_exec = sub_m.execution_commit.clone().unwrap();
+    let sub_ref = snapshot_ref_of(&sub_m.source_id);
+    let scratch = |name: &str| {
+        let d = empty_repo(&f.home, name);
+        git(
+            &d,
+            &["fetch", "-q", real.to_str().unwrap(), "refs/*:refs/*"],
+        );
+        d
+    };
+
+    // a bundle whose ref for the submodule is another commit
+    let s1 = scratch("s1");
+    git(&s1, &["update-ref", &sub_ref, &exec]);
+    let moved = bundle_all(&s1, "moved.bundle");
+    let r1 = empty_repo(&f.home, "r1");
+    let nested = [sub_m.clone()];
+    let e = err_text(import_objects_for(&c2, &r1, &moved, &m, &nested));
+    assert!(
+        e.contains(&format!(
+            "the bundle has {sub_ref} at {exec}, its manifest says {sub_exec}"
+        )),
+        "{e}"
+    );
+    // nothing of it was brought in
+    assert!(git_out(&r1, &["for-each-ref"]).is_empty());
+    // one that has no such ref at all
+    git(&s1, &["update-ref", "-d", &sub_ref]);
+    let lacking = bundle_all(&s1, "lacking.bundle");
+    let e = err_text(import_objects_for(&c2, &r1, &lacking, &m, &nested));
+    assert!(e.contains(&format!("the bundle has no {sub_ref}")), "{e}");
+
+    // manifests that hold together (ids, digests, the gitlink) but name
+    // another tree for the submodule's commit than the commit has
+    let mut wrong = sub_m.clone();
+    wrong.worktree_tree = m.worktree_tree.clone();
+    let wrong = seal_manifest(wrong);
+    let mut top = m.clone();
+    top.submodules[0].source_id = Some(wrong.source_id.clone());
+    let top = seal_manifest(top);
+    let s2 = scratch("s2");
+    let index = git_out(
+        &s2,
+        &["rev-parse", &format!("refs/local-ci/index/{}", m.source_id)],
+    );
+    for (r, at) in [
+        (snapshot_ref_of(&top.source_id), &exec),
+        (snapshot_ref_of(&wrong.source_id), &sub_exec),
+        (format!("refs/local-ci/index/{}", top.source_id), &index),
+    ] {
+        git(&s2, &["update-ref", &r, at]);
+    }
+    let forged = bundle_all(&s2, "forged.bundle");
+    let r2 = empty_repo(&f.home, "r2");
+    let e = err_text(import_objects_for(
+        &c2,
+        &r2,
+        &forged,
+        &top,
+        std::slice::from_ref(&wrong),
+    ));
+    assert!(
+        e.contains(&format!(
+            "commit {sub_exec} has tree {}, the manifest says {}",
+            sub_m.worktree_tree.clone().unwrap(),
+            m.worktree_tree.clone().unwrap()
+        )),
+        "{e}"
+    );
+    // the same bundle with the manifests as they were is taken: it was the
+    // tree that was refused
+    let r3 = empty_repo(&f.home, "r3");
+    import_objects_for(&c2, &r3, &forged, &m, &nested).unwrap();
+}
+
+#[test]
+fn a_nested_ref_that_is_already_there_with_another_value_is_refused_and_kept() {
+    let (f, m, sub_m) = dirty_submodule_capture();
+    let c = f.ctx();
+    let store = ObjectStore::open(f.home.join("sources")).unwrap();
+    let bundle = export_with_basis(&c, &store, &m, &[]).unwrap();
+    let c2 = ctx(&f.home.join("receiver"));
+    let sub_exec = sub_m.execution_commit.clone().unwrap();
+    let sub_ref = snapshot_ref_of(&sub_m.source_id);
+    let nested = [sub_m.clone()];
+    // the ref is at the commit under the snapshot: a fetch without force
+    // would move it forward
+    let lib = f.dir.join("vendor/lib");
+    let lib_head = git_out(&lib, &["rev-parse", "HEAD"]);
+    let r = empty_repo(&f.home, "r");
+    git(&r, &["fetch", "-q", lib.to_str().unwrap(), "HEAD"]);
+    git(&r, &["update-ref", &sub_ref, &lib_head]);
+    let e = err_text(import_objects_for(&c2, &r, &bundle, &m, &nested));
+    assert!(
+        e.contains(&format!(
+            "{sub_ref} is already here at {lib_head}, its manifest says {sub_exec}"
+        )),
+        "{e}"
+    );
+    assert_eq!(git_out(&r, &["rev-parse", &sub_ref]), lib_head);
+    assert_eq!(
+        git_out(&r, &["for-each-ref", "--format=%(refname)"]),
+        sub_ref
+    );
+    // with the ref out of the way the bundle is taken, and a second time too
+    // (the ref is there with the value the manifest names)
+    git(&r, &["update-ref", "-d", &sub_ref]);
+    import_objects_for(&c2, &r, &bundle, &m, &nested).unwrap();
+    assert_eq!(git_out(&r, &["rev-parse", &sub_ref]), sub_exec);
+    import_objects_for(&c2, &r, &bundle, &m, &nested).unwrap();
 }

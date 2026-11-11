@@ -158,33 +158,83 @@ pub fn export_from(ctx: &ExecContext, store: &ObjectStore, m: &SourceManifest) -
     export_impl(ctx, store, m, None)
 }
 
+/// The most commits [`export_with_basis`] takes as `have`: a longer list is
+/// refused, since every entry costs Git calls on the exporting host.
+pub const MAX_HAVE: usize = 256;
+
+/// The most manifests [`import_objects_for`] takes as `nested`: a longer
+/// list is refused.
+pub const MAX_NESTED: usize = 256;
+
 /// Like [`export_from`], but cut at the commits the receiving host says it
 /// has (`have`) instead of at the merge base with origin: the bundle holds
 /// what is reachable from the refs of `m` and not from the entries of `have`
 /// that this store knows. An empty `have` (or one this store knows nothing
 /// of) gives the whole history of the execution commit. Every entry must be
-/// a 40-digit lowercase hex commit id, or the call is refused before Git runs.
+/// a 40-digit lowercase hex commit id, and there may be [`MAX_HAVE`] of them
+/// at most, or the call is refused before Git runs. An entry given twice
+/// counts once.
 ///
 /// A ref of the bundle (the snapshot of an unchanged dirty submodule, say)
 /// whose tip is reachable from an entry of `have` would be dropped by Git.
 /// Then that entry is not used and the parents of the tip are excluded
-/// instead, so the ref stays in the bundle.
+/// instead, so the ref stays in the bundle. The exclusions of a bundle are
+/// not per ref: an entry that is not used is not used for any ref, so the
+/// other refs of the bundle bring the history that entry would have cut. If
+/// a ref is still missing after that (its tip lies below the parent of
+/// another covered tip), the bundle is written once more with no basis at
+/// all, that is with the whole history; only if a ref is missing even then
+/// does the export fail.
 ///
-/// The bundle's name depends on `have`, so exports with different bases of
-/// one source do not replace each other.
+/// The bundle's name depends on `have` (not on its order, nor on entries
+/// given twice), so exports with different bases of one source do not
+/// replace each other. Nothing here removes them: every distinct `have`
+/// leaves a file in `bundles/` of the store, and the caller removes the ones
+/// it is done with.
 pub fn export_with_basis(
     ctx: &ExecContext,
     store: &ObjectStore,
     m: &SourceManifest,
     have: &[String],
 ) -> Result<PathBuf> {
+    if have.len() > MAX_HAVE {
+        bail!(
+            "too many commits in have: {} (at most {MAX_HAVE})",
+            have.len()
+        );
+    }
     if let Some(h) = have.iter().find(|h| !is_hex40(h)) {
         bail!("not a commit id: {h:?}");
     }
-    export_impl(ctx, store, m, Some(have))
+    let mut have = have.to_vec();
+    have.sort();
+    have.dedup();
+    export_impl(ctx, store, m, Some(&have))
 }
 
-/// The `^` arguments of a bundle made over `refs` with the basis `have`.
+/// Whether `a` is an ancestor of `b` (or `b` itself). Git says "no" with the
+/// exit code 1; anything else it fails with is an error, not a "no".
+fn is_ancestor(ctx: &ExecContext, dir: &Path, a: &str, b: &str) -> Result<bool> {
+    let out = ctx
+        .command("git")
+        .arg("--git-dir")
+        .arg(dir)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("failed to run git")?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor {a} {b}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// The `^` arguments of a bundle made over `refs` with the basis `have`
+/// (sorted, no entry twice).
 fn basis_exclusions(
     ctx: &ExecContext,
     dir: &Path,
@@ -210,10 +260,12 @@ fn basis_exclusions(
         if !known {
             continue;
         }
-        let covers: Vec<&String> = tips
-            .iter()
-            .filter(|t| pg(ctx, dir, &["merge-base", "--is-ancestor", t, h], &[], None).is_ok())
-            .collect();
+        let mut covers: Vec<&String> = vec![];
+        for t in &tips {
+            if is_ancestor(ctx, dir, t, h)? {
+                covers.push(t);
+            }
+        }
         if covers.is_empty() {
             out.push(format!("^{h}"));
         } else {
@@ -230,6 +282,26 @@ fn basis_exclusions(
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// The lines of `git bundle list-heads`: (commit, ref).
+fn bundle_heads(
+    ctx: &ExecContext,
+    pre: &[std::ffi::OsString],
+    bundle: &Path,
+) -> Result<Vec<(String, String)>> {
+    let o = git_run(
+        ctx,
+        pre,
+        &["bundle", "list-heads", &bundle.to_string_lossy()],
+        &[],
+        None,
+    )?;
+    Ok(String::from_utf8_lossy(&o)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(c, r)| (c.to_string(), r.to_string()))
+        .collect())
 }
 
 fn export_impl(
@@ -280,7 +352,9 @@ fn export_impl(
             )
             .with_context(|| format!("cannot bring the objects of {} along", sub.source_id))?;
         }
-        refs.push(r);
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
     }
     let out_dir = store.root().join("bundles");
     std::fs::create_dir_all(&out_dir)?;
@@ -288,85 +362,173 @@ fn export_impl(
         None => format!("{}.bundle", m.source_id),
         Some(h) => {
             use sha2::{Digest, Sha256};
-            let mut sorted: Vec<&str> = h.iter().map(String::as_str).collect();
-            sorted.sort();
-            sorted.dedup();
-            let d = Sha256::digest(sorted.join("\n"));
+            // `h` is sorted and holds no entry twice
+            let d = Sha256::digest(h.join("\n"));
             let hex: String = d.iter().take(8).map(|b| format!("{b:02x}")).collect();
             format!("{}-{hex}.bundle", m.source_id)
         }
     };
     let dest = out_dir.join(name);
     let tmp = super::store::tmp_name(&out_dir, "bundle");
-    let mut args: Vec<String> = vec![
-        "bundle".into(),
-        "create".into(),
-        "-q".into(),
-        tmp.to_string_lossy().into_owned(),
-    ];
-    args.extend(refs.iter().cloned());
+    // Write the bundle of `refs` with the exclusions `excl` to `tmp`.
+    let write = |excl: &[String]| -> Result<()> {
+        let mut args: Vec<String> = vec![
+            "bundle".into(),
+            "create".into(),
+            "-q".into(),
+            tmp.to_string_lossy().into_owned(),
+        ];
+        args.extend(refs.iter().cloned());
+        args.extend(excl.iter().cloned());
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Err(e) = pg(ctx, &dir, &argv, &[], None) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("cannot bundle {commit}"));
+        }
+        Ok(())
+    };
+    // Git leaves out a ref its exclusions cover; a bundle that lacks one is
+    // never handed on
+    let complete = || {
+        let pre = ["--git-dir".into(), dir.clone().into()];
+        let heads = bundle_heads(ctx, &pre, &tmp).unwrap_or_default();
+        refs.iter().all(|r| heads.iter().any(|(_, h)| h == r))
+    };
     match have {
         None => {
-            if let Some(mb) = &m.merge_base {
-                args.push(format!("^{mb}"));
-            }
+            let excl: Vec<String> = m.merge_base.iter().map(|mb| format!("^{mb}")).collect();
+            write(&excl)?;
         }
-        Some(h) => args.extend(basis_exclusions(ctx, &dir, &refs, h)?),
-    }
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let res = pg(ctx, &dir, &argv, &[], None);
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("cannot bundle {commit}"));
-    }
-    if have.is_some() {
-        // Git leaves out a ref its exclusions cover; a bundle that lacks one
-        // is never handed on
-        let heads = pg(
-            ctx,
-            &dir,
-            &["bundle", "list-heads", &tmp.to_string_lossy()],
-            &[],
-            None,
-        )
-        .map(|o| String::from_utf8_lossy(&o).into_owned())
-        .unwrap_or_default();
-        let all = refs
-            .iter()
-            .all(|r| heads.lines().any(|l| l.ends_with(&format!(" {r}"))));
-        if !all {
-            let _ = std::fs::remove_file(&tmp);
-            bail!("the bundle of {} lacks a ref it needs", m.source_id);
+        Some(h) => {
+            write(&basis_exclusions(ctx, &dir, &refs, h)?)?;
+            if !complete() {
+                // the whole history instead: larger, but nothing is missing
+                write(&[])?;
+                if !complete() {
+                    let _ = std::fs::remove_file(&tmp);
+                    bail!("the bundle of {} lacks a ref it needs", m.source_id);
+                }
+            }
         }
     }
     std::fs::rename(&tmp, &dest)?;
     Ok(dest)
 }
 
+/// Where an import learns of the dirty submodules below the ones `m` names.
+enum Nested<'a> {
+    /// From the manifests in this host's store, as far as it has them.
+    Store(Option<&'a ObjectStore>),
+    /// From these manifests and nothing else: the dirty submodules below `m`,
+    /// each exactly once.
+    Given(Vec<&'a SourceManifest>),
+}
+
 /// Bring the objects of a bundle into `clone_dir` (the worker's clone of the
 /// repository) and check that the execution commit is there, with the tree
 /// the manifest recorded. Nothing is fetched from the network: the bundle's
 /// prerequisites (the merge base) have to be in the clone already.
+///
+/// The dirty submodules below the ones `m` names are known only as far as
+/// this host's store has their manifests; a host that has no store uses
+/// [`import_objects_for`].
 pub fn import_objects(
     ctx: &ExecContext,
     clone_dir: &Path,
     bundle: &Path,
     m: &SourceManifest,
 ) -> Result<String> {
-    import_objects_for(ctx, clone_dir, bundle, m, &[])
+    let store = default_store(ctx).ok();
+    import_impl(ctx, clone_dir, bundle, m, Nested::Store(store.as_ref()))
 }
 
-/// Like [`import_objects`], and also fetches the snapshot ref of each source
-/// id in `ids`: the dirty submodules below `m` that this host has no manifest
-/// of (a receiving host that has no store yet). Each id is validated as a
-/// source id before it reaches a ref name; ids already known from `m` and the
-/// store are not repeated.
+/// Like [`import_objects`], for a receiving host that was sent the manifests
+/// of the dirty submodules below `m` (`nested`, at every depth) instead of
+/// having them in a store. The store of this host is not asked.
+///
+/// `nested` is not trusted any more than the bundle is:
+///
+/// - it holds [`MAX_NESTED`] manifests at most, each with ids and a digest
+///   that hold;
+/// - every dirty submodule of `m`, and of each manifest reached from it,
+///   must have its manifest in `nested`, and `nested` must hold no manifest
+///   that is not reached that way;
+/// - the snapshot ref of each is fetched without force and must be the
+///   execution commit its manifest names, in the bundle and afterwards in
+///   the clone: a ref that is already in the clone with another value is
+///   refused and left as it is;
+/// - the tree of that commit must be the worktree tree its manifest names,
+///   and the gitlink of every dirty submodule, in `m` and in each of
+///   `nested`, must be the execution commit of that submodule's manifest.
 pub fn import_objects_for(
     ctx: &ExecContext,
     clone_dir: &Path,
     bundle: &Path,
     m: &SourceManifest,
-    extra: &[String],
+    nested: &[SourceManifest],
+) -> Result<String> {
+    if nested.len() > MAX_NESTED {
+        bail!(
+            "too many nested manifests: {} (at most {MAX_NESTED})",
+            nested.len()
+        );
+    }
+    let given = reached(m, nested)?;
+    import_impl(ctx, clone_dir, bundle, m, Nested::Given(given))
+}
+
+/// The manifests of `nested` in the order they are reached from the dirty
+/// submodules of `m`. One that is needed and not there is an error, and so
+/// is one that is there and not needed.
+fn reached<'a>(
+    m: &SourceManifest,
+    nested: &'a [SourceManifest],
+) -> Result<Vec<&'a SourceManifest>> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for n in nested {
+        check_ids(n)?;
+        super::capture::check_digest(n)?;
+        if n.execution_commit.is_none() || n.worktree_tree.is_none() {
+            bail!("the nested manifest {} has no Git objects", n.source_id);
+        }
+        by_id.insert(n.source_id.as_str(), n);
+    }
+    let mut out: Vec<&SourceManifest> = vec![];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut todo: Vec<&[SubmoduleRef]> = vec![&m.submodules];
+    while let Some(subs) = todo.pop() {
+        for s in subs.iter().filter(|s| s.dirty) {
+            let Some(id) = &s.source_id else { continue };
+            check_source_id(id)?;
+            let Some(n) = by_id.get(id.as_str()).copied() else {
+                bail!(
+                    "submodule {}: the manifest of {id} was not given",
+                    s.path.display()
+                );
+            };
+            // a manifest seen before is not walked again (nor can a ring of
+            // them go on for ever)
+            if seen.insert(id.as_str()) {
+                out.push(n);
+                todo.push(&n.submodules);
+            }
+        }
+    }
+    if let Some(id) = by_id.keys().find(|id| !seen.contains(*id)) {
+        bail!(
+            "the manifest {id} is not of a dirty submodule below {}",
+            m.source_id
+        );
+    }
+    Ok(out)
+}
+
+fn import_impl(
+    ctx: &ExecContext,
+    clone_dir: &Path,
+    bundle: &Path,
+    m: &SourceManifest,
+    nested: Nested,
 ) -> Result<String> {
     // a manifest nobody has verified is not taken for what it says
     super::capture::check_digest(m)?;
@@ -386,19 +548,52 @@ pub fn import_objects_for(
     // the snapshot of `m`, those of its dirty submodules, and the index
     // commit: named one by one, so a bundle cannot put another ref in the
     // clone
-    let store = default_store(ctx).ok();
-    let mut refspecs: Vec<String> = vec![];
-    let mut ids = vec![m.source_id.clone()];
-    ids.extend(dirty_submodule_ids(&m.submodules, store.as_ref())?);
-    for id in extra {
-        check_source_id(id)?;
-        ids.push(id.clone());
-    }
-    ids.sort();
-    ids.dedup();
-    for id in &ids {
-        let r = snapshot_ref(id);
-        refspecs.push(format!("+{r}:{r}"));
+    let own = snapshot_ref(&m.source_id);
+    let mut refspecs: Vec<String> = vec![format!("+{own}:{own}")];
+    match &nested {
+        Nested::Store(store) => {
+            let mut ids = dirty_submodule_ids(&m.submodules, *store)?;
+            ids.sort();
+            ids.dedup();
+            for id in ids.iter().filter(|id| **id != m.source_id) {
+                let r = snapshot_ref(id);
+                refspecs.push(format!("+{r}:{r}"));
+            }
+        }
+        Nested::Given(list) => {
+            // what the fetch below would write is looked at first: a ref it
+            // would move, or set to a commit the manifest does not name, is
+            // refused while the clone is still as it was
+            let heads = bundle_heads(ctx, &pre, bundle)?;
+            for n in list {
+                let r = snapshot_ref(&n.source_id);
+                let want = n.execution_commit.as_deref().unwrap_or_default();
+                let in_bundle = heads.iter().find(|(_, h)| *h == r).map(|(c, _)| c.as_str());
+                if in_bundle != Some(want) {
+                    return Err(SourceError::Corrupt {
+                        what: match in_bundle {
+                            Some(c) => {
+                                format!("the bundle has {r} at {c}, its manifest says {want}")
+                            }
+                            None => format!("the bundle has no {r}"),
+                        },
+                    }
+                    .into());
+                }
+                let here = git_run(ctx, &pre, &["rev-parse", "--verify", "-q", &r], &[], None)
+                    .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+                    .ok();
+                if let Some(c) = here.filter(|c| c != want) {
+                    return Err(SourceError::Corrupt {
+                        what: format!("{r} is already here at {c}, its manifest says {want}"),
+                    }
+                    .into());
+                }
+                if r != own {
+                    refspecs.push(format!("{r}:{r}"));
+                }
+            }
+        }
     }
     if m.index_tree.is_some() {
         let r = index_ref(&m.source_id);
@@ -421,21 +616,7 @@ pub fn import_objects_for(
     .trim()
     .to_string();
     if let Some(tree) = &m.worktree_tree {
-        let t = String::from_utf8_lossy(&git_run(
-            ctx,
-            &pre,
-            &["rev-parse", &format!("{commit}^{{tree}}")],
-            &[],
-            None,
-        )?)
-        .trim()
-        .to_string();
-        if &t != tree {
-            return Err(SourceError::Corrupt {
-                what: format!("commit {commit} has tree {t}, the manifest says {tree}"),
-            }
-            .into());
-        }
+        check_tree(ctx, &pre, commit, tree)?;
     }
     // the index tree came along (in the commit of its own ref) and is the one
     // the manifest names
@@ -476,11 +657,126 @@ pub fn import_objects_for(
             .into());
         }
     }
-    // a dirty submodule's commit is what the gitlink names: it has come along,
-    // and so have the dirty ones below it (known from their manifests, when
-    // this host has them)
-    check_gitlinks(ctx, &pre, commit, &m.submodules, store.as_ref())?;
+    match &nested {
+        // a dirty submodule's commit is what the gitlink names: it has come
+        // along, and so have the dirty ones below it (known from their
+        // manifests, when this host has them)
+        Nested::Store(store) => check_gitlinks(ctx, &pre, commit, &m.submodules, *store)?,
+        Nested::Given(list) => {
+            let commit_of = |id: &str| {
+                list.iter()
+                    .find(|n| n.source_id == id)
+                    .and_then(|n| n.execution_commit.as_deref())
+            };
+            // each nested snapshot is the commit its manifest names, with
+            // the tree its manifest names
+            for n in list {
+                let r = snapshot_ref(&n.source_id);
+                let want = n.execution_commit.as_deref().unwrap_or_default();
+                let at = git_run(ctx, &pre, &["rev-parse", "--verify", &r], &[], None)?;
+                let at = String::from_utf8_lossy(&at).trim().to_string();
+                if at != want {
+                    return Err(SourceError::Corrupt {
+                        what: format!("{r} is {at}, its manifest says {want}"),
+                    }
+                    .into());
+                }
+                check_tree(
+                    ctx,
+                    &pre,
+                    want,
+                    n.worktree_tree.as_deref().unwrap_or_default(),
+                )?;
+            }
+            // at every level, a dirty submodule's gitlink names the commit
+            // of that submodule's manifest
+            let levels =
+                std::iter::once((commit.as_str(), &m.submodules)).chain(list.iter().map(|n| {
+                    (
+                        n.execution_commit.as_deref().unwrap_or_default(),
+                        &n.submodules,
+                    )
+                }));
+            for (at, subs) in levels {
+                for sub in subs.iter().filter(|s| s.dirty) {
+                    let sha = gitlink_here(ctx, &pre, at, sub)?;
+                    let want = sub.source_id.as_deref().and_then(commit_of);
+                    if want.is_some_and(|w| w != sha) {
+                        return Err(SourceError::Corrupt {
+                            what: format!(
+                                "the gitlink of submodule {} is {sha}, its manifest says {}",
+                                sub.path.display(),
+                                want.unwrap_or_default()
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+    }
     Ok(got)
+}
+
+/// `commit` must have the tree `tree`.
+fn check_tree(
+    ctx: &ExecContext,
+    pre: &[std::ffi::OsString],
+    commit: &str,
+    tree: &str,
+) -> Result<()> {
+    let t = String::from_utf8_lossy(&git_run(
+        ctx,
+        pre,
+        &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+        &[],
+        None,
+    )?)
+    .trim()
+    .to_string();
+    if t != tree {
+        return Err(SourceError::Corrupt {
+            what: format!("commit {commit} has tree {t}, the manifest says {tree}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The commit the gitlink of `sub` names in the tree of `commit`: it must be
+/// a commit that is here.
+fn gitlink_here(
+    ctx: &ExecContext,
+    pre: &[std::ffi::OsString],
+    commit: &str,
+    sub: &SubmoduleRef,
+) -> Result<String> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut args: Vec<std::ffi::OsString> = pre.to_vec();
+    args.extend(["ls-tree", "-z", commit, "--"].map(std::ffi::OsString::from));
+    args.push(std::ffi::OsString::from_vec(sub.path.0.clone()));
+    let line = super::capture::git_run_os(ctx, None, &args, &[], None)?;
+    let line = String::from_utf8_lossy(&line).into_owned();
+    let sha = line.split_whitespace().nth(2).unwrap_or("").to_string();
+    let here = is_hex40(&sha)
+        && git_run(
+            ctx,
+            pre,
+            &["cat-file", "-e", &format!("{sha}^{{commit}}")],
+            &[],
+            None,
+        )
+        .is_ok();
+    if !here {
+        return Err(SourceError::Corrupt {
+            what: format!(
+                "the commit of submodule {} is not in the bundle",
+                sub.path.display()
+            ),
+        }
+        .into());
+    }
+    Ok(sha)
 }
 
 /// The gitlink of every dirty submodule in `subs`, read from `commit` (the
@@ -493,32 +789,8 @@ fn check_gitlinks(
     subs: &[SubmoduleRef],
     store: Option<&ObjectStore>,
 ) -> Result<()> {
-    use std::os::unix::ffi::OsStringExt;
     for sub in subs.iter().filter(|s| s.dirty) {
-        let mut args: Vec<std::ffi::OsString> = pre.to_vec();
-        args.extend(["ls-tree", "-z", commit, "--"].map(std::ffi::OsString::from));
-        args.push(std::ffi::OsString::from_vec(sub.path.0.clone()));
-        let line = super::capture::git_run_os(ctx, None, &args, &[], None)?;
-        let line = String::from_utf8_lossy(&line).into_owned();
-        let sha = line.split_whitespace().nth(2).unwrap_or("").to_string();
-        let here = is_hex40(&sha)
-            && git_run(
-                ctx,
-                pre,
-                &["cat-file", "-e", &format!("{sha}^{{commit}}")],
-                &[],
-                None,
-            )
-            .is_ok();
-        if !here {
-            return Err(SourceError::Corrupt {
-                what: format!(
-                    "the commit of submodule {} is not in the bundle",
-                    sub.path.display()
-                ),
-            }
-            .into());
-        }
+        let sha = gitlink_here(ctx, pre, commit, sub)?;
         let nested = match (&sub.source_id, store) {
             (Some(id), Some(st)) => st.load_manifest(id)?,
             _ => None,
