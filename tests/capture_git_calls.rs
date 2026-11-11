@@ -610,8 +610,18 @@ fn a_capture_is_the_same_when_git_does_not_answer_a_question_that_was_put_togeth
         ("what the store has", in_store, "refs/*", "garble"),
         ("what the store has", in_store, "refs/*", "ambiguous"),
         // `pack_across`
-        ("the staged blobs", "*pack-objects*", "", "fail"),
-        ("the staged blobs", "*unpack-objects*", "", "fail"),
+        (
+            "the staged blobs",
+            "-C * pack-objects --stdout*",
+            "",
+            "fail",
+        ),
+        (
+            "the staged blobs",
+            "--git-dir * unpack-objects -q",
+            "",
+            "fail",
+        ),
         // `hash_filtered_all`
         ("the blobs of changed files", "*--stdin-paths", "", "fail"),
         ("the blobs of changed files", "*--stdin-paths", "", "garble"),
@@ -736,5 +746,15 @@ fn a_filter_that_looks_for_the_file_finds_none_however_many_files_changed() {
         assert_eq!(blob(&format!("new{i}.see")), format!("absent\nnew {i}"));
         assert_eq!(blob(&format!("g{i}.up")), format!("THIRD {i}"));
         assert_eq!(blob(&format!("t{i}.txt")), format!("third {i}"));
+    }
+
+    // with a setting that touches every file, the attributes are not asked
+    // for where they are otherwise: the filter of a file is asked on its own
+    git(&d, &["config", "core.autocrlf", "input"]);
+    let blob = capture();
+    for i in 0..4 {
+        assert_eq!(blob(&format!("dir/f{i}.see")), format!("absent\nthird {i}"));
+        assert_eq!(blob(&format!("new{i}.see")), format!("absent\nnew {i}"));
+        assert_eq!(blob(&format!("g{i}.up")), format!("THIRD {i}"));
     }
 }
