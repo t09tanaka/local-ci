@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Each step run under task-traffic-controller gets a name for its `top` screen
+  in `TASK_TRAFFIC_CONTROLLER_LABEL`: `workflow / job (matrix) / step`, at most
+  60 characters (the step is cut first). It is an environment variable, so a
+  controller that does not know the name ignores it.
+
 ## [0.11.0] - 2026-11-11
 
 - `source::export_with_basis(ctx, store, m, have)` writes the bundle of a

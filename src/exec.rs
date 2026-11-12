@@ -417,6 +417,27 @@ pub fn compose_projects(script: &str) -> Vec<String> {
     out
 }
 
+/// The longest name handed to task-traffic-controller's `top`.
+const RUN_LABEL_MAX: usize = 60;
+
+/// `workflow / job / step`, for task-traffic-controller's `top`. At most `RUN_LABEL_MAX`
+/// characters: the step is cut first, then the whole name.
+fn run_label(workflow: &str, job: &str, step: &str) -> String {
+    let clip = |s: &str, max: usize| -> String {
+        let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.chars().count() <= max {
+            return one_line;
+        }
+        let head: String = one_line.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    };
+    let head = format!("{} / {} / ", clip(workflow, 100), clip(job, 100));
+    let room = RUN_LABEL_MAX.saturating_sub(head.chars().count());
+    // keep at least a few characters of the step when the front part is long
+    let step = clip(step, room.max(8));
+    clip(&format!("{head}{step}"), RUN_LABEL_MAX)
+}
+
 /// The prefix task-traffic-controller puts on its own output lines. The one
 /// place that knows it.
 const CONTROLLER_PREFIX: &str = "task-traffic-controller: ";
@@ -1003,14 +1024,24 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        label: &str,
         piped: bool,
     ) -> Result<(Exit, Duration)> {
         let mut attempt = 0;
         let mut queued = Duration::ZERO;
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
-            let (r, q) =
-                self.shell_once(cwd, script, shell, env, timeout, log, key.clone(), piped)?;
+            let (r, q) = self.shell_once(
+                cwd,
+                script,
+                shell,
+                env,
+                timeout,
+                log,
+                key.clone(),
+                label,
+                piped,
+            )?;
             queued += q;
             let failed = matches!(r, Exit::Code(c) if c != 0);
             if !(failed
@@ -1036,6 +1067,7 @@ impl<'a> Runner<'a> {
         timeout: Option<Duration>,
         log: &Path,
         key: Option<String>,
+        label: &str,
         piped: bool,
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
@@ -1154,6 +1186,11 @@ impl<'a> Runner<'a> {
             .process_group(0);
         for (k, v) in env {
             cmd.env(k, v);
+        }
+        // A name for task-traffic-controller's `top`. An environment variable, not
+        // `--label`, so a controller that does not know the flag still runs the step.
+        if self.opts.traffic_controller.is_some() && !label.is_empty() {
+            cmd.env("TASK_TRAFFIC_CONTROLLER_LABEL", label);
         }
         let pipe = if piped {
             let (r, w) = script_pipe(&self.tools.join(format!("scripts/step-{n}.fifo")))?;
@@ -1535,6 +1572,7 @@ impl<'a> Runner<'a> {
                     Some(Duration::from_secs(1800)),
                     &log,
                     Some(format!("local-ci setup {label}")),
+                    &run_label(&sel.wf.name, &s.job, &s.label),
                     false,
                 )
                 .map(|(exit, _)| exit);
@@ -3199,6 +3237,15 @@ impl<'a> Runner<'a> {
                     Some(timeout),
                     &log,
                     Some(key),
+                    &run_label(
+                        &w.name,
+                        &display,
+                        &if s.name.is_some() {
+                            label.clone()
+                        } else {
+                            format!("step {}", n + 1)
+                        },
+                    ),
                     piped,
                 )
                 .map(|(exit, queued)| {
@@ -3854,6 +3901,42 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn run_label_plain() {
+        assert_eq!(
+            run_label("CI", "build", "Run tests"),
+            "CI / build / Run tests"
+        );
+    }
+
+    #[test]
+    fn run_label_matrix_job() {
+        assert_eq!(
+            run_label("CI", "test (ubuntu, 20)", "step 3"),
+            "CI / test (ubuntu, 20) / step 3"
+        );
+    }
+
+    #[test]
+    fn run_label_unnamed_step() {
+        assert_eq!(run_label("CI", "lint", "step 8"), "CI / lint / step 8");
+    }
+
+    #[test]
+    fn run_label_truncates_step_first() {
+        let l = run_label("CI", "build", &"x".repeat(200));
+        assert_eq!(l.chars().count(), RUN_LABEL_MAX);
+        assert!(l.starts_with("CI / build / xxx"));
+        assert!(l.ends_with('…'));
+    }
+
+    #[test]
+    fn run_label_long_front_is_cut_and_one_line() {
+        let l = run_label(&"w".repeat(80), &"j".repeat(80), "a\nb");
+        assert_eq!(l.chars().count(), RUN_LABEL_MAX);
+        assert_eq!(run_label("CI", "j", "a\n  b"), "CI / j / a b");
+    }
 
     #[test]
     // What this checks: the ends of the pipe carry close-on-exec, the write end is
