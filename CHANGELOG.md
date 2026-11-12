@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-12
+
 - Each step run under task-traffic-controller gets a name for its `top` screen
   in `TASK_TRAFFIC_CONTROLLER_LABEL`: `workflow / job (matrix) / step`, at most
   60 characters (the step is cut first). It is an environment variable, so a
