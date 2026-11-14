@@ -745,3 +745,42 @@ fn ordered_trigger_alternatives_preserve_the_event_or_report_real_uncertainty() 
         }
     }
 }
+
+#[test]
+fn raw_frozen_git_guards_reject_each_independent_invalid_identity() {
+    let f = Fixture::new(WORKFLOW);
+    let captured = build(&f.store, &f.capture(), &options()).unwrap();
+    captured.verify().unwrap(); // schema 7 is a supported, source-bound format.
+    let mut legacy = captured.clone();
+    legacy.schema_version = 6;
+    legacy.source.pinned = None;
+    legacy.source.execution_commit = Some("a".repeat(40));
+    legacy.source.source_id = format!("commit:{}", "a".repeat(40));
+    legacy.source.base = Some("main".into());
+    legacy.digest = legacy.compute_digest().unwrap();
+    legacy.verify().unwrap();
+    legacy.require_git_source().unwrap();
+    for case in 0..7 {
+        let mut invalid = legacy.clone();
+        match case {
+            0 => invalid.schema_version = 7, // Missing pinned metadata, independently of the commit/base.
+            1 => invalid.source.pinned = captured.source.pinned.clone(), // Wrong schema, independently of commit/base.
+            2 => invalid.source.execution_commit = None,
+            3 => invalid.source.execution_commit = Some(String::new()),
+            4 => invalid.source.base = None,
+            5 => invalid.source.base = Some(String::new()),
+            _ => invalid.schema_version = 99,
+        }
+        // Reseal so a digest failure cannot conceal a missing identity check.
+        invalid.digest = invalid.compute_digest().unwrap();
+        assert_eq!(
+            invalid
+                .require_git_source()
+                .unwrap_err()
+                .downcast_ref::<E>(),
+            Some(&E::UnsupportedExecution),
+            "case {case}"
+        );
+        assert!(invalid.verify().is_err(), "case {case}");
+    }
+}

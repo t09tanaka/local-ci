@@ -180,7 +180,7 @@ jobs:
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh src/frozen.rs
       - name: zero survivors in frozen
-        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
+        run: cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
 
   mutants-shard:
     name: mutation gate (shard)

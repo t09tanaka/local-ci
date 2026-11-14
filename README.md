@@ -553,7 +553,7 @@ commands are in `.github/workflows/ci.yml`):
 
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
-cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
 cargo schemata --file src/artifact.rs -- --lib artifact
 cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
 cargo schemata --file src/demand.rs -- --lib --test task_demand
