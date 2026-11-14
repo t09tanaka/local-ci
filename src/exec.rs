@@ -861,13 +861,19 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 }
 
 impl<'a> Runner<'a> {
-    pub fn new(ctx: &'a ExecContext, fp: &'a FrozenPlan, ws: &Workspace, opts: Opts) -> Self {
+    pub fn new(
+        ctx: &'a ExecContext,
+        fp: &'a FrozenPlan,
+        ws: &Workspace,
+        opts: Opts,
+    ) -> Result<Self> {
+        fp.require_git_source()?;
         let base_path = ctx.var("PATH").unwrap_or_default().to_string();
         let plan = fp.to_plan();
         let refused = (0..plan.selected.len())
             .filter_map(|wf| Some((wf, artifact_io::workflow_refusal(&plan, wf)?)))
             .collect();
-        Runner {
+        Ok(Runner {
             ctx,
             fp,
             refused,
@@ -885,11 +891,17 @@ impl<'a> Runner<'a> {
             seq: AtomicUsize::new(0),
             synced: Mutex::new(HashSet::new()),
             docker_ok: OnceLock::new(),
-        }
+        })
     }
 
     fn github_ctx(&self, ws: &Path, w: &Workflow, event: &str, job: &str) -> Value {
-        let base = crate::git::branch_name(&self.fp.source.base);
+        let base = crate::git::branch_name(
+            self.fp
+                .source
+                .base
+                .as_deref()
+                .expect("Git execution requires a base"),
+        );
         let head = self.fp.branch.clone().unwrap_or_default();
         let pr = event == "pull_request";
         json!({
@@ -950,7 +962,14 @@ impl<'a> Runner<'a> {
                 self.marks(Path::new(&ws)).to_string_lossy().into_owned(),
             ),
             ("GITHUB_WORKSPACE".into(), ws),
-            ("GITHUB_SHA".into(), self.fp.source.execution_commit.clone()),
+            (
+                "GITHUB_SHA".into(),
+                self.fp
+                    .source
+                    .execution_commit
+                    .clone()
+                    .expect("Git execution requires a commit"),
+            ),
             ("GITHUB_REF".into(), s("ref")),
             ("GITHUB_REF_NAME".into(), s("ref_name")),
             ("GITHUB_HEAD_REF".into(), s("head_ref")),
@@ -1406,6 +1425,7 @@ impl<'a> Runner<'a> {
 
     /// Create the Python venv that `pip install` steps install into, if any step needs one.
     pub fn prepare_tools(&self) -> Result<()> {
+        self.fp.require_git_source()?;
         for d in [
             "scripts",
             "tmp",
@@ -1485,18 +1505,33 @@ impl<'a> Runner<'a> {
             .collect()
     }
 
-    pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> PreparedSetup {
+    pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> Result<PreparedSetup> {
+        self.fp.require_git_source()?;
         if recipe.steps.is_empty() {
-            return PreparedSetup {
-                receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
+            return Ok(PreparedSetup {
+                receipt: PreparedReceipt::empty(
+                    key,
+                    self.fp
+                        .source
+                        .execution_commit
+                        .as_deref()
+                        .expect("Git execution requires a commit"),
+                ),
                 steps: vec![],
-            };
+            });
         }
         let workspace = match setup::ensure_workspace_id(&self.wt) {
             Ok(id) => id,
             Err(e) => {
-                return PreparedSetup {
-                    receipt: PreparedReceipt::empty(key, &self.fp.source.execution_commit),
+                return Ok(PreparedSetup {
+                    receipt: PreparedReceipt::empty(
+                        key,
+                        self.fp
+                            .source
+                            .execution_commit
+                            .as_deref()
+                            .expect("Git execution requires a commit"),
+                    ),
                     steps: vec![StepResult {
                         label: "setup".into(),
                         outcome: Outcome::Error(format!("cannot record the workspace id: {e:#}")),
@@ -1505,7 +1540,7 @@ impl<'a> Runner<'a> {
                         log: None,
                         note: None,
                     }],
-                };
+                });
             }
         };
         let covered = setup::covered_by(recipe);
@@ -1620,21 +1655,27 @@ impl<'a> Runner<'a> {
         } else {
             vec![]
         };
-        PreparedSetup {
+        Ok(PreparedSetup {
             receipt: PreparedReceipt {
                 schema_version: crate::wire::wire_version(),
                 template_key: key.into(),
-                source: self.fp.source.execution_commit.clone(),
+                source: self
+                    .fp
+                    .source
+                    .execution_commit
+                    .clone()
+                    .expect("Git execution requires a commit"),
                 workspace,
                 steps: prepared,
                 artifacts,
                 notes,
             },
             steps: out,
-        }
+        })
     }
 
-    pub fn run_units(&self) -> Vec<UnitResult> {
+    pub fn run_units(&self) -> Result<Vec<UnitResult>> {
+        self.fp.require_git_source()?;
         let sem = Semaphore {
             free: Mutex::new(self.opts.parallel.max(1)),
             cv: Condvar::new(),
@@ -1680,7 +1721,7 @@ impl<'a> Runner<'a> {
         });
         let mut r = results.into_inner().unwrap();
         r.sort_by_key(|(i, _)| *i);
-        r.into_iter().map(|(_, u)| u).collect()
+        Ok(r.into_iter().map(|(_, u)| u).collect())
     }
 
     /// The entries of a job that is not run, each an error that says why: one
@@ -1862,7 +1903,11 @@ impl<'a> Runner<'a> {
             &self.repo_root,
             from,
             to,
-            &self.fp.source.execution_commit,
+            self.fp
+                .source
+                .execution_commit
+                .as_deref()
+                .expect("Git execution requires a commit"),
             self.fp.config.link_node_modules,
         )?;
         let marks = self.marks(to);
@@ -1881,7 +1926,7 @@ impl<'a> Runner<'a> {
 
     fn remove_copy(&self, ws: &Path) {
         if !self.opts.keep {
-            self.release_ports(ws);
+            let _ = self.release_ports(ws);
             crate::git::remove_worktree(self.ctx, &self.repo_root, ws, &self.opts.trash);
         }
     }
@@ -1894,7 +1939,12 @@ impl<'a> Runner<'a> {
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
-            &self.fp.source.execution_commit[..7],
+            &self
+                .fp
+                .source
+                .execution_commit
+                .as_deref()
+                .expect("Git execution requires a commit")[..7],
             std::process::id()
         ));
         let t0 = Instant::now();
@@ -1942,15 +1992,17 @@ impl<'a> Runner<'a> {
 
     /// Give back the port block of `ws`. The worktree of the run itself may hold
     /// one even when no job asked: portool's post-checkout hook takes it.
-    pub fn release_ports(&self, ws: &Path) {
+    pub fn release_ports(&self, ws: &Path) -> Result<()> {
+        self.fp.require_git_source()?;
         let Some(bin) = &self.opts.portool else {
-            return;
+            return Ok(());
         };
         if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
             && ws.join(".portool.toml").is_file()
         {
             crate::portool::release(self.ctx, bin, ws);
         }
+        Ok(())
     }
 
     /// Run the tasks of one unit, one after the other, in `ws`.
@@ -2282,7 +2334,11 @@ impl<'a> Runner<'a> {
             Some((r, tctx)) => match setup::derive_in(&self.plan, &self.hoisted, task)?
                 .prepared_places(
                     r,
-                    &self.fp.source.execution_commit,
+                    self.fp
+                        .source
+                        .execution_commit
+                        .as_deref()
+                        .expect("Git execution requires a commit"),
                     setup::workspace_id(ws).as_deref(),
                     ws,
                     tctx,
@@ -2734,7 +2790,12 @@ impl<'a> Runner<'a> {
                         // the pid stays last in the name: cleanup scripts read it from there
                         let copy = self.wt.with_file_name(format!(
                             "{}-c{}-{}",
-                            &self.fp.source.execution_commit[..7],
+                            &self
+                                .fp
+                                .source
+                                .execution_commit
+                                .as_deref()
+                                .expect("Git execution requires a commit")[..7],
                             self.seq.fetch_add(1, Ordering::SeqCst),
                             std::process::id()
                         ));

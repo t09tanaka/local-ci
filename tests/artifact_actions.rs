@@ -109,7 +109,13 @@ fn lab_ws(jobs: &str) -> (common::Tmp, FrozenPlan, Workspace) {
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt/w");
-    local_ci::git::add_worktree(&ctx(tmp.path()), &dir, &wt, &fp.source.execution_commit).unwrap();
+    local_ci::git::add_worktree(
+        &ctx(tmp.path()),
+        &dir,
+        &wt,
+        fp.source.execution_commit.as_deref().unwrap(),
+    )
+    .unwrap();
     let ws = Workspace {
         root: wt,
         repo_root: dir.clone(),
@@ -940,7 +946,8 @@ fn a_run_with_a_required_artifact_missing_is_not_a_success() {
         r.setup.clone(),
         r.units.clone(),
         0.0,
-    );
+    )
+    .unwrap();
     assert_eq!(again.state, "error");
     // a task result names what the task published
     let (_t, _f, ok) = run(jobs);

@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.12.0] - 2026-11-14
+
+- Add `build_frozen_plan_from_source` for verified captured inputs, including
+  non-Git directories, without recapture, commands, network access or secret
+  restoration. Required but unavailable event metadata produces typed static
+  errors. Submodule inputs are explicitly unsupported.
+- Breaking library change: `SourceRef.execution_commit` and `base` are
+  `Option<String>`. Captured plans use schema 7 with pinned provenance;
+  ordinary Git plans keep schema 6 and unchanged JSON/digests. Legacy Git
+  execution entry points reject captured plans before side effects. Public
+  `exec::Runner` execution methods and `report::assemble` now return `Result`
+  so unsupported captured execution is a typed error, including direct calls.
 
 ## [0.11.1] - 2026-11-12
 

@@ -28,10 +28,13 @@ pub struct SourceRef {
     /// commit (nothing captured) names itself `commit:<sha>`.
     pub source_id: String,
     /// The full commit sha the jobs run against: the commit itself, or the
-    /// synthetic commit made from a captured worktree.
-    pub execution_commit: String,
-    /// The base the changed files were taken against (a ref or a sha).
-    pub base: String,
+    /// synthetic commit made from a captured worktree. None for a directory.
+    pub execution_commit: Option<String>,
+    /// The explicitly captured base (a ref or sha), if known.
+    pub base: Option<String>,
+    /// Verified captured input metadata. Absent on legacy Git plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<crate::source_plan::PinnedIdentity>,
 }
 
 /// `.local-ci.toml` as it applied to the plan, plus the workflow directories
@@ -267,7 +270,11 @@ impl FrozenPlan {
         let (tasks, shard_groups) = dag::derive_tasks(&parts.plan, &workflows, &units, shards);
         let unrunnable = std::mem::take(&mut parts.plan.unrunnable);
         let mut fp = FrozenPlan {
-            schema_version: SCHEMA_VERSION,
+            schema_version: if parts.source.pinned.is_some() {
+                crate::source_plan::PINNED_SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION
+            },
             digest: String::new(),
             repository: parts.repository,
             source: parts.source,
@@ -297,6 +304,23 @@ impl FrozenPlan {
         Ok(fp)
     }
 
+    /// Refuse source kinds the legacy Git executor cannot execute, before
+    /// commands, workspace writes, demand registration or tool discovery.
+    pub fn require_git_source(&self) -> Result<()> {
+        if self.schema_version != SCHEMA_VERSION
+            || self.source.pinned.is_some()
+            || self
+                .source
+                .execution_commit
+                .as_ref()
+                .is_none_or(String::is_empty)
+            || self.source.base.as_ref().is_none_or(String::is_empty)
+        {
+            return Err(crate::source_plan::PinnedPlanError::UnsupportedExecution.into());
+        }
+        Ok(())
+    }
+
     /// The digest the plan should carry: the SHA-256 of its canonical JSON with
     /// the `digest` field empty.
     pub fn compute_digest(&self) -> Result<String> {
@@ -307,11 +331,26 @@ impl FrozenPlan {
 
     /// Fail unless the schema is known and the digests match the content.
     pub fn verify(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION
+            && self.schema_version != crate::source_plan::PINNED_SCHEMA_VERSION
+        {
             bail!(
                 "plan schema version {} is not supported (this is {SCHEMA_VERSION})",
                 self.schema_version
             );
+        }
+        match (self.schema_version, &self.source.pinned) {
+            (6, None)
+                if self
+                    .source
+                    .execution_commit
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty())
+                    && self.source.base.as_ref().is_some_and(|s| !s.is_empty()) => {}
+            (crate::source_plan::PINNED_SCHEMA_VERSION, Some(identity)) => {
+                crate::source_plan::verify_identity(self, identity)?
+            }
+            _ => bail!("plan source identity does not match its schema version"),
         }
         crate::wire::check_version("plan job graph", self.graph.schema_version)?;
         for t in &self.tasks {

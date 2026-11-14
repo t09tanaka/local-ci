@@ -129,7 +129,13 @@ fn lab(example_dir: &str, command: &str, env: &str) -> Lab {
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt/t");
-    local_ci::git::add_worktree(&ctx, &dir, &wt, &fp.source.execution_commit).unwrap();
+    local_ci::git::add_worktree(
+        &ctx,
+        &dir,
+        &wt,
+        fp.source.execution_commit.as_deref().unwrap(),
+    )
+    .unwrap();
     // what `npm ci` made is not in the commit
     if example_dir == "node" || example_dir == "playwright" {
         std::os::unix::fs::symlink(

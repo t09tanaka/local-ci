@@ -480,16 +480,27 @@ fn topo(jobs: &[&Job]) -> Vec<String> {
 }
 
 pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
+    let decided = workflows
+        .into_iter()
+        .filter(|w| {
+            only.is_empty()
+                || only
+                    .iter()
+                    .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
+        })
+        .map(|w| {
+            let decision = decide(&w, ev);
+            (w, decision)
+        })
+        .collect();
+    build_decided(decided)
+}
+
+/// Group already selected and evaluated workflows without deciding again.
+pub(crate) fn build_decided(workflows: Vec<(Workflow, Decision)>) -> Plan {
     let mut plan = Plan::default();
-    for w in workflows {
-        if !only.is_empty()
-            && !only
-                .iter()
-                .any(|o| w.file.ends_with(o.as_str()) || &w.name == o)
-        {
-            continue;
-        }
-        match decide(&w, ev) {
+    for (w, decision) in workflows {
+        match decision {
             Decision::Run { event } => plan.selected.push(Selected { wf: w, event }),
             Decision::Skip { reason } => plan.skipped.push((w.file.clone(), reason)),
         }

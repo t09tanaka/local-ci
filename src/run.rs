@@ -269,7 +269,7 @@ fn disabled_workflows(ctx: &ExecContext, root: &std::path::Path) -> Option<Vec<D
 }
 
 /// Keep only the named jobs and the jobs they need.
-fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
+pub(crate) fn keep_jobs(p: &mut plan::Plan, wanted: &[String]) {
     for u in &mut p.units {
         let w = &p.selected[u.wf].wf;
         let mut keep: Vec<String> = u
@@ -429,8 +429,9 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
         repository: git::repo_slug(ctx, &repo.root),
         source: SourceRef {
             source_id: format!("commit:{}", repo.sha),
-            execution_commit: repo.sha.clone(),
-            base: repo.base.clone(),
+            execution_commit: Some(repo.sha.clone()),
+            base: Some(repo.base.clone()),
+            pinned: None,
         },
         branch: repo.head.clone(),
         changed_files: repo.changed.clone(),
@@ -467,6 +468,7 @@ pub fn execute_plan(
     ws: &exec::Workspace,
     opts: exec::Opts,
 ) -> Result<report::RunResult> {
+    fp.require_git_source()?;
     let area = ws.run_dir.join("artifacts");
     if std::fs::read_dir(&area).is_ok_and(|mut d| d.next().is_some()) {
         bail!(
@@ -488,16 +490,16 @@ fn run_plan(
     let t0 = std::time::Instant::now();
     let nothing = fp.units.is_empty();
     if nothing {
-        return Ok(report::assemble(
+        return report::assemble(
             fp,
             ws.run_dir.clone(),
             vec![],
             vec![],
             t0.elapsed().as_secs_f64(),
-        ));
+        );
     }
     let keep = opts.keep;
-    let mut runner = exec::Runner::new(ctx, fp, ws, opts);
+    let mut runner = exec::Runner::new(ctx, fp, ws, opts)?;
     let result = (|| -> Result<_> {
         runner.prepare_tools()?;
         // Each task has a recipe of its own. This run does them in the one
@@ -512,7 +514,7 @@ fn run_plan(
             .unwrap_or_default();
         let tctx = setup::TemplateContext::local(fp, &run_id);
         let all = setup::SetupRecipe::union(&recipes.iter().map(|(_, r)| r).collect::<Vec<_>>());
-        let done = runner.run_recipe(&all, all.template_key(&tctx).digest());
+        let done = runner.run_recipe(&all, all.template_key(&tctx).digest())?;
         let ok = done.ok();
         let mut by_key: std::collections::HashMap<String, setup::PreparedReceipt> =
             Default::default();
@@ -527,7 +529,7 @@ fn run_plan(
         runner.set_receipts(receipts, tctx);
         let setup = done.steps;
         let units = if ok && !ctx.cancel.is_cancelled() {
-            runner.run_units()
+            runner.run_units()?
         } else {
             vec![]
         };
@@ -535,26 +537,30 @@ fn run_plan(
     })();
     ctx.cancel.remove_containers(ctx);
     if !keep {
-        runner.release_ports(&ws.root);
+        runner.release_ports(&ws.root)?;
     }
     let (setup, units) = result?;
-    Ok(report::assemble(
+    report::assemble(
         fp,
         ws.run_dir.clone(),
         setup,
         units,
         t0.elapsed().as_secs_f64(),
-    ))
+    )
 }
 
 pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
     let t_start = std::time::Instant::now();
     let mut full = build_frozen_plan(ctx, &a.target, obs)?;
     if let Some(m) = &a.source {
-        if m.execution_commit.as_deref() != Some(full.source.execution_commit.as_str()) {
+        if m.execution_commit.as_deref() != full.source.execution_commit.as_deref() {
             bail!(
                 "the target is {}, not the execution commit of source {}",
-                &full.source.execution_commit[..7],
+                &full
+                    .source
+                    .execution_commit
+                    .as_deref()
+                    .expect("resolved Git commit")[..7],
                 m.source_id
             );
         }
@@ -571,7 +577,11 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     // Units whose result from the last day still holds are not run.
     let store = cache::Store::new(cache.join("results").join(&key));
     store.prune(stamp);
-    let sha = full.source.execution_commit.as_str();
+    let sha = full
+        .source
+        .execution_commit
+        .as_deref()
+        .expect("resolved Git commit");
     let fingerprints: Vec<Option<String>> = if full.units.is_empty() {
         vec![]
     } else {
@@ -579,7 +589,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             ctx,
             &root,
             sha,
-            &full.source.base,
+            full.source.base.as_deref().expect("resolved Git base"),
             full.branch.as_deref(),
             &full.config.workflow_dirs,
             &full.config.no_cache,
@@ -774,7 +784,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         setup,
         units,
         t_start.elapsed().as_secs_f64(),
-    );
+    )?;
     exec::write_json(&run_dir.join("result.json"), &result)?;
     std::fs::write(runs.join("last"), run_dir.to_string_lossy().as_bytes())?;
     prune_runs(&runs, 20);

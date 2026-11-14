@@ -351,7 +351,13 @@ impl Lab {
         self.n += 1;
         let name = format!("t{}", self.n);
         let wt = self.cache.join("wt").join(&name);
-        local_ci::git::add_worktree(c, &self.dir, &wt, &self.fp.source.execution_commit).unwrap();
+        local_ci::git::add_worktree(
+            c,
+            &self.dir,
+            &wt,
+            self.fp.source.execution_commit.as_deref().unwrap(),
+        )
+        .unwrap();
         let ws = local_ci::exec::Workspace {
             root: wt.clone(),
             repo_root: self.dir.clone(),
@@ -969,7 +975,13 @@ impl Lab {
         let c = ctx(self.tmp.path());
         let cache = self.tmp.path().join("local");
         let wt = cache.join("wt/all");
-        local_ci::git::add_worktree(&c, &self.dir, &wt, &self.fp.source.execution_commit).unwrap();
+        local_ci::git::add_worktree(
+            &c,
+            &self.dir,
+            &wt,
+            self.fp.source.execution_commit.as_deref().unwrap(),
+        )
+        .unwrap();
         let ws = local_ci::exec::Workspace {
             root: wt,
             repo_root: self.dir.clone(),

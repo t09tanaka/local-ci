@@ -101,8 +101,30 @@ fn paths_ok(t: &Trigger, ev: &Event) -> Result<(), String> {
 const PR_EVENTS: [&str; 2] = ["pull_request", "pull_request_target"];
 const DEFAULT_PR_TYPES: [&str; 3] = ["opened", "synchronize", "reopened"];
 
+/// A field needed to decide a still-applicable trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingMetadata {
+    BaseBranch,
+    HeadBranch,
+    ChangedFiles,
+}
+
 pub fn decide(w: &Workflow, ev: &Event) -> Decision {
+    decide_with_metadata(w, ev, true, true, true).expect("a complete event has no unknown metadata")
+}
+
+/// The same ordered trigger evaluation, with unavailable fields explicit.
+/// A later known run resolves earlier unknown candidates only when their
+/// normalized event is identical; otherwise the chosen event remains unknown.
+pub(crate) fn decide_with_metadata(
+    w: &Workflow,
+    ev: &Event,
+    base_known: bool,
+    head_known: bool,
+    changes_known: bool,
+) -> Result<Decision, MissingMetadata> {
     let mut reasons = Vec::new();
+    let mut unknown = Vec::new();
     for t in &w.triggers {
         let pr = PR_EVENTS.contains(&t.event.as_str());
         if !pr && t.event != "push" {
@@ -127,34 +149,59 @@ pub fn decide(w: &Workflow, ev: &Event) -> Decision {
             reasons.push("push: tags only".into());
             continue;
         }
+        let event = if pr { "pull_request" } else { "push" };
+        let missing_branch = if !t.branches.is_empty() || !t.branches_ignore.is_empty() {
+            if pr && !base_known {
+                Some(MissingMetadata::BaseBranch)
+            } else if !pr && !head_known {
+                Some(MissingMetadata::HeadBranch)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let branch = if pr {
             Some(ev.base.as_str())
         } else {
             ev.head.as_deref()
         };
-        if !branch_ok(t, branch) {
+        if missing_branch.is_none() && !branch_ok(t, branch) {
             reasons.push(format!("{}: branch filter", t.event));
+            continue;
+        }
+        if !ev.all && !changes_known && (!t.paths.is_empty() || !t.paths_ignore.is_empty()) {
+            unknown.push((
+                event,
+                missing_branch.unwrap_or(MissingMetadata::ChangedFiles),
+            ));
             continue;
         }
         match paths_ok(t, ev) {
             Ok(()) => {
-                return Decision::Run {
-                    event: if pr {
-                        "pull_request".into()
-                    } else {
-                        "push".into()
-                    },
+                if let Some(missing) = missing_branch {
+                    unknown.push((event, missing));
+                    continue;
                 }
+                if let Some((_, missing)) = unknown.iter().find(|(earlier, _)| *earlier != event) {
+                    return Err(*missing);
+                }
+                return Ok(Decision::Run {
+                    event: event.into(),
+                });
             }
             Err(r) => reasons.push(r),
         }
+    }
+    if let Some((_, missing)) = unknown.first() {
+        return Err(*missing);
     }
     if w.triggers
         .iter()
         .all(|t| !PR_EVENTS.contains(&t.event.as_str()) && t.event != "push")
     {
         let evs: Vec<&str> = w.triggers.iter().map(|t| t.event.as_str()).collect();
-        return Decision::Skip {
+        return Ok(Decision::Skip {
             reason: format!(
                 "only {}",
                 if evs.is_empty() {
@@ -163,12 +210,12 @@ pub fn decide(w: &Workflow, ev: &Event) -> Decision {
                     evs.join(", ")
                 }
             ),
-        };
+        });
     }
     reasons.dedup();
-    Decision::Skip {
+    Ok(Decision::Skip {
         reason: reasons.join("; "),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -343,5 +390,168 @@ mod tests {
                 reason: "only no triggers".into()
             }
         );
+    }
+    #[test]
+    fn partial_metadata_requires_only_fields_that_can_change_the_ordered_decision() {
+        use MissingMetadata::{BaseBranch, ChangedFiles, HeadBranch};
+        let skip = |reason: &str| {
+            Ok(Decision::Skip {
+                reason: reason.into(),
+            })
+        };
+        let run = |event: &str| {
+            Ok(Decision::Run {
+                event: event.into(),
+            })
+        };
+        for (triggers, base, head, changes, expected) in [
+            (
+                "push:\n    paths-ignore: ['docs/**']",
+                false,
+                false,
+                false,
+                Err(ChangedFiles),
+            ),
+            (
+                "pull_request:\n    branches-ignore: ['release/**']",
+                false,
+                false,
+                false,
+                Err(BaseBranch),
+            ),
+            (
+                "push:\n    branches-ignore: ['release/**']",
+                false,
+                false,
+                false,
+                Err(HeadBranch),
+            ),
+            (
+                "push:\n    tags-ignore: ['legacy']\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                skip("push: tags only"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n    paths: ['src/**']",
+                true,
+                false,
+                false,
+                skip("pull_request: branch filter"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n    paths: ['src/**']",
+                false,
+                false,
+                true,
+                skip("paths not matched"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                Err(BaseBranch),
+            ),
+            (
+                "push:\n    branches: [main]\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                Err(HeadBranch),
+            ),
+            // A Git capture's detached head is known, unlike a directory's unknown head.
+            (
+                "push:\n    branches: [main]\n    paths: ['src/**']",
+                false,
+                true,
+                false,
+                skip("push: branch filter"),
+            ),
+            (
+                "push:\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                Err(ChangedFiles),
+            ),
+            (
+                "pull_request:\n    types: [closed]\n    branches: [main]\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                skip("pull_request: types closed"),
+            ),
+            (
+                "push:\n    tags: ['v*']\n    paths: ['src/**']",
+                false,
+                false,
+                false,
+                skip("push: tags only"),
+            ),
+            (
+                "push: {}\n  pull_request:\n    branches: [main]",
+                false,
+                false,
+                false,
+                run("push"),
+            ),
+            (
+                "pull_request:\n    paths: ['src/**']\n  pull_request_target: {}",
+                false,
+                false,
+                false,
+                run("pull_request"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n  pull_request_target: {}",
+                false,
+                false,
+                false,
+                run("pull_request"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n  push: {}",
+                false,
+                false,
+                false,
+                Err(BaseBranch),
+            ),
+            (
+                "push:\n    paths: ['src/**']\n  pull_request: {}",
+                false,
+                false,
+                false,
+                Err(ChangedFiles),
+            ),
+            (
+                "pull_request:\n    types: [closed]\n    paths: ['src/**']\n  push: {}",
+                false,
+                false,
+                false,
+                run("push"),
+            ),
+            (
+                "pull_request:\n    branches: [main]\n  pull_request_target:\n    branches: [main]",
+                false,
+                false,
+                false,
+                Err(BaseBranch),
+            ),
+        ] {
+            let w = parse("ci.yml", &format!("on:\n  {triggers}\njobs: {{}}\n")).unwrap();
+            let event = Event {
+                base: "dev".into(),
+                head: None,
+                changed: vec!["docs/readme.md".into()],
+                all: false,
+            };
+            assert_eq!(
+                decide_with_metadata(&w, &event, base, head, changes),
+                expected,
+                "{triggers}"
+            );
+        }
     }
 }
