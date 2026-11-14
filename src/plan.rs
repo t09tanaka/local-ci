@@ -533,11 +533,11 @@ pub fn build(workflows: Vec<Workflow>, ev: &Event, only: &[String]) -> Plan {
             }
         }
         let mut groups: Vec<(usize, Vec<&Job>)> = Vec::new();
-        for i in 0..n {
+        for (i, job) in w.jobs.iter().enumerate() {
             let r = find(&mut parent, i);
             match groups.iter_mut().find(|(root, _)| *root == r) {
-                Some((_, g)) => g.push(&w.jobs[i]),
-                None => groups.push((r, vec![&w.jobs[i]])),
+                Some((_, g)) => g.push(job),
+                None => groups.push((r, vec![job])),
             }
         }
         for (_, g) in groups {
