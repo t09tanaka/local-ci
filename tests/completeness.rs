@@ -123,7 +123,13 @@ fn workspace(tmp: &common::Tmp, dir: &Path, fp: &FrozenPlan, name: &str) -> Work
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt").join(name);
-    local_ci::git::add_worktree(&ctx(tmp.path()), dir, &wt, &fp.source.execution_commit).unwrap();
+    local_ci::git::add_worktree(
+        &ctx(tmp.path()),
+        dir,
+        &wt,
+        fp.source.execution_commit.as_deref().unwrap(),
+    )
+    .unwrap();
     let ws = Workspace {
         root: wt,
         repo_root: dir.to_path_buf(),
@@ -141,7 +147,7 @@ fn execute(tmp: &common::Tmp, dir: &Path, fp: &FrozenPlan, name: &str) -> RunRes
 }
 
 fn reassemble(fp: &FrozenPlan, r: &RunResult) -> RunResult {
-    report::assemble(fp, r.run_dir.clone(), r.setup.clone(), r.units.clone(), 0.0)
+    report::assemble(fp, r.run_dir.clone(), r.setup.clone(), r.units.clone(), 0.0).unwrap()
 }
 
 // ---- the result is all of the plan ----

@@ -249,14 +249,23 @@ pub fn assemble(
     setup: Vec<StepResult>,
     units: Vec<UnitResult>,
     secs: f64,
-) -> RunResult {
+) -> anyhow::Result<RunResult> {
+    fp.require_git_source()?;
     let dir = fp.config.default_workflows_dir.as_str();
     let base = state(&setup, &units);
     let not_covered = not_covered(&units, dir);
     let mut result = RunResult {
         version: env!("CARGO_PKG_VERSION").into(),
-        sha: fp.source.execution_commit.clone(),
-        base: fp.source.base.clone(),
+        sha: fp
+            .source
+            .execution_commit
+            .clone()
+            .expect("Git execution requires a commit"),
+        base: fp
+            .source
+            .base
+            .clone()
+            .expect("Git execution requires a base"),
         changed_files: fp.changed_files.len(),
         mode: if fp.filters.all { "all" } else { "changes" }.into(),
         state: base.into(),
@@ -298,7 +307,7 @@ pub fn assemble(
         result.completeness.problems().len(),
         dir,
     );
-    result
+    Ok(result)
 }
 
 pub fn description(

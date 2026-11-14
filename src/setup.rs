@@ -350,7 +350,13 @@ impl TemplateContext {
     /// the template; fill them in before reusing one in a persistent scope.
     pub fn local(fp: &FrozenPlan, run_id: &str) -> Self {
         TemplateContext {
-            source_digest: fp.source.execution_commit.clone(),
+            source_digest: fp
+                .source
+                .pinned
+                .as_ref()
+                .map(|s| s.manifest_digest.clone())
+                .or_else(|| fp.source.execution_commit.clone())
+                .unwrap_or_else(|| fp.source.source_id.clone()),
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             profile: "local".into(),

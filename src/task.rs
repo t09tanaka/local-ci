@@ -300,10 +300,11 @@ pub fn execute_setup(
     ws: &Workspace,
     opts: Opts,
 ) -> Result<PreparedSetup> {
+    fp.require_git_source()?;
     crate::wire::check_version("setup recipe", recipe.schema_version)?;
-    let runner = Runner::new(ctx, fp, ws, opts);
+    let runner = Runner::new(ctx, fp, ws, opts)?;
     runner.prepare_tools()?;
-    let r = runner.run_recipe(recipe, key.digest());
+    let r = runner.run_recipe(recipe, key.digest())?;
     ctx.cancel.remove_containers(ctx);
     Ok(r)
 }
@@ -335,6 +336,7 @@ pub fn execute_task(
     ws: &Workspace,
     opts: Opts,
 ) -> Result<TaskResult> {
+    fp.require_git_source()?;
     let task = fp
         .task(task_id)
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
@@ -343,7 +345,7 @@ pub fn execute_task(
         crate::wire::check_version("receipt", receipt.schema_version)?;
     }
     let keep = opts.keep;
-    let runner = Runner::new(ctx, fp, ws, opts);
+    let runner = Runner::new(ctx, fp, ws, opts)?;
     // as in a run: an artifact step local-ci cannot run fails the task's jobs
     // before anything is started
     if let Some(r) = runner.refused_task(task) {
@@ -370,7 +372,7 @@ pub fn execute_task(
     })();
     ctx.cancel.remove_containers(ctx);
     if !keep {
-        runner.release_ports(&ws.root);
+        runner.release_ports(&ws.root)?;
     }
     result
 }

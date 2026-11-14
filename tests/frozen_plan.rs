@@ -88,7 +88,7 @@ fn a_frozen_plan_survives_json_and_keeps_its_digest() {
     assert!(fp.digest.starts_with("sha256:"));
     assert_eq!(fp.units.len(), 2);
     assert_eq!(fp.changed_files, vec!["a.txt".to_string()]);
-    assert_eq!(fp.source.base, "main");
+    assert_eq!(fp.source.base.as_deref(), Some("main"));
     fp.verify().unwrap();
 
     let text = fp.to_canonical_json().unwrap();
@@ -204,7 +204,13 @@ fn executing_a_built_plan_gives_what_run_gives() {
     let fp = local_ci::build_frozen_plan(&c, &target(&dir, "main"), &mut Quiet).unwrap();
     let cache = tmp.path().join("c2");
     let wt = cache.join("wt/manual");
-    local_ci::git::add_worktree(&c, &dir, &wt, &fp.source.execution_commit).unwrap();
+    local_ci::git::add_worktree(
+        &c,
+        &dir,
+        &wt,
+        fp.source.execution_commit.as_deref().unwrap(),
+    )
+    .unwrap();
     let ws = local_ci::exec::Workspace {
         root: wt,
         repo_root: dir.clone(),

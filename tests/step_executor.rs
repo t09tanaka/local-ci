@@ -111,7 +111,13 @@ fn lab_for(workflow: &str) -> Lab {
     let cache = tmp.path().join("lab");
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let wt = cache.join("wt/t");
-    local_ci::git::add_worktree(&ctx, &dir, &wt, &fp.source.execution_commit).unwrap();
+    local_ci::git::add_worktree(
+        &ctx,
+        &dir,
+        &wt,
+        fp.source.execution_commit.as_deref().unwrap(),
+    )
+    .unwrap();
     let ws = Workspace {
         root: wt,
         repo_root: dir.clone(),

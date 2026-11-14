@@ -134,7 +134,7 @@ impl<'a> Place<'a> {
             &ctx(self.home),
             self.dir,
             &wt,
-            &self.fp.source.execution_commit,
+            self.fp.source.execution_commit.as_deref().unwrap(),
         )
         .unwrap();
         let ws = Workspace {

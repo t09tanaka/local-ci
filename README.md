@@ -381,6 +381,44 @@ A job is not split when:
   and does not evaluate the configuration. A shard runs Cypress through its module API in a small
   script, which prints one JSON line with a result per spec file and exits non-zero when a test failed.
 
+## Planning an already captured source (library)
+
+`build_frozen_plan_from_source(store, manifest, options)` validates the
+manifest and objects, materializes a private temporary view without secrets,
+and applies the existing configuration, workflow parser and planner. It does
+not need an `ExecContext`, a Git checkout, a command runner, the network, or
+execution resources. The view is destroyed before the call returns.
+
+`PinnedPlanOptions` supplies `Filters`, an explicit disabled-workflow list,
+and optional frozen `base_branch` and `changed_files`. `None` means unknown;
+`Some(vec![])` means a known empty change set. `workflow_dirs_override` is an
+optional authoritative list from the caller's resolved configuration: `None`
+uses the captured configuration/default, `Some(empty)` is invalid, and a
+nonempty list replaces the captured workflow directories before extra
+`filters.workflows_dirs` are appended. The resolved directories are included
+in the frozen configuration and its digest. A selected, enabled workflow
+whose branch or path filter requires unknown metadata returns a static typed
+`PinnedPlanError`. `all` bypasses path filters, as in ordinary planning; branch
+filters still apply. No branch or base is inferred from HEAD or a live tree.
+Submodule captures are currently refused with `UnsupportedSource`.
+
+Captured plans use schema 7. Their `source.pinned` records source kind,
+manifest digest, repository identity, relative capture directory and event
+metadata availability; `source_id` and the plan digest bind those values.
+`SourceRef.execution_commit` and `base` are now `Option<String>`: directory
+sources have neither, and a captured Git source can have an unknown base.
+Ordinary Git plans retain schema 6 and their existing JSON/digests; their
+string fields deserialize as `Some` and absent `pinned` as `None`.
+
+The existing Git execution entry points reject every captured plan with typed
+`UnsupportedExecution` before tools, commands, workspace writes or execution
+resource registration. This API plans captured inputs; source-aware execution
+is separate. `Runner::new`, `run_recipe`, `run_units`, `release_ports`, and
+`report::assemble` now return `Result` so direct callers also receive this
+typed refusal, including an empty recipe or report. A manifest digest
+establishes consistency, not authenticity: the
+caller is responsible for the provenance of manifests and object stores.
+
 ## Capturing a working directory (library)
 
 `source::capture_source` fixes the input of a run as the working directory is
@@ -515,7 +553,7 @@ commands are in `.github/workflows/ci.yml`):
 
 ```sh
 cargo schemata --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
-cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test shard_plan --test wire_api
+cargo schemata --file src/frozen.rs -- --lib --test job_dag --test frozen_plan --test source_plan --test shard_plan --test wire_api
 cargo schemata --file src/artifact.rs -- --lib artifact
 cargo schemata --file src/shard.rs -- --lib shard::tests --test shard_plan
 cargo schemata --file src/demand.rs -- --lib --test task_demand

@@ -848,9 +848,13 @@ pub(crate) fn derive_tasks(
                 if t.jobs.contains(n) {
                     continue;
                 }
-                if let Some(ids) = by_job.get(&(t.workflow.clone(), n.clone())) {
-                    deps.extend(ids.iter().cloned());
-                }
+                deps.extend(
+                    by_job
+                        .get(&(t.workflow.clone(), n.clone()))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
             }
         }
         t.depends_on = deps.into_iter().collect();
@@ -1048,4 +1052,63 @@ fn order_groups(
         done.push(next);
     }
     Some(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_unvalidated_task_view_omits_absent_local_dependency_edges() {
+        let workflow = crate::workflow::parse(
+            "ci.yml",
+            r#"
+on: push
+jobs:
+  producer:
+    runs-on: x
+    outputs:
+      value: ${{ steps.make.outputs.value }}
+    steps:
+      - run: echo producer
+  consumer:
+    needs: producer
+    runs-on: x
+    steps:
+      - run: echo '${{ needs.producer.outputs.value }}'
+"#,
+        )
+        .unwrap();
+        let event = crate::filter::Event {
+            base: "main".into(),
+            head: Some("feature".into()),
+            changed: vec![],
+            all: false,
+        };
+        let mut partial = plan::build(vec![workflow], &event, &[]);
+        partial.units[0].jobs.retain(|job| job == "consumer");
+        let specs: Vec<_> = partial
+            .selected
+            .iter()
+            .map(WorkflowSpec::from_selected)
+            .collect();
+        let units: Vec<_> = partial.units.iter().map(UnitSpec::from_unit).collect();
+        // Public FrozenPlan construction guarantees a closed, validated graph;
+        // tests/job_dag.rs covers skipping workflows with missing needs. This
+        // directly exercises the helper's existing defensive None handling
+        // for a partial/unvalidated input, not a public execution contract.
+        assert!(build_graph(&specs, &units).is_err());
+        let (tasks, _) = derive_tasks(&partial, &specs, &units, &[]);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].jobs, ["consumer"]);
+        assert!(tasks[0].depends_on.is_empty());
+        assert_eq!(
+            tasks[0]
+                .needs_outputs
+                .iter()
+                .map(|o| format!("{}.{}", o.job, o.name))
+                .collect::<Vec<_>>(),
+            ["producer.value"]
+        );
+    }
 }

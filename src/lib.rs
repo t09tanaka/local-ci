@@ -28,6 +28,7 @@ mod script;
 pub mod setup;
 pub mod shard;
 pub mod source;
+pub mod source_plan;
 pub mod step_executor;
 pub mod task;
 pub mod template;
@@ -48,4 +49,8 @@ pub use run::{
 pub use step_executor::{ScriptPipe, StepExecutor, StepExit, StepRequest};
 pub use task::{
     aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,
+};
+
+pub use source_plan::{
+    build_frozen_plan_from_source, PinnedIdentity, PinnedPlanError, PinnedPlanOptions,
 };
